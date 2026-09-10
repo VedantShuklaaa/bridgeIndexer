@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use reqwest::Client;
 use sqlx::PgPool;
 
+use crate::chain_adapters::registry::AdapterRegistry;
 use crate::config::AppConfig;
 
 #[derive(Clone)]
@@ -8,10 +11,11 @@ pub struct AppState {
     pub db: PgPool,
     pub http_client: Client,
     pub config: AppConfig,
+    pub registry: Arc<AdapterRegistry>,
 }
 
 impl AppState {
-    pub fn new(db: PgPool, config: AppConfig) -> anyhow::Result<Self> {
+    pub fn new(db: PgPool, config: AppConfig, registry: AdapterRegistry) -> anyhow::Result<Self> {
         let http_client = Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .build()?;
@@ -20,6 +24,7 @@ impl AppState {
             db,
             http_client,
             config,
+            registry: Arc::new(registry),
         })
     }
 }

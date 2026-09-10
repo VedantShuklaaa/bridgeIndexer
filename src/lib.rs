@@ -7,3 +7,4 @@ pub mod normaliser;
 pub mod routes;
 pub mod services;
 pub mod state;
+pub mod chain_adapters;

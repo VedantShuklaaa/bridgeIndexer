@@ -1,6 +1,6 @@
 use serde::Serialize;
-
 use super::bridge::BridgeEvent;
+use super::bridge_transfer::BridgeTransfer;
 
 #[derive(Debug, Serialize)]
 pub enum Chain {
@@ -23,4 +23,5 @@ pub struct NormalisedTransaction {
     pub fee_lamports: u64,
     pub signer: Option<String>,
     pub bridge_event: Option<BridgeEvent>,
+    pub bridge_transfer: Option<BridgeTransfer>, // new — Phase 2 result
 }

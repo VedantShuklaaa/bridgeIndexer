@@ -4,9 +4,6 @@ use serde_json::Value;
 
 use crate::error::AppError;
 
-/// Generic JSON-RPC 2.0 request envelope. Reusable for any Helius RPC
-/// method (getTransaction, getSignaturesForAddress, etc.) — not tied
-/// to getTransaction specifically.
 #[derive(Debug, Serialize)]
 struct JsonRpcRequest<T: Serialize> {
     jsonrpc: &'static str,
@@ -15,8 +12,6 @@ struct JsonRpcRequest<T: Serialize> {
     params: T,
 }
 
-/// The second element of Helius's getTransaction params array —
-/// options controlling response shape.
 #[derive(Debug, Serialize)]
 struct GetTransactionOptions {
     encoding: &'static str,

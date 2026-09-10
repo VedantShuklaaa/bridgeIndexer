@@ -1,8 +1,8 @@
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub database_url: String,
-    pub helius_url: String,   // full URL including api-key query param
-    pub wormhole_url: String, // e.g. https://api.wormholescan.io
+    pub helius_url: String,   
+    pub wormhole_url: String, 
     pub port: u16,
 }
 
