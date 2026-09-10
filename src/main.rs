@@ -1,37 +1,24 @@
-use axum::{Router, routing::get, serve};
-use std::env;
-use tokio::net::TcpListener;
-
-use crate::{
-    config::config::{HOST, PORT},
-    db::connection::connect_db,
-    state::state::AppState,
-};
-
-mod config;
-mod db;
-mod state;
-mod handler;
-mod error;
+use bridge::config::AppConfig;
+use bridge::routes::build_router;
+use bridge::state::AppState;
+use sqlx::postgres::PgPoolOptions;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    dotenvy::dotenv().ok();
 
-    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let db = connect_db(&database_url).await;
+    let config = AppConfig::from_env()?;
+    let db = PgPoolOptions::new()
+        .max_connections(5)
+        .connect_lazy(&config.database_url)?;
+    let state = AppState::new(db, config.clone())?;
 
-    let state = AppState { db };
+    let app = build_router(state);
+    let addr = format!("0.0.0.0:{}", config.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    let app = Router::new().route("/", get(hello)).with_state(state);
+    tracing::info!("listening on {addr}");
+    axum::serve(listener, app).await?;
 
-    let addr = format!("{}:{}", HOST, PORT);
-    let listener = TcpListener::bind(&addr).await.unwrap();
-
-    serve(listener, app).await.unwrap();
-}
-
-async fn hello() -> &'static str {
-    "hello world"
+    Ok(())
 }

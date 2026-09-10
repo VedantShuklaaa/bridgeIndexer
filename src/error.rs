@@ -19,21 +19,22 @@ pub enum AppError {
         message: String,
     },
 
+    #[error("upstream provider rate limited: {0}")]
+    UpstreamRateLimited(&'static str),
+
     #[error("upstream provider timed out: {0}")]
     UpstreamTimeout(&'static str),
 
     #[error("failed to normalise transaction data: {0}")]
     Normalisation(String),
 
-    #[error("configuration error: {0}")]
-    Config(String),
+    #[error("invalid request: {0}")]
+    BadRequest(String),
 
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
 }
 
-/// What actually goes on the wire. Kept separate from `AppError` so internal
-/// error detail (e.g. anyhow chains) never leaks to the client.
 #[derive(Serialize)]
 struct ErrorBody {
     error: ErrorDetail,
@@ -51,11 +52,14 @@ impl AppError {
             AppError::InvalidTransactionHash(_) => (StatusCode::BAD_REQUEST, "INVALID_TX_HASH"),
             AppError::TransactionNotFound(_) => (StatusCode::NOT_FOUND, "TX_NOT_FOUND"),
             AppError::UpstreamProvider { .. } => (StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR"),
+            AppError::UpstreamRateLimited(_) => {
+                (StatusCode::TOO_MANY_REQUESTS, "UPSTREAM_RATE_LIMITED")
+            }
             AppError::UpstreamTimeout(_) => (StatusCode::GATEWAY_TIMEOUT, "UPSTREAM_TIMEOUT"),
             AppError::Normalisation(_) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "NORMALISATION_FAILED")
             }
-            AppError::Config(_) => (StatusCode::INTERNAL_SERVER_ERROR, "CONFIG_ERROR"),
+            AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
         }
     }
@@ -65,8 +69,6 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, code) = self.status_and_code();
 
-        // Log full detail server-side (including anyhow chain) regardless of
-        // what's returned to the client.
         if status.is_server_error() {
             tracing::error!(error = %self, "request failed");
         } else {
@@ -74,15 +76,37 @@ impl IntoResponse for AppError {
         }
 
         let message = match &self {
-            // Don't leak internal/config detail to clients.
-            AppError::Internal(_) | AppError::Config(_) => "internal server error".to_string(),
+            AppError::Internal(_) => "internal server error".to_string(),
             other => other.to_string(),
         };
 
-        let body = ErrorBody {
-            error: ErrorDetail { code, message },
-        };
+        (
+            status,
+            Json(ErrorBody {
+                error: ErrorDetail { code, message },
+            }),
+        )
+            .into_response()
+    }
+}
 
-        (status, Json(body)).into_response()
+impl From<reqwest::Error> for AppError {
+    fn from(err: reqwest::Error) -> Self {
+        if err.is_timeout() {
+            AppError::UpstreamTimeout("unknown")
+        } else if err.status().map(|s| s.as_u16()) == Some(429) {
+            AppError::UpstreamRateLimited("unknown")
+        } else {
+            AppError::UpstreamProvider {
+                provider: "unknown",
+                message: err.to_string(),
+            }
+        }
+    }
+}
+
+impl From<serde_json::Error> for AppError {
+    fn from(err: serde_json::Error) -> Self {
+        AppError::Normalisation(err.to_string())
     }
 }
