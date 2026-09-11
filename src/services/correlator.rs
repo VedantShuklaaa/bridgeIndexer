@@ -1,6 +1,7 @@
 use crate::chain_adapters::registry::AdapterRegistry;
 use crate::domain::bridge_transfer::{BridgeMessageId, BridgeStatus, BridgeTransfer, ChainId};
 use crate::error::AppError;
+use crate::services::token_metadata::{TokenMetadata, resolve_token_metadata};
 use crate::util::explorer::explorer_tx_url;
 use crate::vaa::decode::format_amount;
 
@@ -10,7 +11,8 @@ pub struct CorrelateParams {
     pub message_id: BridgeMessageId,
     pub destination_chain_id: u16,
     pub token: Option<String>,
-    pub token_symbol: Option<String>,
+    pub token_chain: u16,                         // NEW
+    pub wormholescan_symbol_hint: Option<String>, // was `token_symbol`, renamed for clarity
     pub raw_amount: Option<u128>,
     pub amount: Option<String>,
     pub destination_wallet: Option<String>,
@@ -27,7 +29,8 @@ pub async fn correlate(
         message_id,
         destination_chain_id,
         token,
-        token_symbol,
+        token_chain,
+        wormholescan_symbol_hint,
         raw_amount,
         amount,
         destination_wallet,
@@ -36,25 +39,32 @@ pub async fn correlate(
 
     let destination_chain = ChainId::from_wormhole_id(destination_chain_id);
 
+    // Unchanged — this part was never the bug, destination lookup correctly
+    // stays keyed by destination_chain_id.
     let (destination_tx_hash, status) = if let Some(known) = known_destination_tx {
         (Some(known), BridgeStatus::Completed)
     } else {
-        let fast = match registry.get_wormholescan(destination_chain_id) {
+        let wormholescan_adapter = registry.get_wormholescan(destination_chain_id);
+        let evm_adapter = registry.get_evm(destination_chain_id);
+
+        let fast = match &wormholescan_adapter {
             Some(a) => a.find_transaction(&message_id).await?,
             None => None,
         };
+
         match fast {
             Some(info) => (Some(info.tx_hash), BridgeStatus::Completed),
-            None => match registry.get_evm(destination_chain_id) {
-                // We have a way to check this chain, and checked — genuinely not redeemed yet.
+            None => match &evm_adapter {
                 Some(a) => match a.find_transaction(&message_id).await? {
                     Some(info) => (Some(info.tx_hash), BridgeStatus::Completed),
                     None => (None, BridgeStatus::Pending),
                 },
-                // No adapter registered for this chain at all — we never
-                // actually checked, so this isn't "pending", it's "unsupported".
-                // Kept as Detected rather than silently reporting Pending.
-                None => (None, BridgeStatus::Detected),
+                // No EVM adapter — but if WormholeScan itself was checked, that's
+                // still a genuine check, not "unsupported chain."
+                None => match wormholescan_adapter {
+                    Some(_) => (None, BridgeStatus::Pending),
+                    None => (None, BridgeStatus::Detected),
+                },
             },
         }
     };
@@ -62,35 +72,19 @@ pub async fn correlate(
     let effective_raw_amount: Option<u128> =
         raw_amount.or_else(|| amount.as_ref().and_then(|a| a.parse::<u128>().ok()));
 
-    let (token_symbol, amount_formatted) = match (&token, registry.get_evm(destination_chain_id)) {
-        (Some(token_addr), Some(adapter)) => {
-            let decimals = adapter.token_decimals(token_addr).await.unwrap_or(None);
-
-            let symbol = match adapter.token_symbol(token_addr).await {
-                Ok(Some(symbol)) => Some(symbol),
-                Ok(None) => token_symbol.clone(),
-                Err(e) => {
-                    tracing::warn!(
-                        token = %token_addr,
-                        error = %e,
-                        "token_symbol failed"
-                    );
-
-                    token_symbol.clone()
-                }
-            };
-
-            (
-                symbol,
-                effective_raw_amount.map(|r| format_amount(r, decimals)),
-            )
+    // NEW: keyed by token_chain, not destination_chain_id.
+    let metadata = match &token {
+        Some(token_addr) => {
+            resolve_token_metadata(registry, token_chain, token_addr, wormholescan_symbol_hint)
+                .await?
         }
-
-        _ => (
-            token_symbol,
-            effective_raw_amount.map(|r| format_amount(r, None)),
-        ),
+        None => TokenMetadata {
+            symbol: None,
+            decimals: None,
+        },
     };
+
+    let amount_formatted = effective_raw_amount.map(|r| format_amount(r, metadata.decimals));
 
     let source_explorer_url = explorer_tx_url(1, &source_tx_hash);
     let destination_explorer_url = destination_tx_hash
@@ -107,7 +101,7 @@ pub async fn correlate(
         destination_tx_hash,
         destination_explorer_url,
         token,
-        token_symbol,
+        token_symbol: metadata.symbol,
         amount: amount.or_else(|| raw_amount.map(|r| r.to_string())),
         amount_formatted,
         message_id,

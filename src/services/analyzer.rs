@@ -48,6 +48,20 @@ pub async fn analyse_tx(state: &AppState, hash: &str) -> Result<NormalisedTransa
                         .and_then(|c| c.parse().ok())
                 });
 
+            fn extract_wormholescan_number_field(raw: &Value, field: &str) -> Option<u16> {
+                raw.get("content")
+                    .and_then(|c| c.get("standarizedProperties"))
+                    .and_then(|p| p.get(field))
+                    .and_then(Value::as_u64)
+                    .map(|n| n as u16)
+            }
+
+            let token_chain: Option<u16> = decoded
+                .transfer
+                .as_ref()
+                .map(|t| t.token_chain)
+                .or_else(|| extract_wormholescan_number_field(&wh_raw, "tokenChain"));
+            
             // NEW: raw u128, kept separate from the display string — needed
             // so the correlator can divide by the token's real decimals.
             // Only available when our own VAA decode recognized the payload;
@@ -64,13 +78,20 @@ pub async fn analyse_tx(state: &AppState, hash: &str) -> Result<NormalisedTransa
             let token: Option<String> = decoded
                 .transfer
                 .as_ref()
-                .and_then(|t| {
-                    destination_chain_id.map(|c| decode_destination_address(c, &t.token_address))
-                })
+                .and_then(|t| token_chain.map(|c| decode_destination_address(c, &t.token_address)))
+                //                ^^^^^^^^^^^ was destination_chain_id — token_address decodes per token_chain, not destination
                 .flatten()
                 .or_else(|| extract_wormholescan_field(&wh_raw, "tokenAddress"));
 
-            let token_symbol: Option<String> = extract_wormholescan_field(&wh_raw, "tokenSymbol");
+            tracing::info!(
+                "WormholeScan standardizedProperties: {:?}",
+                wh_raw
+                    .get("content")
+                    .and_then(|c| c.get("standarizedProperties"))
+            );
+
+            let wormholescan_symbol_hint: Option<String> =
+                extract_wormholescan_field(&wh_raw, "tokenSymbol");
 
             let destination_wallet: Option<String> = decoded
                 .transfer
@@ -97,7 +118,8 @@ pub async fn analyse_tx(state: &AppState, hash: &str) -> Result<NormalisedTransa
                         message_id,
                         destination_chain_id: destination_chain_id.unwrap_or(0),
                         token,
-                        token_symbol,
+                        token_chain: token_chain.unwrap_or(0),
+                        wormholescan_symbol_hint,
                         raw_amount,
                         amount,
                         destination_wallet,
