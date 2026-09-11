@@ -42,19 +42,11 @@ impl ChainAdapter for WormholeScanAdapter {
         );
 
         let resp = self.client.get(&url).send().await?;
-
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
         if !resp.status().is_success() {
-            return Err(AppError::UpstreamProvider {
-                provider: "wormholescan",
-                message: format!("status {}", resp.status()),
-            });
+            return Ok(None); // treat as "not confirmed yet", fall through to real adapter
         }
 
         let payload: Value = resp.json().await?;
-
         let tx_hash = payload
             .get("destinationTx")
             .and_then(|d| d.get("txHash"))
@@ -62,11 +54,6 @@ impl ChainAdapter for WormholeScanAdapter {
 
         Ok(tx_hash.map(|h| DestinationTxInfo {
             tx_hash: h.to_string(),
-            wallet: payload
-                .get("destinationTx")
-                .and_then(|d| d.get("to"))
-                .and_then(Value::as_str)
-                .map(String::from),
         }))
     }
 }

@@ -16,3 +16,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 async-trait = "0.1.92"
+base64 = "0.22"
+hex = "0.4"
+sha3 = "0.10"

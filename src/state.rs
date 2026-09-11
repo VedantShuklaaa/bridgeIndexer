@@ -15,11 +15,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(db: PgPool, config: AppConfig, registry: AdapterRegistry) -> anyhow::Result<Self> {
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()?;
-
+    pub fn new(
+        db: PgPool,
+        config: AppConfig,
+        http_client: Client,
+        registry: AdapterRegistry,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             db,
             http_client,

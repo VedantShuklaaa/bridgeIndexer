@@ -1,18 +1,16 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{Value, json};
+use sha3::{Digest, Keccak256};
 
 use crate::domain::bridge_transfer::BridgeMessageId;
 use crate::error::AppError;
 
 use super::{ChainAdapter, DestinationTxInfo};
 
-/// Direct-RPC adapter for EVM chains. Looks for the Wormhole Token Bridge's
-/// TransferRedeemed event log, filtered by (emitterChainId, sequence).
-///
-/// SCAFFOLD — not verified against a live response. The event topic hash
-/// and topic-decoding logic below need confirming against a real
-/// eth_getLogs result before this is trustworthy.
+const BLOCK_RANGE: u64 = 2000;
+const MAX_CHUNKS: u64 = 50; // ~100k blocks lookback before giving up
+
 pub struct EvmAdapter {
     client: Client,
     rpc_url: String,
@@ -25,6 +23,7 @@ impl EvmAdapter {
         client: Client,
         rpc_url: String,
         token_bridge_contract: String,
+        _from_block_hex: String,
         name: &'static str,
     ) -> Self {
         Self {
@@ -34,6 +33,89 @@ impl EvmAdapter {
             name,
         }
     }
+
+    async fn latest_block(&self) -> Result<u64, AppError> {
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": [] });
+        let resp = self.client.post(&self.rpc_url).json(&body).send().await?;
+        let payload: Value = resp.json().await?;
+
+        let hex = payload
+            .get("result")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::UpstreamProvider {
+                provider: self.name,
+                message: "no result from eth_blockNumber".into(),
+            })?;
+
+        u64::from_str_radix(hex.trim_start_matches("0x"), 16)
+            .map_err(|e| AppError::Normalisation(format!("bad block number: {e}")))
+    }
+
+    async fn get_logs_in_range(
+        &self,
+        from: u64,
+        to: u64,
+        topics: &[String; 4],
+    ) -> Result<Vec<Value>, AppError> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getLogs",
+            "params": [{
+                "address": self.token_bridge_contract,
+                "topics": topics,
+                "fromBlock": format!("0x{:x}", from),
+                "toBlock": format!("0x{:x}", to),
+            }]
+        });
+
+        let resp = self.client.post(&self.rpc_url).json(&body).send().await?;
+        let payload: Value = resp.json().await?;
+
+        if let Some(err) = payload.get("error") {
+            return Err(AppError::UpstreamProvider {
+                provider: self.name,
+                message: err.to_string(),
+            });
+        }
+
+        Ok(payload
+            .get("result")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+}
+
+fn event_topic(signature: &str) -> String {
+    format!("0x{}", hex::encode(Keccak256::digest(signature.as_bytes())))
+}
+
+fn pad_u16(v: u16) -> String {
+    let mut buf = [0u8; 32];
+    buf[30..32].copy_from_slice(&v.to_be_bytes());
+    format!("0x{}", hex::encode(buf))
+}
+
+fn pad_u64(v: u64) -> String {
+    let mut buf = [0u8; 32];
+    buf[24..32].copy_from_slice(&v.to_be_bytes());
+    format!("0x{}", hex::encode(buf))
+}
+
+fn decode_decimals(hex_result: &str) -> Option<u8> {
+    let bytes = hex::decode(hex_result.trim_start_matches("0x")).ok()?;
+    bytes.last().copied()
+}
+
+fn decode_string_return(hex_result: &str) -> Option<String> {
+    let bytes = hex::decode(hex_result.trim_start_matches("0x")).ok()?;
+    if bytes.len() < 64 {
+        return None;
+    }
+    let len = u64::from_be_bytes(bytes[56..64].try_into().ok()?) as usize;
+    let data = bytes.get(64..64 + len)?;
+    String::from_utf8(data.to_vec()).ok()
 }
 
 #[async_trait]
@@ -46,37 +128,61 @@ impl ChainAdapter for EvmAdapter {
         &self,
         message_id: &BridgeMessageId,
     ) -> Result<Option<DestinationTxInfo>, AppError> {
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_getLogs",
-            "params": [{
-                "address": self.token_bridge_contract,
-                "fromBlock": "earliest",
-                "toBlock": "latest",
-            }]
-        });
+        let topics = [
+            event_topic("TransferRedeemed(uint16,bytes32,uint64)"),
+            pad_u16(message_id.emitter_chain),
+            format!("0x{}", message_id.emitter_address),
+            pad_u64(message_id.sequence),
+        ];
 
-        let resp = self.client.post(&self.rpc_url).json(&body).send().await?;
-        let payload: Value = resp.json().await?;
-        let logs = payload.get("result").and_then(Value::as_array);
+        let latest = self.latest_block().await?;
+        let mut to = latest;
 
-        // TODO: decode each log's topics for (emitterChainId, sequence) ==
-        // message_id, once the TransferRedeemed topic encoding is confirmed.
-        // fromBlock: earliest will be too slow on a real contract — needs
-        // a reasonable lower bound (recent block range) before this is usable.
-        let _ = message_id;
+        for _ in 0..MAX_CHUNKS {
+            let from = to.saturating_sub(BLOCK_RANGE - 1);
+            let logs = self.get_logs_in_range(from, to, &topics).await?;
 
-        match logs {
-            Some(arr) if !arr.is_empty() => Ok(Some(DestinationTxInfo {
-                tx_hash: arr[0]
+            if !logs.is_empty() {
+                let tx_hash = logs[0]
                     .get("transactionHash")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
-                    .to_string(),
-                wallet: None,
-            })),
-            _ => Ok(None),
+                    .to_string();
+                return Ok(Some(DestinationTxInfo { tx_hash }));
+            }
+
+            if from == 0 {
+                break;
+            }
+            to = from - 1;
         }
+
+        Ok(None)
+    }
+
+    async fn token_decimals(&self, token_address: &str) -> Result<Option<u8>, AppError> {
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "eth_call",
+            "params": [{ "to": token_address, "data": "0x313ce567" }, "latest"]
+        });
+        let resp = self.client.post(&self.rpc_url).json(&body).send().await?;
+        let payload: Value = resp.json().await?;
+        Ok(payload
+            .get("result")
+            .and_then(Value::as_str)
+            .and_then(decode_decimals))
+    }
+
+    async fn token_symbol(&self, token_address: &str) -> Result<Option<String>, AppError> {
+        let body = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "eth_call",
+            "params": [{ "to": token_address, "data": "0x95d89b41" }, "latest"]
+        });
+        let resp = self.client.post(&self.rpc_url).json(&body).send().await?;
+        let payload: Value = resp.json().await?;
+        Ok(payload
+            .get("result")
+            .and_then(Value::as_str)
+            .and_then(decode_string_return))
     }
 }

@@ -4,7 +4,14 @@ use serde::Serialize;
 pub enum ChainId {
     Solana,
     Ethereum,
+    Bsc,
+    Avalanche,
     Base,
+    Arbitrum,
+    Optimism,
+    Polygon,
+    Gnosis,
+    Near,
     Unknown(u16),
 }
 
@@ -13,8 +20,31 @@ impl ChainId {
         match id {
             1 => ChainId::Solana,
             2 => ChainId::Ethereum,
+            4 => ChainId::Bsc,
+            5 => ChainId::Polygon,
+            6 => ChainId::Avalanche,
+            15 => ChainId::Near,
+            23 => ChainId::Arbitrum,
+            24 => ChainId::Optimism,
+            25 => ChainId::Gnosis,
             30 => ChainId::Base,
             other => ChainId::Unknown(other),
+        }
+    }
+
+    pub fn wormhole_id(&self) -> u16 {
+        match self {
+            ChainId::Solana => 1,
+            ChainId::Ethereum => 2,
+            ChainId::Bsc => 4,
+            ChainId::Polygon => 5,
+            ChainId::Avalanche => 6,
+            ChainId::Near => 15,
+            ChainId::Arbitrum => 23,
+            ChainId::Optimism => 24,
+            ChainId::Gnosis => 25,
+            ChainId::Base => 30,
+            ChainId::Unknown(id) => *id,
         }
     }
 }
@@ -38,11 +68,15 @@ pub struct BridgeTransfer {
     pub source_chain: ChainId,
     pub source_tx_hash: String,
     pub source_wallet: Option<String>,
+    pub source_explorer_url: Option<String>,
     pub destination_chain: ChainId,
     pub destination_wallet: Option<String>,
     pub destination_tx_hash: Option<String>,
+    pub destination_explorer_url: Option<String>,
     pub token: Option<String>,
-    pub amount: Option<String>,
+    pub token_symbol: Option<String>,
+    pub amount: Option<String>, // raw, Wormhole-normalized (unchanged behavior)
+    pub amount_formatted: Option<String>, // new — human-readable, decimals-aware
     pub message_id: BridgeMessageId,
     pub status: BridgeStatus,
 }
