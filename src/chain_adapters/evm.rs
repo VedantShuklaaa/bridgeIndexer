@@ -108,16 +108,6 @@ fn decode_decimals(hex_result: &str) -> Option<u8> {
     bytes.last().copied()
 }
 
-fn decode_string_return(hex_result: &str) -> Option<String> {
-    let bytes = hex::decode(hex_result.trim_start_matches("0x")).ok()?;
-    if bytes.len() < 64 {
-        return None;
-    }
-    let len = u64::from_be_bytes(bytes[56..64].try_into().ok()?) as usize;
-    let data = bytes.get(64..64 + len)?;
-    String::from_utf8(data.to_vec()).ok()
-}
-
 fn decode_symbol(hex_result: &str) -> Option<String> {
     let bytes = hex::decode(hex_result.trim_start_matches("0x")).ok()?;
 
@@ -209,32 +199,22 @@ impl ChainAdapter for EvmAdapter {
 
     async fn token_symbol(&self, token_address: &str) -> Result<Option<String>, AppError> {
         let body = json!({
-            "jsonrpc": "2.0", "id": 1, "method": "eth_call",
-            "params": [{ "to": token_address, "data": "0x95d89b41" }, "latest"]
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_call",
+            "params": [{
+                "to": token_address,
+                "data": "0x95d89b41"
+            }, "latest"]
         });
+
         let resp = self.client.post(&self.rpc_url).json(&body).send().await?;
-        let status = resp.status();
-        let text = resp.text().await?;
 
-        let payload: Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(token = %token_address, %status, body = %text, "non-JSON response from symbol() call: {e}");
-                return Ok(None);
-            }
-        };
-
-        if let Some(err) = payload.get("error") {
-            return Err(AppError::UpstreamProvider {
-                provider: self.name,
-                message: err.to_string(),
-            });
-        }
+        let payload: Value = resp.json().await?;
 
         Ok(payload
             .get("result")
             .and_then(Value::as_str)
             .and_then(decode_symbol))
     }
-    
 }

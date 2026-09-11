@@ -10,6 +10,7 @@ pub struct CorrelateParams {
     pub message_id: BridgeMessageId,
     pub destination_chain_id: u16,
     pub token: Option<String>,
+    pub token_symbol: Option<String>,
     pub raw_amount: Option<u128>,
     pub amount: Option<String>,
     pub destination_wallet: Option<String>,
@@ -26,6 +27,7 @@ pub async fn correlate(
         message_id,
         destination_chain_id,
         token,
+        token_symbol,
         raw_amount,
         amount,
         destination_wallet,
@@ -63,19 +65,31 @@ pub async fn correlate(
     let (token_symbol, amount_formatted) = match (&token, registry.get_evm(destination_chain_id)) {
         (Some(token_addr), Some(adapter)) => {
             let decimals = adapter.token_decimals(token_addr).await.unwrap_or(None);
+
             let symbol = match adapter.token_symbol(token_addr).await {
-                Ok(s) => s,
+                Ok(Some(symbol)) => Some(symbol),
+                Ok(None) => token_symbol.clone(),
                 Err(e) => {
-                    tracing::warn!(token = %token_addr, error = %e, "token_symbol failed");
-                    None
+                    tracing::warn!(
+                        token = %token_addr,
+                        error = %e,
+                        "token_symbol failed"
+                    );
+
+                    token_symbol.clone()
                 }
             };
+
             (
                 symbol,
                 effective_raw_amount.map(|r| format_amount(r, decimals)),
             )
         }
-        _ => (None, effective_raw_amount.map(|r| format_amount(r, None))),
+
+        _ => (
+            token_symbol,
+            effective_raw_amount.map(|r| format_amount(r, None)),
+        ),
     };
 
     let source_explorer_url = explorer_tx_url(1, &source_tx_hash);

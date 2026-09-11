@@ -70,6 +70,8 @@ pub async fn analyse_tx(state: &AppState, hash: &str) -> Result<NormalisedTransa
                 .flatten()
                 .or_else(|| extract_wormholescan_field(&wh_raw, "tokenAddress"));
 
+            let token_symbol: Option<String> = extract_wormholescan_field(&wh_raw, "tokenSymbol");
+
             let destination_wallet: Option<String> = decoded
                 .transfer
                 .as_ref()
@@ -95,6 +97,7 @@ pub async fn analyse_tx(state: &AppState, hash: &str) -> Result<NormalisedTransa
                         message_id,
                         destination_chain_id: destination_chain_id.unwrap_or(0),
                         token,
+                        token_symbol,
                         raw_amount,
                         amount,
                         destination_wallet,
