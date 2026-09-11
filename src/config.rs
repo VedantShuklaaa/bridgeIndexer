@@ -1,6 +1,7 @@
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub database_url: String,
+    pub redis_url: String,
     pub helius_url: String,
     pub wormhole_url: String,
     pub port: u16,
@@ -42,6 +43,8 @@ pub struct AppConfig {
     pub solana_token_bridge_program: String,
     pub near_rpc_url: String,
     pub near_token_bridge_contract: String,
+
+    pub solana_ws_url: String,
 }
 
 impl AppConfig {
@@ -58,6 +61,7 @@ impl AppConfig {
 
         Ok(Self {
             database_url: required("DATABASE_URL")?,
+            redis_url: required("REDIS_URL")?,
             helius_url: required("HELIUS_URL")?,
             wormhole_url: optional("WORMHOLE_URL", "https://api.wormholescan.io"),
             port: std::env::var("PORT")
@@ -110,6 +114,7 @@ impl AppConfig {
             base_token_bridge_deploy_block: optional("BASE_TOKEN_BRIDGE_DEPLOY_BLOCK", "0x0"),
 
             solana_token_bridge_program: required("SOLANA_TOKEN_BRIDGE_PROGRAM")?,
+            solana_ws_url: required("SOLANA_WS_URL")?,
             near_rpc_url: optional("NEAR_RPC_URL", "https://rpc.mainnet.near.org"),
             near_token_bridge_contract: required("NEAR_TOKEN_BRIDGE_CONTRACT")?,
         })
