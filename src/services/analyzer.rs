@@ -1,5 +1,5 @@
 use crate::clients::{helius, wormhole};
-use crate::domain::bridge_transfer::{BridgeMessageId, ChainId};
+use crate::domain::bridge_transfer::BridgeMessageId;
 use crate::domain::transaction::NormalisedTransaction;
 use crate::error::AppError;
 use crate::normaliser;

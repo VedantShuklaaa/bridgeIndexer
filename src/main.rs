@@ -1,8 +1,4 @@
-use std::sync::Arc;
-
-use bridge::chain_adapters::evm::EvmAdapter;
-use bridge::chain_adapters::registry::AdapterRegistry;
-use bridge::chain_adapters::wormholescan::WormholeScanAdapter;
+use bridge::chain_adapters::setup::build_registry;
 use bridge::config::AppConfig;
 use bridge::routes::build_router;
 use bridge::state::AppState;
@@ -22,26 +18,7 @@ async fn main() -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
 
-    let mut registry = AdapterRegistry::new();
-    registry.register_wormholescan(
-        4,
-        Arc::new(WormholeScanAdapter::new(
-            http_client.clone(),
-            config.wormhole_url.clone(),
-            "bsc",
-        )),
-    );
-    registry.register_evm(
-        4,
-        Arc::new(EvmAdapter::new(
-            http_client.clone(),
-            config.base_rpc_url.clone(),
-            config.base_token_bridge_contract.clone(),
-            config.base_token_bridge_deploy_block.clone(),
-            "bsc",
-        )),
-    );
-
+    let registry = build_registry(&config, &http_client);
     let state = AppState::new(db, config.clone(), http_client.clone(), registry)?;
     let app = build_router(state);
 

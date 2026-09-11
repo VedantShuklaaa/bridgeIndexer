@@ -5,6 +5,7 @@ use async_trait::async_trait;
 pub mod evm;
 pub mod registry;
 pub mod wormholescan;
+pub mod setup;
 
 #[derive(Debug, Clone)]
 pub struct DestinationTxInfo {

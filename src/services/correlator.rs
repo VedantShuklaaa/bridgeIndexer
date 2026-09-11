@@ -10,8 +10,8 @@ pub struct CorrelateParams {
     pub message_id: BridgeMessageId,
     pub destination_chain_id: u16,
     pub token: Option<String>,
-    pub raw_amount: Option<u128>, // present when our own VAA decode succeeded
-    pub amount: Option<String>,   // fallback raw string (e.g. from Wormholescan)
+    pub raw_amount: Option<u128>,
+    pub amount: Option<String>,
     pub destination_wallet: Option<String>,
     pub known_destination_tx: Option<String>,
 }
@@ -44,29 +44,41 @@ pub async fn correlate(
         match fast {
             Some(info) => (Some(info.tx_hash), BridgeStatus::Completed),
             None => match registry.get_evm(destination_chain_id) {
+                // We have a way to check this chain, and checked — genuinely not redeemed yet.
                 Some(a) => match a.find_transaction(&message_id).await? {
                     Some(info) => (Some(info.tx_hash), BridgeStatus::Completed),
                     None => (None, BridgeStatus::Pending),
                 },
+                // No adapter registered for this chain at all — we never
+                // actually checked, so this isn't "pending", it's "unsupported".
+                // Kept as Detected rather than silently reporting Pending.
                 None => (None, BridgeStatus::Detected),
             },
         }
     };
 
-    // Enrich with on-chain token metadata, if we have an EVM adapter for
-    // this chain and a token address to look up. Best-effort — failures
-    // here shouldn't fail the whole request.
+    let effective_raw_amount: Option<u128> =
+        raw_amount.or_else(|| amount.as_ref().and_then(|a| a.parse::<u128>().ok()));
+
     let (token_symbol, amount_formatted) = match (&token, registry.get_evm(destination_chain_id)) {
         (Some(token_addr), Some(adapter)) => {
             let decimals = adapter.token_decimals(token_addr).await.unwrap_or(None);
-            let symbol = adapter.token_symbol(token_addr).await.unwrap_or(None);
-            let formatted = raw_amount.map(|r| format_amount(r, decimals));
-            (symbol, formatted)
+            let symbol = match adapter.token_symbol(token_addr).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(token = %token_addr, error = %e, "token_symbol failed");
+                    None
+                }
+            };
+            (
+                symbol,
+                effective_raw_amount.map(|r| format_amount(r, decimals)),
+            )
         }
-        _ => (None, raw_amount.map(|r| format_amount(r, None))),
+        _ => (None, effective_raw_amount.map(|r| format_amount(r, None))),
     };
 
-    let source_explorer_url = explorer_tx_url(1, &source_tx_hash); // source is always Solana here
+    let source_explorer_url = explorer_tx_url(1, &source_tx_hash);
     let destination_explorer_url = destination_tx_hash
         .as_ref()
         .and_then(|h| explorer_tx_url(destination_chain_id, h));

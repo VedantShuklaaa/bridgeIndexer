@@ -5,34 +5,113 @@ pub struct AppConfig {
     pub wormhole_url: String,
     pub port: u16,
 
-    // Phase 2 — EVM destination-chain adapter config
+    // EVM destination-chain adapter config
+    pub eth_rpc_url: String,
+    pub eth_token_bridge_contract: String,
+    pub eth_token_bridge_deploy_block: String,
+
+    pub bsc_rpc_url: String,
+    pub bsc_token_bridge_contract: String,
+    pub bsc_token_bridge_deploy_block: String,
+
+    pub polygon_rpc_url: String,
+    pub polygon_token_bridge_contract: String,
+    pub polygon_token_bridge_deploy_block: String,
+
+    pub avalanche_rpc_url: String,
+    pub avalanche_token_bridge_contract: String,
+    pub avalanche_token_bridge_deploy_block: String,
+
+    pub arbitrum_rpc_url: String,
+    pub arbitrum_token_bridge_contract: String,
+    pub arbitrum_token_bridge_deploy_block: String,
+
+    pub optimism_rpc_url: String,
+    pub optimism_token_bridge_contract: String,
+    pub optimism_token_bridge_deploy_block: String,
+
+    pub gnosis_rpc_url: String,
+    pub gnosis_token_bridge_contract: String,
+    pub gnosis_token_bridge_deploy_block: String,
+
     pub base_rpc_url: String,
     pub base_token_bridge_contract: String,
-    pub base_token_bridge_deploy_block: String, // hex string, e.g. "0x1234567"
+    pub base_token_bridge_deploy_block: String,
+
+    // Non-EVM chains (see section 4)
+    pub solana_token_bridge_program: String,
+    pub near_rpc_url: String,
+    pub near_token_bridge_contract: String,
 }
 
 impl AppConfig {
     pub fn from_env() -> anyhow::Result<Self> {
         dotenvy::dotenv().ok();
 
+        // small local helper so we're not repeating .map_err(...) everywhere
+        fn required(key: &str) -> anyhow::Result<String> {
+            std::env::var(key).map_err(|_| anyhow::anyhow!("{key} not set"))
+        }
+        fn optional(key: &str, default: &str) -> String {
+            std::env::var(key).unwrap_or_else(|_| default.to_string())
+        }
+
         Ok(Self {
-            database_url: std::env::var("DATABASE_URL")
-                .map_err(|_| anyhow::anyhow!("DATABASE_URL not set"))?,
-            helius_url: std::env::var("HELIUS_URL")
-                .map_err(|_| anyhow::anyhow!("HELIUS_URL not set"))?,
-            wormhole_url: std::env::var("WORMHOLE_URL")
-                .unwrap_or_else(|_| "https://api.wormholescan.io".to_string()),
+            database_url: required("DATABASE_URL")?,
+            helius_url: required("HELIUS_URL")?,
+            wormhole_url: optional("WORMHOLE_URL", "https://api.wormholescan.io"),
             port: std::env::var("PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(8080),
 
-            base_rpc_url: std::env::var("BASE_RPC_URL")
-                .unwrap_or_else(|_| "https://mainnet.base.org".to_string()),
-            base_token_bridge_contract: std::env::var("BASE_TOKEN_BRIDGE_CONTRACT")
-                .map_err(|_| anyhow::anyhow!("BASE_TOKEN_BRIDGE_CONTRACT not set"))?,
-            base_token_bridge_deploy_block: std::env::var("BASE_TOKEN_BRIDGE_DEPLOY_BLOCK")
-                .unwrap_or_else(|_| "0x0".to_string()),
+            eth_rpc_url: optional("ETH_RPC_URL", "https://eth.llamarpc.com"),
+            eth_token_bridge_contract: required("ETH_TOKEN_BRIDGE_CONTRACT")?,
+            eth_token_bridge_deploy_block: optional("ETH_TOKEN_BRIDGE_DEPLOY_BLOCK", "0x0"),
+
+            bsc_rpc_url: optional("BSC_RPC_URL", "https://bsc-dataseed.binance.org"),
+            bsc_token_bridge_contract: required("BSC_TOKEN_BRIDGE_CONTRACT")?,
+            bsc_token_bridge_deploy_block: optional("BSC_TOKEN_BRIDGE_DEPLOY_BLOCK", "0x0"),
+
+            polygon_rpc_url: optional("POLYGON_RPC_URL", "https://polygon-rpc.com"),
+            polygon_token_bridge_contract: required("POLYGON_TOKEN_BRIDGE_CONTRACT")?,
+            polygon_token_bridge_deploy_block: optional("POLYGON_TOKEN_BRIDGE_DEPLOY_BLOCK", "0x0"),
+
+            avalanche_rpc_url: optional(
+                "AVALANCHE_RPC_URL",
+                "https://api.avax.network/ext/bc/C/rpc",
+            ),
+            avalanche_token_bridge_contract: required("AVALANCHE_TOKEN_BRIDGE_CONTRACT")?,
+            avalanche_token_bridge_deploy_block: optional(
+                "AVALANCHE_TOKEN_BRIDGE_DEPLOY_BLOCK",
+                "0x0",
+            ),
+
+            arbitrum_rpc_url: optional("ARBITRUM_RPC_URL", "https://arb1.arbitrum.io/rpc"),
+            arbitrum_token_bridge_contract: required("ARBITRUM_TOKEN_BRIDGE_CONTRACT")?,
+            arbitrum_token_bridge_deploy_block: optional(
+                "ARBITRUM_TOKEN_BRIDGE_DEPLOY_BLOCK",
+                "0x0",
+            ),
+
+            optimism_rpc_url: optional("OPTIMISM_RPC_URL", "https://mainnet.optimism.io"),
+            optimism_token_bridge_contract: required("OPTIMISM_TOKEN_BRIDGE_CONTRACT")?,
+            optimism_token_bridge_deploy_block: optional(
+                "OPTIMISM_TOKEN_BRIDGE_DEPLOY_BLOCK",
+                "0x0",
+            ),
+
+            gnosis_rpc_url: optional("GNOSIS_RPC_URL", "https://rpc.gnosischain.com"),
+            gnosis_token_bridge_contract: required("GNOSIS_TOKEN_BRIDGE_CONTRACT")?,
+            gnosis_token_bridge_deploy_block: optional("GNOSIS_TOKEN_BRIDGE_DEPLOY_BLOCK", "0x0"),
+
+            base_rpc_url: optional("BASE_RPC_URL", "https://mainnet.base.org"),
+            base_token_bridge_contract: required("BASE_TOKEN_BRIDGE_CONTRACT")?,
+            base_token_bridge_deploy_block: optional("BASE_TOKEN_BRIDGE_DEPLOY_BLOCK", "0x0"),
+
+            solana_token_bridge_program: required("SOLANA_TOKEN_BRIDGE_PROGRAM")?,
+            near_rpc_url: optional("NEAR_RPC_URL", "https://rpc.mainnet.near.org"),
+            near_token_bridge_contract: required("NEAR_TOKEN_BRIDGE_CONTRACT")?,
         })
     }
 }

@@ -9,7 +9,7 @@ use crate::error::AppError;
 use super::{ChainAdapter, DestinationTxInfo};
 
 const BLOCK_RANGE: u64 = 2000;
-const MAX_CHUNKS: u64 = 50; // ~100k blocks lookback before giving up
+const MAX_CHUNKS: u64 = 50;
 
 pub struct EvmAdapter {
     client: Client,
@@ -118,6 +118,40 @@ fn decode_string_return(hex_result: &str) -> Option<String> {
     String::from_utf8(data.to_vec()).ok()
 }
 
+fn decode_symbol(hex_result: &str) -> Option<String> {
+    let bytes = hex::decode(hex_result.trim_start_matches("0x")).ok()?;
+
+    // bytes32 return
+    if bytes.len() == 32 {
+        return String::from_utf8(bytes.iter().copied().take_while(|b| *b != 0).collect())
+            .ok()
+            .filter(|s| !s.is_empty());
+    }
+
+    // dynamic string return
+    if bytes.len() >= 64 {
+        let offset = u64::from_be_bytes(bytes[0..32].get(24..32)?.try_into().ok()?) as usize;
+
+        if offset + 32 > bytes.len() {
+            return None;
+        }
+
+        let len =
+            u64::from_be_bytes(bytes[offset..offset + 32].get(24..32)?.try_into().ok()?) as usize;
+
+        let start = offset + 32;
+        let end = start.checked_add(len)?;
+
+        let data = bytes.get(start..end)?;
+
+        return String::from_utf8(data.to_vec())
+            .ok()
+            .filter(|s| !s.is_empty());
+    }
+
+    None
+}
+
 #[async_trait]
 impl ChainAdapter for EvmAdapter {
     fn name(&self) -> &'static str {
@@ -179,10 +213,28 @@ impl ChainAdapter for EvmAdapter {
             "params": [{ "to": token_address, "data": "0x95d89b41" }, "latest"]
         });
         let resp = self.client.post(&self.rpc_url).json(&body).send().await?;
-        let payload: Value = resp.json().await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+
+        let payload: Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(token = %token_address, %status, body = %text, "non-JSON response from symbol() call: {e}");
+                return Ok(None);
+            }
+        };
+
+        if let Some(err) = payload.get("error") {
+            return Err(AppError::UpstreamProvider {
+                provider: self.name,
+                message: err.to_string(),
+            });
+        }
+
         Ok(payload
             .get("result")
             .and_then(Value::as_str)
-            .and_then(decode_string_return))
+            .and_then(decode_symbol))
     }
+    
 }
