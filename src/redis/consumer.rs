@@ -5,6 +5,7 @@ use crate::{domain::transaction::NormalisedTransaction, services::analyzer::anal
 use anyhow::{Context, Result};
 use redis::Value;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::ingestion::solana::CandidateTransaction;
@@ -17,16 +18,22 @@ pub struct RedisConsumer {
     client: redis::Client,
     state: AppState,
     consumer_name: String,
+    shutdown: CancellationToken,
 }
 
 impl RedisConsumer {
-    pub fn new(redis_url: &str, state: AppState, consumer_name: String) -> Result<Self> {
+    pub fn new(
+        redis_url: &str,
+        state: AppState,
+        consumer_name: String,
+        shutdown: CancellationToken,
+    ) -> Result<Self> {
         let client = redis::Client::open(redis_url)?;
-
         Ok(Self {
             client,
             state,
             consumer_name,
+            shutdown,
         })
     }
 
@@ -47,8 +54,8 @@ impl RedisConsumer {
         );
 
         loop {
-            let response: Value = redis::cmd("XREADGROUP")
-                .arg("GROUP")
+            let mut cmd = redis::cmd("XREADGROUP");
+            cmd.arg("GROUP")
                 .arg(CONSUMER_GROUP)
                 .arg(&self.consumer_name)
                 .arg("COUNT")
@@ -57,11 +64,46 @@ impl RedisConsumer {
                 .arg(5000)
                 .arg("STREAMS")
                 .arg(BRIDGE_TX_STREAM)
-                .arg(">")
-                .query_async(&mut connection)
-                .await?;
+                .arg(">");
+
+            let read_fut = cmd.query_async::<Value>(&mut connection);
+
+            let response = tokio::select! {
+                _ = self.shutdown.cancelled() => {
+                    info!(consumer = %self.consumer_name, "shutdown requested, stopping consumer");
+                    return Ok(());
+                }
+                result = read_fut => result?,
+            };
 
             self.process_messages(&mut connection, response).await?;
+        }
+    }
+
+    pub async fn run_recovery(&self) -> Result<()> {
+        let mut connection = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .context("failed to connect to Redis recovery worker")?;
+
+        info!(
+            stream = BRIDGE_TX_STREAM,
+            group = CONSUMER_GROUP,
+            consumer = %self.consumer_name,
+            "Redis recovery worker started"
+        );
+
+        loop {
+            self.reclaim_pending_messages(&mut connection).await?;
+
+            tokio::select! {
+                _ = self.shutdown.cancelled() => {
+                    info!("shutdown requested, stopping recovery worker");
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
         }
     }
 
@@ -243,27 +285,6 @@ impl RedisConsumer {
         self.process_messages(connection, response).await?;
 
         Ok(())
-    }
-
-    pub async fn run_recovery(&self) -> Result<()> {
-        let mut connection = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .context("failed to connect to Redis recovery worker")?;
-
-        info!(
-            stream = BRIDGE_TX_STREAM,
-            group = CONSUMER_GROUP,
-            consumer = %self.consumer_name,
-            "Redis recovery worker started"
-        );
-
-        loop {
-            self.reclaim_pending_messages(&mut connection).await?;
-
-            tokio::time::sleep(Duration::from_secs(30)).await;
-        }
     }
 
     async fn process_messages(

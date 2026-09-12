@@ -13,3 +13,4 @@ pub mod util;
 pub mod ingestion;
 pub mod redis;
 pub mod db;
+pub mod shutdown;

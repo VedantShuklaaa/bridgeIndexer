@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
 use std::time::Duration;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -28,6 +29,7 @@ pub struct SolanaIngester {
     db: PgPool,
     client: reqwest::Client,
     helius_url: String,
+    shutdown: CancellationToken,
 }
 
 impl SolanaIngester {
@@ -38,6 +40,7 @@ impl SolanaIngester {
         db: PgPool,
         client: reqwest::Client,
         helius_url: String,
+        shutdown: CancellationToken,
     ) -> Self {
         Self {
             ws_url,
@@ -46,22 +49,21 @@ impl SolanaIngester {
             db,
             client,
             helius_url,
+            shutdown,
         }
     }
 
     pub async fn run(&self) -> Result<()> {
         loop {
             match self.run_connection().await {
-                Ok(()) => {
-                    warn!("Solana WebSocket connection closed");
-                }
-                Err(error) => {
-                    error!(%error, "Solana ingestion connection failed");
-                }
+                Ok(()) => warn!("Solana WebSocket connection closed"),
+                Err(error) => error!(%error, "Solana ingestion connection failed"),
             }
 
-            info!("Reconnecting to Solana WebSocket in 5 seconds...");
-            sleep(Duration::from_secs(5)).await;
+            tokio::select! {
+                _ = self.shutdown.cancelled() => return Ok(()),
+                _ = sleep(Duration::from_secs(5)) => {}
+            }
         }
     }
 
@@ -105,25 +107,35 @@ impl SolanaIngester {
 
         self.backfill_missed_transactions().await?;
 
-        while let Some(message) = read.next().await {
-            let message = message.context("failed to read Solana WebSocket message")?;
-
-            match message {
-                Message::Text(text) => {
-                    self.handle_message(&text).await?;
+        loop {
+            tokio::select! {
+                _ = self.shutdown.cancelled() => {
+                    warn!("shutdown requested, closing Solana WebSocket");
+                    let _ = write.send(Message::Close(None)).await;
+                    return Ok(());
                 }
+                message = read.next() => {
+                    let Some(message) = message else { break; };
+                    let message = message.context("failed to read Solana WebSocket message")?;
 
-                Message::Ping(payload) => {
-                    info!("Received Solana WebSocket ping");
-                    write.send(Message::Pong(payload)).await?;
+                    match message {
+                        Message::Text(text) => {
+                            self.handle_message(&text).await?;
+                        }
+
+                        Message::Ping(payload) => {
+                            info!("Received Solana WebSocket ping");
+                            write.send(Message::Pong(payload)).await?;
+                        }
+
+                        Message::Close(_) => {
+                            warn!("Solana WebSocket sent close frame");
+                            break;
+                        }
+
+                        _ => {}
+                    }
                 }
-
-                Message::Close(_) => {
-                    warn!("Solana WebSocket sent close frame");
-                    break;
-                }
-
-                _ => {}
             }
         }
 

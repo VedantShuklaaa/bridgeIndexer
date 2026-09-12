@@ -120,10 +120,10 @@ pub async fn get_last_ingested_slot(pool: &PgPool) -> Result<u64> {
         WHERE key = 'solana_last_ingested_slot'
         "#
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
 
-    Ok(row.value.parse()?)
+    Ok(row.map(|r| r.value.parse()).transpose()?.unwrap_or(0))
 }
 
 pub async fn set_last_ingested_slot(pool: &PgPool, slot: u64) -> Result<()> {
