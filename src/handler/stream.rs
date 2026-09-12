@@ -6,18 +6,17 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::state::AppState;
 
-pub async fn live_ws_handler(
+pub async fn stream_ws_handler(
     State(state): State<AppState>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-async fn stream_ws_handler(socket: WebSocket, state: AppState) {
+async fn handle_socket(socket: WebSocket, state: AppState) {
     let mut rx = state.tx_broadcast.subscribe();
     let (mut sender, mut receiver) = socket.split();
 
-    // Just drains pings/close frames so we notice disconnects; client doesn't need to send anything.
     let mut recv_task =
         tokio::spawn(async move { while let Some(Ok(_)) = receiver.next().await {} });
 

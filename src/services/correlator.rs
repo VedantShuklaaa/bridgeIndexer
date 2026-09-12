@@ -11,8 +11,8 @@ pub struct CorrelateParams {
     pub message_id: BridgeMessageId,
     pub destination_chain_id: u16,
     pub token: Option<String>,
-    pub token_chain: u16,                         // NEW
-    pub wormholescan_symbol_hint: Option<String>, // was `token_symbol`, renamed for clarity
+    pub token_chain: u16,                         
+    pub wormholescan_symbol_hint: Option<String>, 
     pub raw_amount: Option<u128>,
     pub amount: Option<String>,
     pub destination_wallet: Option<String>,
@@ -59,8 +59,7 @@ pub async fn correlate(
                     Some(info) => (Some(info.tx_hash), BridgeStatus::Completed),
                     None => (None, BridgeStatus::Pending),
                 },
-                // No EVM adapter — but if WormholeScan itself was checked, that's
-                // still a genuine check, not "unsupported chain."
+
                 None => match wormholescan_adapter {
                     Some(_) => (None, BridgeStatus::Pending),
                     None => (None, BridgeStatus::Detected),
@@ -72,7 +71,6 @@ pub async fn correlate(
     let effective_raw_amount: Option<u128> =
         raw_amount.or_else(|| amount.as_ref().and_then(|a| a.parse::<u128>().ok()));
 
-    // NEW: keyed by token_chain, not destination_chain_id.
     let metadata = match &token {
         Some(token_addr) => {
             resolve_token_metadata(registry, token_chain, token_addr, wormholescan_symbol_hint)
@@ -92,7 +90,7 @@ pub async fn correlate(
         .and_then(|h| explorer_tx_url(destination_chain_id, h));
 
     Ok(BridgeTransfer {
-        source_chain: ChainId::Solana,
+        source_chain: ChainId::from_wormhole_id(message_id.emitter_chain),
         source_tx_hash,
         source_wallet,
         source_explorer_url,
