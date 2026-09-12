@@ -45,6 +45,8 @@ pub struct AppConfig {
     pub near_token_bridge_contract: String,
 
     pub solana_ws_url: String,
+
+    pub allowed_origins: Vec<String>,
 }
 
 impl AppConfig {
@@ -57,6 +59,15 @@ impl AppConfig {
         }
         fn optional(key: &str, default: &str) -> String {
             std::env::var(key).unwrap_or_else(|_| default.to_string())
+        }
+
+        fn csv_list(key: &str) -> Vec<String> {
+            std::env::var(key)
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
         }
 
         Ok(Self {
@@ -117,6 +128,7 @@ impl AppConfig {
             solana_ws_url: required("SOLANA_WS_URL")?,
             near_rpc_url: optional("NEAR_RPC_URL", "https://rpc.mainnet.near.org"),
             near_token_bridge_contract: required("NEAR_TOKEN_BRIDGE_CONTRACT")?,
+            allowed_origins: csv_list("ALLOWED_ORIGINS"),
         })
     }
 }

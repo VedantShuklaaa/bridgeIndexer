@@ -382,6 +382,19 @@ impl RedisConsumer {
                             "Transaction persisted successfully"
                         );
 
+                        match serde_json::to_string(&analysed) {
+                            Ok(payload) => {
+                                // Err just means no WS clients are currently connected — fine to ignore.
+                                let _ = self.state.tx_broadcast.send(payload);
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    ?error,
+                                    "Failed to serialize transaction for broadcast"
+                                );
+                            }
+                        }
+
                         let _: i64 = redis::cmd("XACK")
                             .arg(BRIDGE_TX_STREAM)
                             .arg(CONSUMER_GROUP)
