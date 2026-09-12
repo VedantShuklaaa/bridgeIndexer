@@ -30,7 +30,7 @@ pub async fn analyse_tx(state: &AppState, hash: &str) -> Result<NormalisedTransa
                 .get("vaa")
                 .and_then(|v| v.get("raw"))
                 .and_then(|r| r.as_str())
-                .ok_or_else(|| AppError::Normalisation("missing vaa.raw".into()))?;
+                .ok_or_else(|| AppError::VaaNotAvailable(hash.to_string()))?;
 
             let decoded = decode_vaa(vaa_b64)?;
 
@@ -61,7 +61,7 @@ pub async fn analyse_tx(state: &AppState, hash: &str) -> Result<NormalisedTransa
                 .as_ref()
                 .map(|t| t.token_chain)
                 .or_else(|| extract_wormholescan_number_field(&wh_raw, "tokenChain"));
-            
+
             // NEW: raw u128, kept separate from the display string — needed
             // so the correlator can divide by the token's real decimals.
             // Only available when our own VAA decode recognized the payload;

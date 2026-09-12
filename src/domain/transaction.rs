@@ -1,10 +1,18 @@
-use serde::Serialize;
 use super::bridge::BridgeEvent;
 use super::bridge_transfer::BridgeTransfer;
+use serde::Serialize;
 
 #[derive(Debug, Serialize)]
 pub enum Chain {
     Solana,
+}
+
+impl Chain {
+    pub fn wormhole_id(&self) -> u16 {
+        match self {
+            Chain::Solana => 1,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

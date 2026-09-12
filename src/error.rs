@@ -13,6 +13,9 @@ pub enum AppError {
     #[error("transaction not found: {0}")]
     TransactionNotFound(String),
 
+    #[error("VAA not available for transaction: {0}")]
+    VaaNotAvailable(String),
+
     #[error("upstream provider error ({provider}): {message}")]
     UpstreamProvider {
         provider: &'static str,
@@ -51,6 +54,7 @@ impl AppError {
         match self {
             AppError::InvalidTransactionHash(_) => (StatusCode::BAD_REQUEST, "INVALID_TX_HASH"),
             AppError::TransactionNotFound(_) => (StatusCode::NOT_FOUND, "TX_NOT_FOUND"),
+            AppError::VaaNotAvailable(_) => (StatusCode::NOT_FOUND, "VAA_NOT_AVAILABLE"),
             AppError::UpstreamProvider { .. } => (StatusCode::BAD_GATEWAY, "UPSTREAM_ERROR"),
             AppError::UpstreamRateLimited(_) => {
                 (StatusCode::TOO_MANY_REQUESTS, "UPSTREAM_RATE_LIMITED")

@@ -32,10 +32,32 @@ async fn main() -> anyhow::Result<()> {
     let redis = RedisProducer::new(&config.redis_url)?;
     redis.test_connection().await?;
 
-    let redis_consumer = RedisConsumer::new(&config.redis_url, state.clone())?;
+    for worker_id in 1..=5 {
+        let worker_name = format!("worker-{worker_id}");
+
+        let redis_consumer =
+            RedisConsumer::new(&config.redis_url, state.clone(), worker_name.clone())?;
+
+        tokio::spawn(async move {
+            if let Err(error) = redis_consumer.run().await {
+                tracing::error!(
+                    consumer = %worker_name,
+                    ?error,
+                    "Redis consumer stopped"
+                );
+            }
+        });
+    }
+
+    let recovery_consumer = RedisConsumer::new(
+        &config.redis_url,
+        state.clone(),
+        "recovery-worker".to_string(),
+    )?;
+
     tokio::spawn(async move {
-        if let Err(error) = redis_consumer.run().await {
-            tracing::error!(?error, "Redis consumer stopped");
+        if let Err(error) = recovery_consumer.run_recovery().await {
+            tracing::error!(?error, "Redis recovery worker stopped");
         }
     });
 

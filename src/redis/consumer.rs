@@ -1,3 +1,4 @@
+use crate::db::repository::persist_transaction;
 use crate::error::AppError;
 use crate::state::AppState;
 use crate::{domain::transaction::NormalisedTransaction, services::analyzer::analyse_tx};
@@ -10,18 +11,23 @@ use crate::ingestion::solana::CandidateTransaction;
 
 const BRIDGE_TX_STREAM: &str = "bridge:transactions";
 const CONSUMER_GROUP: &str = "bridge-workers";
-const CONSUMER_NAME: &str = "worker-1";
+const FAILED_TX_STREAM: &str = "bridge:transactions:failed";
 
 pub struct RedisConsumer {
     client: redis::Client,
     state: AppState,
+    consumer_name: String,
 }
 
 impl RedisConsumer {
-    pub fn new(redis_url: &str, state: AppState) -> Result<Self> {
+    pub fn new(redis_url: &str, state: AppState, consumer_name: String) -> Result<Self> {
         let client = redis::Client::open(redis_url)?;
 
-        Ok(Self { client, state })
+        Ok(Self {
+            client,
+            state,
+            consumer_name,
+        })
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -36,7 +42,7 @@ impl RedisConsumer {
         info!(
             stream = BRIDGE_TX_STREAM,
             group = CONSUMER_GROUP,
-            consumer = CONSUMER_NAME,
+            consumer = %self.consumer_name,
             "Redis consumer started"
         );
 
@@ -44,7 +50,7 @@ impl RedisConsumer {
             let response: Value = redis::cmd("XREADGROUP")
                 .arg("GROUP")
                 .arg(CONSUMER_GROUP)
-                .arg(CONSUMER_NAME)
+                .arg(&self.consumer_name)
                 .arg("COUNT")
                 .arg(10)
                 .arg("BLOCK")
@@ -55,7 +61,7 @@ impl RedisConsumer {
                 .query_async(&mut connection)
                 .await?;
 
-            self.process_messages(response).await?;
+            self.process_messages(&mut connection, response).await?;
         }
     }
 
@@ -102,7 +108,9 @@ impl RedisConsumer {
             match analyse_tx(&self.state, tx_hash).await {
                 Ok(tx) => return Ok(tx),
 
-                Err(AppError::TransactionNotFound(_)) if attempt < MAX_ATTEMPTS => {
+                Err(AppError::TransactionNotFound(_)) | Err(AppError::VaaNotAvailable(_))
+                    if attempt < MAX_ATTEMPTS =>
+                {
                     let delay_ms = 500 * 2_u64.pow(attempt - 1);
 
                     tracing::warn!(
@@ -122,7 +130,77 @@ impl RedisConsumer {
         unreachable!()
     }
 
-    async fn process_messages(&self, response: Value) -> Result<()> {
+    async fn reclaim_pending_messages(
+        &self,
+        connection: &mut redis::aio::MultiplexedConnection,
+    ) -> Result<()> {
+        let response: Value = redis::cmd("XAUTOCLAIM")
+            .arg(BRIDGE_TX_STREAM)
+            .arg(CONSUMER_GROUP)
+            .arg(&self.consumer_name)
+            .arg(5 * 60 * 1000)
+            .arg("0-0")
+            .arg("COUNT")
+            .arg(10)
+            .query_async(&mut *connection)
+            .await?;
+
+        let Value::Array(mut parts) = response else {
+            return Ok(());
+        };
+
+        if parts.len() < 2 {
+            return Ok(());
+        }
+
+        let messages = parts.remove(1);
+
+        let Value::Array(messages) = messages else {
+            return Ok(());
+        };
+
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        info!(count = messages.len(), "Reclaimed pending Redis messages");
+
+        let response = Value::Array(vec![Value::Array(vec![
+            Value::BulkString(BRIDGE_TX_STREAM.as_bytes().to_vec()),
+            Value::Array(messages),
+        ])]);
+
+        self.process_messages(connection, response).await?;
+
+        Ok(())
+    }
+
+    pub async fn run_recovery(&self) -> Result<()> {
+        let mut connection = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .context("failed to connect to Redis recovery worker")?;
+
+        info!(
+            stream = BRIDGE_TX_STREAM,
+            group = CONSUMER_GROUP,
+            consumer = %self.consumer_name,
+            "Redis recovery worker started"
+        );
+
+        loop {
+            self.reclaim_pending_messages(&mut connection).await?;
+
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    }
+
+    async fn process_messages(
+        &self,
+        connection: &mut redis::aio::MultiplexedConnection,
+        response: Value,
+    ) -> Result<()> {
         let Value::Array(streams) = response else {
             return Ok(());
         };
@@ -206,23 +284,89 @@ impl RedisConsumer {
                 );
 
                 match self.analyse_with_retry(&candidate.tx_hash).await {
-                    Ok(_analysed) => {
-                        info!(
+                    Ok(analysed) => {
+                        if let Err(error) = persist_transaction(&self.state.db, &analysed).await {
+                            tracing::error!(
+                                worker = %self.consumer_name,
+                                message_id = %message_id,
+                                tx_hash = %candidate.tx_hash,
+                                ?error,
+                                "Failed to persist transaction"
+                            );
+
+                            continue;
+                        }
+
+                        tracing::info!(
+                            worker = %self.consumer_name,
                             message_id = %message_id,
                             tx_hash = %candidate.tx_hash,
-                            "Transaction analysed successfully"
+                            "Transaction persisted successfully"
+                        );
+
+                        let _: i64 = redis::cmd("XACK")
+                            .arg(BRIDGE_TX_STREAM)
+                            .arg(CONSUMER_GROUP)
+                            .arg(&message_id)
+                            .query_async(&mut *connection)
+                            .await?;
+
+                        tracing::info!(
+                            worker = %self.consumer_name,
+                            message_id = %message_id,
+                            tx_hash = %candidate.tx_hash,
+                            "Redis message acknowledged"
                         );
                     }
 
                     Err(error) => {
                         tracing::error!(
+                            worker = %self.consumer_name,
                             message_id = %message_id,
                             tx_hash = %candidate.tx_hash,
                             ?error,
                             "Failed to analyse transaction"
                         );
 
-                        continue;
+                        match error {
+                            AppError::InvalidTransactionHash(_)
+                            | AppError::Normalisation(_)
+                            | AppError::BadRequest(_) => {
+                                let _: String = redis::cmd("XADD")
+                                    .arg(FAILED_TX_STREAM)
+                                    .arg("*")
+                                    .arg("message_id")
+                                    .arg(&message_id)
+                                    .arg("chain")
+                                    .arg(&candidate.chain)
+                                    .arg("tx_hash")
+                                    .arg(&candidate.tx_hash)
+                                    .arg("slot")
+                                    .arg(candidate.slot)
+                                    .arg("error")
+                                    .arg(error.to_string())
+                                    .query_async(&mut *connection)
+                                    .await?;
+
+                                let _: i64 = redis::cmd("XACK")
+                                    .arg(BRIDGE_TX_STREAM)
+                                    .arg(CONSUMER_GROUP)
+                                    .arg(&message_id)
+                                    .query_async(&mut *connection)
+                                    .await?;
+
+                                tracing::error!(
+                                    worker = %self.consumer_name,
+                                    message_id = %message_id,
+                                    tx_hash = %candidate.tx_hash,
+                                    "Moved failed transaction to dead-letter stream"
+                                );
+                            }
+
+                            _ => {
+                                continue;
+                            }
+                        }
                     }
                 }
             }
