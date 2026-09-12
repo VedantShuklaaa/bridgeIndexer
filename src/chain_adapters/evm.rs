@@ -9,12 +9,13 @@ use crate::error::AppError;
 use super::{ChainAdapter, DestinationTxInfo};
 
 const BLOCK_RANGE: u64 = 2000;
-const MAX_CHUNKS: u64 = 50;
+const MAX_CHUNKS: u64 = 500;
 
 pub struct EvmAdapter {
     client: Client,
     rpc_url: String,
     token_bridge_contract: String,
+    deploy_block: u64,
     name: &'static str,
 }
 
@@ -23,13 +24,17 @@ impl EvmAdapter {
         client: Client,
         rpc_url: String,
         token_bridge_contract: String,
-        _from_block_hex: String,
+        from_block_hex: String,
         name: &'static str,
     ) -> Self {
+        let deploy_block =
+            u64::from_str_radix(from_block_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+
         Self {
             client,
             rpc_url,
             token_bridge_contract,
+            deploy_block,
             name,
         }
     }
@@ -163,7 +168,7 @@ impl ChainAdapter for EvmAdapter {
         let mut to = latest;
 
         for _ in 0..MAX_CHUNKS {
-            let from = to.saturating_sub(BLOCK_RANGE - 1);
+            let from = to.saturating_sub(BLOCK_RANGE - 1).max(self.deploy_block);
             let logs = self.get_logs_in_range(from, to, &topics).await?;
 
             if !logs.is_empty() {
@@ -175,7 +180,7 @@ impl ChainAdapter for EvmAdapter {
                 return Ok(Some(DestinationTxInfo { tx_hash }));
             }
 
-            if from == 0 {
+            if from <= self.deploy_block {
                 break;
             }
             to = from - 1;

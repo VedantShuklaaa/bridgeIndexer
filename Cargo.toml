@@ -18,6 +18,7 @@ dotenvy = "0.15"
 async-trait = "0.1.92"
 base64 = "0.22"
 hex = "0.4"
+bs58 = "0.5"
 sha3 = "0.10"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 rustls = { version = "0.23", features = ["ring"] }

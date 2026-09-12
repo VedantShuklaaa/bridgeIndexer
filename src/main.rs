@@ -1,5 +1,6 @@
 use bridge::chain_adapters::setup::build_registry;
 use bridge::config::AppConfig;
+use bridge::db;
 use bridge::ingestion::solana::SolanaIngester;
 use bridge::redis::consumer::RedisConsumer;
 use bridge::redis::producer::RedisProducer;
@@ -7,7 +8,32 @@ use bridge::routes::build_router;
 use bridge::state::AppState;
 use reqwest::Client;
 use rustls::crypto::ring;
-use sqlx::postgres::PgPoolOptions;
+use std::future::Future;
+use std::time::Duration;
+
+fn spawn_supervised<F, Fut>(task_name: &'static str, make_task: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            match tokio::spawn(make_task()).await {
+                Ok(Ok(())) => {
+                    tracing::warn!(task = task_name, "worker exited cleanly, restarting");
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(task = task_name, ?error, "worker failed, restarting");
+                }
+                Err(join_error) => {
+                    tracing::error!(task = task_name, ?join_error, "worker panicked, restarting");
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -17,9 +43,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let config = AppConfig::from_env()?;
-    let db = PgPoolOptions::new()
-        .max_connections(5)
-        .connect_lazy(&config.database_url)?;
+    let db = db::connection::connect(&config.database_url).await?;
 
     let http_client = Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -27,51 +51,64 @@ async fn main() -> anyhow::Result<()> {
 
     let registry = build_registry(&config, &http_client);
 
-    let state = AppState::new(db, config.clone(), http_client.clone(), registry)?;
+    let state = AppState::new(db.clone(), config.clone(), http_client.clone(), registry)?;
 
-    let redis = RedisProducer::new(&config.redis_url)?;
+    let redis = RedisProducer::new(&config.redis_url).await?;
     redis.test_connection().await?;
 
     for worker_id in 1..=5 {
         let worker_name = format!("worker-{worker_id}");
+        let redis_url = config.redis_url.clone();
+        let worker_state = state.clone();
 
-        let redis_consumer =
-            RedisConsumer::new(&config.redis_url, state.clone(), worker_name.clone())?;
+        spawn_supervised("redis-consumer", move || {
+            let redis_url = redis_url.clone();
+            let worker_state = worker_state.clone();
+            let worker_name = worker_name.clone();
 
-        tokio::spawn(async move {
-            if let Err(error) = redis_consumer.run().await {
-                tracing::error!(
-                    consumer = %worker_name,
-                    ?error,
-                    "Redis consumer stopped"
-                );
+            async move {
+                RedisConsumer::new(&redis_url, worker_state, worker_name)?
+                    .run()
+                    .await
             }
         });
     }
 
-    let recovery_consumer = RedisConsumer::new(
-        &config.redis_url,
-        state.clone(),
-        "recovery-worker".to_string(),
-    )?;
+    {
+        let redis_url = config.redis_url.clone();
+        let recovery_state = state.clone();
 
-    tokio::spawn(async move {
-        if let Err(error) = recovery_consumer.run_recovery().await {
-            tracing::error!(?error, "Redis recovery worker stopped");
-        }
-    });
+        spawn_supervised("redis-recovery", move || {
+            let redis_url = redis_url.clone();
+            let recovery_state = recovery_state.clone();
 
-    let solana_ingester = SolanaIngester::new(
-        config.solana_ws_url.clone(),
-        config.solana_token_bridge_program.clone(),
-        redis,
-    );
+            async move {
+                RedisConsumer::new(&redis_url, recovery_state, "recovery-worker".to_string())?
+                    .run_recovery()
+                    .await
+            }
+        });
+    }
 
-    tokio::spawn(async move {
-        if let Err(error) = solana_ingester.run().await {
-            tracing::error!(%error, "Solana ingester stopped");
-        }
-    });
+    {
+        let ws_url = config.solana_ws_url.clone();
+        let bridge_program = config.solana_token_bridge_program.clone();
+
+        let solana_ingester = SolanaIngester::new(
+            ws_url,
+            bridge_program,
+            redis,
+            db.clone(),
+            http_client.clone(),
+            config.helius_url.clone(),
+        );
+
+        tokio::spawn(async move {
+            if let Err(error) = solana_ingester.run().await {
+                tracing::error!(%error, "Solana ingester stopped");
+            }
+        });
+    }
 
     let app = build_router(state);
 

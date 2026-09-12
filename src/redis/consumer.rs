@@ -108,7 +108,10 @@ impl RedisConsumer {
             match analyse_tx(&self.state, tx_hash).await {
                 Ok(tx) => return Ok(tx),
 
-                Err(AppError::TransactionNotFound(_)) | Err(AppError::VaaNotAvailable(_))
+                Err(AppError::TransactionNotFound(_))
+                | Err(AppError::VaaNotAvailable(_))
+                | Err(AppError::UpstreamRateLimited(_))
+                | Err(AppError::UpstreamTimeout(_))
                     if attempt < MAX_ATTEMPTS =>
                 {
                     let delay_ms = 500 * 2_u64.pow(attempt - 1);
@@ -128,6 +131,73 @@ impl RedisConsumer {
         }
 
         unreachable!()
+    }
+
+    async fn persist_with_retry(&self, transaction: &NormalisedTransaction) -> Result<()> {
+        const MAX_ATTEMPTS: u32 = 3;
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            match persist_transaction(&self.state.db, transaction).await {
+                Ok(()) => return Ok(()),
+
+                Err(error) if attempt < MAX_ATTEMPTS => {
+                    let delay_ms = 1000 * 2_u64.pow(attempt - 1);
+
+                    tracing::warn!(
+                        worker = %self.consumer_name,
+                        attempt,
+                        delay_ms,
+                        ?error,
+                        "Database persistence failed, retrying"
+                    );
+
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+
+                Err(error) => return Err(error),
+            }
+        }
+
+        unreachable!()
+    }
+    async fn dead_letter(
+        &self,
+        connection: &mut redis::aio::MultiplexedConnection,
+        message_id: &str,
+        candidate: &CandidateTransaction,
+        error: &str,
+    ) -> Result<()> {
+        let _: String = redis::cmd("XADD")
+            .arg(FAILED_TX_STREAM)
+            .arg("*")
+            .arg("message_id")
+            .arg(message_id)
+            .arg("chain")
+            .arg(&candidate.chain)
+            .arg("tx_hash")
+            .arg(&candidate.tx_hash)
+            .arg("slot")
+            .arg(candidate.slot)
+            .arg("error")
+            .arg(error)
+            .query_async(&mut *connection)
+            .await?;
+
+        let _: i64 = redis::cmd("XACK")
+            .arg(BRIDGE_TX_STREAM)
+            .arg(CONSUMER_GROUP)
+            .arg(message_id)
+            .query_async(&mut *connection)
+            .await?;
+
+        tracing::error!(
+            worker = %self.consumer_name,
+            message_id = %message_id,
+            tx_hash = %candidate.tx_hash,
+            "Moved failed transaction to dead-letter stream"
+        );
+
+        Ok(())
     }
 
     async fn reclaim_pending_messages(
@@ -285,14 +355,22 @@ impl RedisConsumer {
 
                 match self.analyse_with_retry(&candidate.tx_hash).await {
                     Ok(analysed) => {
-                        if let Err(error) = persist_transaction(&self.state.db, &analysed).await {
+                        if let Err(error) = self.persist_with_retry(&analysed).await {
                             tracing::error!(
                                 worker = %self.consumer_name,
                                 message_id = %message_id,
                                 tx_hash = %candidate.tx_hash,
                                 ?error,
-                                "Failed to persist transaction"
+                                "Failed to persist transaction after retries"
                             );
+
+                            self.dead_letter(
+                                connection,
+                                &message_id,
+                                &candidate,
+                                &error.to_string(),
+                            )
+                            .await?;
 
                             continue;
                         }
@@ -328,45 +406,8 @@ impl RedisConsumer {
                             "Failed to analyse transaction"
                         );
 
-                        match error {
-                            AppError::InvalidTransactionHash(_)
-                            | AppError::Normalisation(_)
-                            | AppError::BadRequest(_) => {
-                                let _: String = redis::cmd("XADD")
-                                    .arg(FAILED_TX_STREAM)
-                                    .arg("*")
-                                    .arg("message_id")
-                                    .arg(&message_id)
-                                    .arg("chain")
-                                    .arg(&candidate.chain)
-                                    .arg("tx_hash")
-                                    .arg(&candidate.tx_hash)
-                                    .arg("slot")
-                                    .arg(candidate.slot)
-                                    .arg("error")
-                                    .arg(error.to_string())
-                                    .query_async(&mut *connection)
-                                    .await?;
-
-                                let _: i64 = redis::cmd("XACK")
-                                    .arg(BRIDGE_TX_STREAM)
-                                    .arg(CONSUMER_GROUP)
-                                    .arg(&message_id)
-                                    .query_async(&mut *connection)
-                                    .await?;
-
-                                tracing::error!(
-                                    worker = %self.consumer_name,
-                                    message_id = %message_id,
-                                    tx_hash = %candidate.tx_hash,
-                                    "Moved failed transaction to dead-letter stream"
-                                );
-                            }
-
-                            _ => {
-                                continue;
-                            }
-                        }
+                        self.dead_letter(connection, &message_id, &candidate, &error.to_string())
+                            .await?;
                     }
                 }
             }

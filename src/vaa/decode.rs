@@ -28,9 +28,9 @@ fn is_evm_chain(chain_id: u16) -> bool {
 pub fn decode_destination_address(chain_id: u16, hex32: &str) -> Option<String> {
     if is_evm_chain(chain_id) {
         to_evm_address(hex32)
+    } else if chain_id == 1 {
+        to_solana_address(hex32)
     } else {
-        // Not wrong, just undecoded — still useful for the user to see,
-        // and truthful about what we do/don't know how to parse yet.
         Some(format!("0x{hex32}"))
     }
 }
@@ -39,9 +39,6 @@ pub struct DecodedVaa {
     pub transfer: Option<TokenTransferPayload>,
 }
 
-/// [version:1][guardian_set_index:4][num_sigs:1][sigs: num_sigs*66]
-/// [timestamp:4][nonce:4][emitter_chain:2][emitter_address:32][sequence:8]
-/// [consistency_level:1][payload:N]
 pub fn decode_vaa(vaa_b64: &str) -> Result<DecodedVaa, AppError> {
     let bytes = STANDARD
         .decode(vaa_b64)
@@ -84,8 +81,6 @@ pub fn decode_vaa(vaa_b64: &str) -> Result<DecodedVaa, AppError> {
     })
 }
 
-/// Token Bridge "Transfer" (id=1) / "TransferWithPayload" (id=3) layout:
-/// [payload_id:1][amount:32][token_address:32][token_chain:2][to:32][to_chain:2][fee:32?]
 fn decode_token_transfer(payload: &[u8]) -> Result<TokenTransferPayload, AppError> {
     if payload.len() < 101 {
         return Err(AppError::Normalisation("transfer payload too short".into()));
@@ -100,14 +95,12 @@ fn decode_token_transfer(payload: &[u8]) -> Result<TokenTransferPayload, AppErro
     })
 }
 
-/// Wormhole amounts are 32-byte big-endian integers, normalized to 8 decimals.
 fn u128_from_last16(bytes32: &[u8]) -> u128 {
     let mut buf = [0u8; 16];
     buf.copy_from_slice(&bytes32[16..32]);
     u128::from_be_bytes(buf)
 }
 
-/// Converts a 32-byte Wormhole-format address to an EVM 0x-prefixed address
 /// (last 20 bytes).
 pub fn to_evm_address(hex32: &str) -> Option<String> {
     let bytes = hex::decode(hex32).ok()?;
@@ -115,6 +108,14 @@ pub fn to_evm_address(hex32: &str) -> Option<String> {
         return None;
     }
     Some(format!("0x{}", hex::encode(&bytes[12..32])))
+}
+
+pub fn to_solana_address(hex32: &str) -> Option<String> {
+    let bytes = hex::decode(hex32).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    Some(bs58::encode(bytes).into_string())
 }
 
 pub fn format_amount(raw: u128, real_decimals: Option<u8>) -> String {

@@ -1,7 +1,7 @@
-use sqlx::{PgPool, Postgres, Transaction};
-
 use crate::domain::bridge_transfer::BridgeTransfer;
 use crate::domain::transaction::NormalisedTransaction;
+use anyhow::Result;
+use sqlx::{PgPool, Postgres, Transaction};
 
 pub async fn persist_transaction(pool: &PgPool, tx: &NormalisedTransaction) -> anyhow::Result<()> {
     let mut db_tx: Transaction<'_, Postgres> = pool.begin().await?;
@@ -74,7 +74,7 @@ async fn persist_bridge_transfer(
         )
         VALUES (
             $1, $2, $3, $4, $5,
-            $6, $7, $8,
+            $6, $7, $8::numeric,
             $9, $10, $11, $12,
             $13, $14, $15, $16, $17
         )
@@ -96,7 +96,7 @@ async fn persist_bridge_transfer(
     .bind(&bridge.source_explorer_url)
     .bind(bridge.message_id.emitter_chain as i16)
     .bind(&bridge.message_id.emitter_address)
-    .bind(bridge.message_id.sequence as i64)
+    .bind(bridge.message_id.sequence.to_string())
     .bind(bridge.destination_chain.wormhole_id() as i16)
     .bind(&bridge.destination_wallet)
     .bind(&bridge.destination_tx_hash)
@@ -107,6 +107,42 @@ async fn persist_bridge_transfer(
     .bind(&bridge.amount_formatted)
     .bind(format!("{:?}", bridge.status))
     .execute(&mut **db_tx)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn get_last_ingested_slot(pool: &PgPool) -> Result<u64> {
+    let row = sqlx::query!(
+        r#"
+        SELECT value
+        FROM indexer_state
+        WHERE key = 'solana_last_ingested_slot'
+        "#
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.value.parse()?)
+}
+
+pub async fn set_last_ingested_slot(pool: &PgPool, slot: u64) -> Result<()> {
+    sqlx::query!(
+        r#"
+        INSERT INTO indexer_state (key, value, updated_at)
+        VALUES (
+            'solana_last_ingested_slot',
+            $1,
+            NOW()
+        )
+        ON CONFLICT (key)
+        DO UPDATE SET
+            value = EXCLUDED.value,
+            updated_at = NOW()
+        "#,
+        slot.to_string()
+    )
+    .execute(pool)
     .await?;
 
     Ok(())

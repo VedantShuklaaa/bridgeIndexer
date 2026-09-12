@@ -46,7 +46,3 @@ pub fn normalise(raw: Value) -> Result<BridgeEvent, AppError> {
         amount,
     })
 }
-
-pub fn extract_destination(_raw: &Value) -> Option<(u64, String)> {
-    None
-}

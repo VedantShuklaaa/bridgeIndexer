@@ -42,8 +42,16 @@ impl ChainAdapter for WormholeScanAdapter {
         );
 
         let resp = self.client.get(&url).send().await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
         if !resp.status().is_success() {
-            return Ok(None); // treat as "not confirmed yet", fall through to real adapter
+            return Err(AppError::UpstreamProvider {
+                provider: self.name,
+                message: format!("status {}", resp.status()),
+            });
         }
 
         let payload: Value = resp.json().await?;
