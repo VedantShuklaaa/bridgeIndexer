@@ -2,7 +2,8 @@ use anyhow::Result;
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 
-use crate::ingestion::solana::CandidateTransaction;
+use crate::ingestion::types::CandidateTransaction;
+
 
 const BRIDGE_TX_STREAM: &str = "bridge:transactions";
 

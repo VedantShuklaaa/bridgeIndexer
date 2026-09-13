@@ -9,18 +9,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::{
-    clients::helius::get_signatures_for_address,
-    db::repository::{get_last_ingested_slot, set_last_ingested_slot},
-    ingestion::types::{LogsConfig, LogsFilter, SolanaRpcRequest},
-    redis::producer::RedisProducer,
+    clients::helius::get_signatures_for_address, db::repository::{get_last_ingested_slot, set_last_ingested_slot}, ingestion::types::{CandidateTransaction, LogsConfig, LogsFilter, SolanaRpcRequest}, redis::producer::RedisProducer,
 };
-
-#[derive(Debug, Clone)]
-pub struct CandidateTransaction {
-    pub chain: String,
-    pub tx_hash: String,
-    pub slot: u64,
-}
 
 pub struct SolanaIngester {
     ws_url: String,
@@ -145,7 +135,7 @@ impl SolanaIngester {
     }
 
     async fn backfill_missed_transactions(&self) -> Result<()> {
-        let last_ingested_slot = get_last_ingested_slot(&self.db).await?;
+        let last_ingested_slot = get_last_ingested_slot(&self.db, "solana").await?;
 
         info!(last_ingested_slot, "Starting Solana transaction backfill");
 
@@ -289,7 +279,7 @@ impl SolanaIngester {
             .await
             .context("failed to publish transaction to Redis")?;
 
-        set_last_ingested_slot(&self.db, candidate.slot)
+        set_last_ingested_slot(&self.db, "solana", candidate.slot)
             .await
             .context("failed to update Solana ingestion checkpoint")?;
 

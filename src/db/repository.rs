@@ -112,38 +112,26 @@ async fn persist_bridge_transfer(
     Ok(())
 }
 
-pub async fn get_last_ingested_slot(pool: &PgPool) -> Result<u64> {
-    let row = sqlx::query!(
-        r#"
-        SELECT value
-        FROM indexer_state
-        WHERE key = 'solana_last_ingested_slot'
-        "#
-    )
-    .fetch_optional(pool)
-    .await?;
+pub async fn get_last_ingested_slot(pool: &PgPool, chain: &str) -> Result<u64> {
+    let key = format!("{chain}_last_ingested_slot");
+    let value: Option<String> =
+        sqlx::query_scalar("SELECT value FROM indexer_state WHERE key = $1")
+            .bind(&key)
+            .fetch_optional(pool)
+            .await?;
 
-    Ok(row.map(|r| r.value.parse()).transpose()?.unwrap_or(0))
+    Ok(value.map(|v| v.parse()).transpose()?.unwrap_or(0))
 }
 
-pub async fn set_last_ingested_slot(pool: &PgPool, slot: u64) -> Result<()> {
-    sqlx::query!(
-        r#"
-        INSERT INTO indexer_state (key, value, updated_at)
-        VALUES (
-            'solana_last_ingested_slot',
-            $1,
-            NOW()
-        )
-        ON CONFLICT (key)
-        DO UPDATE SET
-            value = EXCLUDED.value,
-            updated_at = NOW()
-        "#,
-        slot.to_string()
+pub async fn set_last_ingested_slot(pool: &PgPool, chain: &str, slot: u64) -> Result<()> {
+    let key = format!("{chain}_last_ingested_slot");
+    sqlx::query(
+        "INSERT INTO indexer_state (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
     )
+    .bind(&key)
+    .bind(slot.to_string())
     .execute(pool)
     .await?;
-
     Ok(())
 }

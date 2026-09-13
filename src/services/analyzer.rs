@@ -1,4 +1,4 @@
-use crate::clients::{helius, wormhole};
+use crate::clients::{evm, helius, wormhole};
 use crate::domain::bridge_transfer::BridgeMessageId;
 use crate::domain::transaction::NormalisedTransaction;
 use crate::error::AppError;
@@ -8,18 +8,21 @@ use crate::state::AppState;
 use crate::vaa::decode::{decode_destination_address, decode_vaa};
 use serde_json::Value;
 
-pub async fn analyse_tx(state: &AppState, hash: &str) -> Result<NormalisedTransaction, AppError> {
-    if hash.trim().is_empty() || hash.len() < 64 {
+pub async fn analyse_tx(
+    state: &AppState,
+    chain: &str,
+    hash: &str,
+) -> Result<NormalisedTransaction, AppError> {
+    if hash.trim().is_empty() {
         return Err(AppError::InvalidTransactionHash(hash.to_string()));
     }
 
-    let (solana_result, wormhole_result) = tokio::join!(
-        helius::get_transaction(&state.http_client, &state.config.helius_url, hash),
+    let (source_result, wormhole_result) = tokio::join!(
+        fetch_source_transaction(state, chain, hash),
         wormhole::get_operation_by_tx_hash(&state.http_client, &state.config.wormhole_url, hash),
     );
 
-    let solana_raw = solana_result?;
-    let mut tx = normaliser::solana::normalise(solana_raw, hash)?;
+    let mut tx = source_result?;
     tx.bridge_transfer = None;
 
     match wormhole_result {
@@ -62,11 +65,6 @@ pub async fn analyse_tx(state: &AppState, hash: &str) -> Result<NormalisedTransa
                 .map(|t| t.token_chain)
                 .or_else(|| extract_wormholescan_number_field(&wh_raw, "tokenChain"));
 
-            // NEW: raw u128, kept separate from the display string — needed
-            // so the correlator can divide by the token's real decimals.
-            // Only available when our own VAA decode recognized the payload;
-            // Wormholescan's fallback amount is already decimal-formatted
-            // text, not something we can safely re-parse as a raw integer.
             let raw_amount: Option<u128> = decoded.transfer.as_ref().map(|t| t.amount);
 
             let amount: Option<String> = decoded
@@ -147,4 +145,30 @@ fn extract_wormholescan_field(raw: &Value, field: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(String::from)
+}
+
+async fn fetch_source_transaction(
+    state: &AppState,
+    chain: &str,
+    hash: &str,
+) -> Result<NormalisedTransaction, AppError> {
+    match chain {
+        "solana" => {
+            let raw =
+                helius::get_transaction(&state.http_client, &state.config.helius_url, hash).await?;
+            normaliser::solana::normalise(raw, hash)
+        }
+        evm_chain @ ("ethereum" | "bsc" | "polygon" | "avalanche" | "arbitrum" | "optimism"
+        | "gnosis" | "base") => {
+            let rpc_url = state
+                .config
+                .rpc_url_for_chain(evm_chain)
+                .map_err(|e| AppError::Normalisation(e.to_string()))?;
+            let raw = evm::get_transaction_data(&state.http_client, rpc_url, hash).await?;
+            normaliser::evm::normalise(raw, hash, evm_chain)
+        }
+        other => Err(AppError::Normalisation(format!(
+            "unsupported chain: {other}"
+        ))),
+    }
 }

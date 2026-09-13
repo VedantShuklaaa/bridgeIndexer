@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::ingestion::solana::CandidateTransaction;
+use crate::ingestion::types::CandidateTransaction; // moved from ingestion::solana
 
 const BRIDGE_TX_STREAM: &str = "bridge:transactions";
 const CONSUMER_GROUP: &str = "bridge-workers";
@@ -116,7 +116,7 @@ impl RedisConsumer {
             .arg(BRIDGE_TX_STREAM)
             .arg(CONSUMER_GROUP)
             .arg("0")
-            .arg("MKSTREAM") // <-- creates the stream if it doesn't exist yet
+            .arg("MKSTREAM")
             .query_async(connection)
             .await;
 
@@ -140,11 +140,15 @@ impl RedisConsumer {
         Ok(())
     }
 
-    async fn analyse_with_retry(&self, tx_hash: &str) -> Result<NormalisedTransaction, AppError> {
+    async fn analyse_with_retry(
+        &self,
+        chain: &str,
+        tx_hash: &str,
+    ) -> Result<NormalisedTransaction, AppError> {
         const MAX_ATTEMPTS: u32 = 5;
 
         for attempt in 1..=MAX_ATTEMPTS {
-            match analyse_tx(&self.state, tx_hash).await {
+            match analyse_tx(&self.state, chain, tx_hash).await {
                 Ok(tx) => return Ok(tx),
 
                 Err(AppError::TransactionNotFound(_))
@@ -199,6 +203,7 @@ impl RedisConsumer {
 
         unreachable!()
     }
+
     async fn dead_letter(
         &self,
         connection: &mut redis::aio::MultiplexedConnection,
@@ -371,7 +376,10 @@ impl RedisConsumer {
                     "Parsed transaction from Redis"
                 );
 
-                match self.analyse_with_retry(&candidate.tx_hash).await {
+                match self
+                    .analyse_with_retry(&candidate.chain, &candidate.tx_hash)
+                    .await
+                {
                     Ok(analysed) => {
                         if let Err(error) = self.persist_with_retry(&analysed).await {
                             tracing::error!(
@@ -402,7 +410,6 @@ impl RedisConsumer {
 
                         match serde_json::to_string(&analysed) {
                             Ok(payload) => {
-                                // Err just means no WS clients are currently connected — fine to ignore.
                                 let _ = self.state.tx_broadcast.send(payload);
                             }
                             Err(error) => {

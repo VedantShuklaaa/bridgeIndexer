@@ -1,6 +1,7 @@
 use bridge::chain_adapters::setup::build_registry;
 use bridge::config::AppConfig;
 use bridge::db;
+use bridge::ingestion::setup::spawn_evm_ingesters;
 use bridge::ingestion::solana::SolanaIngester;
 use bridge::redis::consumer::RedisConsumer;
 use bridge::redis::producer::RedisProducer;
@@ -116,13 +117,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     {
-        let ws_url = config.solana_ws_url.clone();
-        let bridge_program = config.solana_token_bridge_program.clone();
-
         let solana_ingester = SolanaIngester::new(
-            ws_url,
-            bridge_program,
-            redis,
+            config.solana_ws_url.clone(),
+            config.solana_token_bridge_program.clone(),
+            redis.clone(),
             db.clone(),
             http_client.clone(),
             config.helius_url.clone(),
@@ -135,6 +133,14 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+
+    spawn_evm_ingesters(
+        &config,
+        http_client.clone(),
+        redis.clone(),
+        db.clone(),
+        shutdown.clone(),
+    );
 
     let app = build_router(state);
     let addr = format!("0.0.0.0:{}", config.port);

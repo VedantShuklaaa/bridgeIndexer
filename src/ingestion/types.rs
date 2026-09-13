@@ -17,3 +17,10 @@ pub struct LogsFilter {
 pub struct LogsConfig {
     pub commitment: &'static str,
 }
+
+#[derive(Debug, Clone)]
+pub struct CandidateTransaction {
+    pub chain: String,
+    pub tx_hash: String,
+    pub slot: u64,
+}

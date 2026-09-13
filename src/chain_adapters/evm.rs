@@ -123,7 +123,7 @@ impl EvmAdapter {
         topics: &[String; 4],
     ) -> Result<Vec<Value>, AppError> {
         let mut window = to - from + 1;
-        let mut cursor_to = to;
+        let cursor_to = to;
 
         loop {
             let cursor_from = cursor_to.saturating_sub(window - 1).max(from);
@@ -156,7 +156,7 @@ impl EvmAdapter {
     }
 }
 
-fn event_topic(signature: &str) -> String {
+pub fn event_topic(signature: &str) -> String {
     format!("0x{}", hex::encode(Keccak256::digest(signature.as_bytes())))
 }
 
