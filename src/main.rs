@@ -51,6 +51,8 @@ async fn main() -> anyhow::Result<()> {
 
     let config = AppConfig::from_env()?;
     let db = db::connection::connect(&config.database_url).await?;
+    sqlx::migrate!("./migrations").run(&db).await?;
+
     let http_client = Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()?;

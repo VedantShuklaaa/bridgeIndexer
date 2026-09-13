@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT value\n        FROM indexer_state\n        WHERE key = 'solana_last_ingested_slot'\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "value",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c3e1c1829c290866615968c67ea1439a6040c01ecead62b8ba419afb5bfdec55"
+}

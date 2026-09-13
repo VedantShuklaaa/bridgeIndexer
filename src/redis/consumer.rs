@@ -116,6 +116,7 @@ impl RedisConsumer {
             .arg(BRIDGE_TX_STREAM)
             .arg(CONSUMER_GROUP)
             .arg("0")
+            .arg("MKSTREAM") // <-- creates the stream if it doesn't exist yet
             .query_async(connection)
             .await;
 
@@ -127,17 +128,13 @@ impl RedisConsumer {
                     "Created Redis consumer group"
                 );
             }
-
             Err(error) if error.to_string().contains("BUSYGROUP") => {
                 info!(
                     group = CONSUMER_GROUP,
                     "Redis consumer group already exists"
                 );
             }
-
-            Err(error) => {
-                return Err(error.into());
-            }
+            Err(error) => return Err(error.into()),
         }
 
         Ok(())

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO indexer_state (key, value, updated_at)\n        VALUES (\n            'solana_last_ingested_slot',\n            $1,\n            NOW()\n        )\n        ON CONFLICT (key)\n        DO UPDATE SET\n            value = EXCLUDED.value,\n            updated_at = NOW()\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a832aff202c4235cf657bbb7a650301490b8cf33a1af463922c4cf24c209d52b"
+}
