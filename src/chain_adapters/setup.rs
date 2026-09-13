@@ -52,15 +52,16 @@ pub fn build_registry(config: &AppConfig, http_client: &Client) -> AdapterRegist
     registry.register_evm(ChainId::Ethereum.wormhole_id(), eth_adapter.clone());
     registry.register_token_metadata(ChainId::Ethereum.wormhole_id(), eth_adapter);
 
-    let bsc_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+    let base_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::with_block_range(
         http_client.clone(),
-        config.bsc_rpc_url.clone(),
-        config.bsc_token_bridge_contract.clone(),
-        config.bsc_token_bridge_deploy_block.clone(),
-        "bsc",
+        config.base_rpc_url.clone(),
+        config.base_token_bridge_contract.clone(),
+        config.base_token_bridge_deploy_block.clone(),
+        "base",
+        10, // Alchemy free tier caps eth_getLogs at 10 blocks for Base
     ));
-    registry.register_evm(ChainId::Bsc.wormhole_id(), bsc_adapter.clone());
-    registry.register_token_metadata(ChainId::Bsc.wormhole_id(), bsc_adapter);
+    registry.register_evm(ChainId::Base.wormhole_id(), base_adapter.clone());
+    registry.register_token_metadata(ChainId::Base.wormhole_id(), base_adapter);
 
     let polygon_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
         http_client.clone(),

@@ -49,6 +49,14 @@ provides.
   a crashed consumer via `XAUTOCLAIM` every 30s.
 * **Graceful shutdown.** SIGTERM/Ctrl+C stops new work being picked up, lets
   in-flight messages finish, and drains open HTTP/WS connections before exit.
+* **RPC rate-limit resilience.** Destination-chain lookups (`chain_adapters::evm`)
+  page through `eth_getLogs` in provider-configurable block-size chunks rather
+  than one unbounded query — the default is 2000 blocks, but any chain can be
+  constructed with a tighter cap via `EvmAdapter::with_block_range(...)` for
+  RPC providers on rate-limited tiers (e.g. Base on a free-tier Alchemy key,
+  capped at 10 blocks per call). If a provider rejects a range as too wide at
+  runtime, the adapter automatically shrinks the window and retries rather
+  than failing the transaction outright.
 
 ## API
 
@@ -87,12 +95,12 @@ X → Solana), but a transfer that never touches Solana isn't observed yet.
 
 The correlation layer (`services::correlator`) and the destination-lookup
 adapters (`chain_adapters::evm`, `chain_adapters::wormholescan`) are already
-chain-agnostic — they were built against `AdapterRegistry`, keyed by Wormhole
-chain ID, specifically so adding a chain doesn't require touching correlation
-logic. What's missing per chain is the ingestion side: a chain-specific
-listener that watches its Token Bridge contract and pushes candidates onto
-the same `bridge:transactions` Redis stream Solana's ingester already writes
-to.
+chain-agnostic and already wired up in `AdapterRegistry` for Ethereum, BSC,
+Polygon, Avalanche, Arbitrum, Optimism, Gnosis, and Base — specifically so
+adding a chain doesn't require touching correlation logic. What's missing per
+chain is the ingestion side: a chain-specific listener that watches its Token
+Bridge contract and pushes candidates onto the same `bridge:transactions`
+Redis stream Solana's ingester already writes to.
 
 Planned rollout, one chain at a time:
 

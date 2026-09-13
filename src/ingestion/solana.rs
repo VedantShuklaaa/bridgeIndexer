@@ -2,10 +2,10 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use sqlx::PgPool;
-use tokio_util::sync::CancellationToken;
 use std::time::Duration;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -105,7 +105,9 @@ impl SolanaIngester {
             "Subscribed to Solana bridge logs"
         );
 
-        self.backfill_missed_transactions().await?;
+        if let Err(error) = self.backfill_missed_transactions().await {
+            warn!(%error, "Solana transaction backfill failed, continuing with live ingestion");
+        }
 
         loop {
             tokio::select! {
@@ -197,6 +199,8 @@ impl SolanaIngester {
                     .publish_transaction(&candidate)
                     .await
                     .context("failed to publish backfilled transaction")?;
+
+                tokio::time::sleep(Duration::from_millis(150)).await; // stay under Helius's free-tier rate cap
 
                 recovered += 1;
 

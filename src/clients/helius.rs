@@ -51,6 +51,18 @@ pub async fn get_transaction(client: &Client, url: &str, hash: &str) -> Result<V
     let body = JsonRpcRequest::get_transaction(hash);
 
     let resp = client.post(url).json(&body).send().await?;
+
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(AppError::UpstreamRateLimited("helius"));
+    }
+
+    if !resp.status().is_success() {
+        return Err(AppError::UpstreamProvider {
+            provider: "helius",
+            message: format!("status {}", resp.status()),
+        });
+    }
+
     let payload: Value = resp.json().await?;
 
     if let Some(err) = payload.get("error") {
@@ -88,6 +100,17 @@ pub async fn get_signatures_for_address(
 
     let resp = client.post(url).json(&body).send().await?;
 
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(AppError::UpstreamRateLimited("helius"));
+    }
+
+    if !resp.status().is_success() {
+        return Err(AppError::UpstreamProvider {
+            provider: "helius",
+            message: format!("status {}", resp.status()),
+        });
+    }
+
     let payload: Value = resp.json().await?;
 
     if let Some(err) = payload.get("error") {
@@ -99,7 +122,6 @@ pub async fn get_signatures_for_address(
 
     match payload.get("result") {
         Some(Value::Array(result)) => Ok(result.clone()),
-
         _ => Err(AppError::UpstreamProvider {
             provider: "helius",
             message: "invalid getSignaturesForAddress response".to_string(),

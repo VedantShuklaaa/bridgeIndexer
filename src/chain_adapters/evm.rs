@@ -8,8 +8,9 @@ use crate::error::AppError;
 
 use super::{ChainAdapter, DestinationTxInfo};
 
-const BLOCK_RANGE: u64 = 2000;
-const MAX_CHUNKS: u64 = 500;
+const DEFAULT_BLOCK_RANGE: u64 = 2000;
+const MIN_BLOCK_RANGE: u64 = 5;
+const MAX_CHUNKS: u64 = 2000; // raised since ranges can now shrink a lot on free tiers
 
 pub struct EvmAdapter {
     client: Client,
@@ -17,6 +18,7 @@ pub struct EvmAdapter {
     token_bridge_contract: String,
     deploy_block: u64,
     name: &'static str,
+    block_range: u64,
 }
 
 impl EvmAdapter {
@@ -27,6 +29,26 @@ impl EvmAdapter {
         from_block_hex: String,
         name: &'static str,
     ) -> Self {
+        Self::with_block_range(
+            client,
+            rpc_url,
+            token_bridge_contract,
+            from_block_hex,
+            name,
+            DEFAULT_BLOCK_RANGE,
+        )
+    }
+
+    /// Use this for chains/providers with a tighter eth_getLogs range limit
+    /// (e.g. Base on Alchemy's free tier only allows 10 blocks per call).
+    pub fn with_block_range(
+        client: Client,
+        rpc_url: String,
+        token_bridge_contract: String,
+        from_block_hex: String,
+        name: &'static str,
+        block_range: u64,
+    ) -> Self {
         let deploy_block =
             u64::from_str_radix(from_block_hex.trim_start_matches("0x"), 16).unwrap_or(0);
 
@@ -36,6 +58,7 @@ impl EvmAdapter {
             token_bridge_contract,
             deploy_block,
             name,
+            block_range,
         }
     }
 
@@ -90,6 +113,47 @@ impl EvmAdapter {
             .cloned()
             .unwrap_or_default())
     }
+
+    /// Fetches logs for [from, to], automatically shrinking the range and
+    /// retrying if the provider rejects it as too wide (e.g. free-tier caps).
+    async fn get_logs_resilient(
+        &self,
+        from: u64,
+        to: u64,
+        topics: &[String; 4],
+    ) -> Result<Vec<Value>, AppError> {
+        let mut window = to - from + 1;
+        let mut cursor_to = to;
+
+        loop {
+            let cursor_from = cursor_to.saturating_sub(window - 1).max(from);
+
+            match self.get_logs_in_range(cursor_from, cursor_to, topics).await {
+                Ok(logs) => {
+                    if cursor_from == from {
+                        return Ok(logs);
+                    }
+                    // shrunk below the original request but succeeded on this
+                    // sub-window; caller's outer loop handles stepping further back
+                    return Ok(logs);
+                }
+                Err(AppError::UpstreamProvider { message, .. })
+                    if window > MIN_BLOCK_RANGE
+                        && (message.contains("-32600")
+                            || message.to_lowercase().contains("block range")) =>
+                {
+                    window = (window / 4).max(MIN_BLOCK_RANGE);
+                    tracing::warn!(
+                        provider = self.name,
+                        new_window = window,
+                        "eth_getLogs range rejected, shrinking and retrying"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
 }
 
 fn event_topic(signature: &str) -> String {
@@ -116,14 +180,12 @@ fn decode_decimals(hex_result: &str) -> Option<u8> {
 fn decode_symbol(hex_result: &str) -> Option<String> {
     let bytes = hex::decode(hex_result.trim_start_matches("0x")).ok()?;
 
-    // bytes32 return
     if bytes.len() == 32 {
         return String::from_utf8(bytes.iter().copied().take_while(|b| *b != 0).collect())
             .ok()
             .filter(|s| !s.is_empty());
     }
 
-    // dynamic string return
     if bytes.len() >= 64 {
         let offset = u64::from_be_bytes(bytes[0..32].get(24..32)?.try_into().ok()?) as usize;
 
@@ -168,8 +230,10 @@ impl ChainAdapter for EvmAdapter {
         let mut to = latest;
 
         for _ in 0..MAX_CHUNKS {
-            let from = to.saturating_sub(BLOCK_RANGE - 1).max(self.deploy_block);
-            let logs = self.get_logs_in_range(from, to, &topics).await?;
+            let from = to
+                .saturating_sub(self.block_range - 1)
+                .max(self.deploy_block);
+            let logs = self.get_logs_resilient(from, to, &topics).await?;
 
             if !logs.is_empty() {
                 let tx_hash = logs[0]
