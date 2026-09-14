@@ -64,10 +64,6 @@ pub struct AppConfig {
     pub optimism_core_bridge_contract: String,
     pub optimism_core_bridge_deploy_block: String,
 
-    pub gnosis_ws_url: String,
-    pub gnosis_core_bridge_contract: String,
-    pub gnosis_core_bridge_deploy_block: String,
-
     pub base_ws_url: String,
     pub base_core_bridge_contract: String,
     pub base_core_bridge_deploy_block: String,
@@ -170,9 +166,6 @@ impl AppConfig {
             gnosis_rpc_url: optional("GNOSIS_RPC_URL", "https://rpc.gnosischain.com"),
             gnosis_token_bridge_contract: required("GNOSIS_TOKEN_BRIDGE_CONTRACT")?,
             gnosis_token_bridge_deploy_block: optional("GNOSIS_TOKEN_BRIDGE_DEPLOY_BLOCK", "0x0"),
-            gnosis_ws_url: required("GNOSIS_WS_URL")?,
-            gnosis_core_bridge_contract: required("GNOSIS_CORE_BRIDGE_CONTRACT")?,
-            gnosis_core_bridge_deploy_block: optional("GNOSIS_CORE_BRIDGE_DEPLOY_BLOCK", "0x0"),
 
             base_rpc_url: optional("BASE_RPC_URL", "https://mainnet.base.org"),
             base_token_bridge_contract: required("BASE_TOKEN_BRIDGE_CONTRACT")?,

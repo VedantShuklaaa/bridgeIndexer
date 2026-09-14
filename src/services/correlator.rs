@@ -11,8 +11,8 @@ pub struct CorrelateParams {
     pub message_id: BridgeMessageId,
     pub destination_chain_id: u16,
     pub token: Option<String>,
-    pub token_chain: u16,                         
-    pub wormholescan_symbol_hint: Option<String>, 
+    pub token_chain: u16,
+    pub wormholescan_symbol_hint: Option<String>,
     pub raw_amount: Option<u128>,
     pub amount: Option<String>,
     pub destination_wallet: Option<String>,
@@ -84,7 +84,7 @@ pub async fn correlate(
 
     let amount_formatted = effective_raw_amount.map(|r| format_amount(r, metadata.decimals));
 
-    let source_explorer_url = explorer_tx_url(1, &source_tx_hash);
+    let source_explorer_url = explorer_tx_url(message_id.emitter_chain, &source_tx_hash);
     let destination_explorer_url = destination_tx_hash
         .as_ref()
         .and_then(|h| explorer_tx_url(destination_chain_id, h));

@@ -18,8 +18,12 @@ struct EvmChainConfig {
     block_range: u64,
 }
 
-fn parse_deploy_block(hex_str: &str) -> u64 {
-    u64::from_str_radix(hex_str.trim_start_matches("0x"), 16).unwrap_or(0)
+fn parse_deploy_block(value: &str) -> u64 {
+    if let Some(hex) = value.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).unwrap_or(0)
+    } else {
+        value.parse::<u64>().unwrap_or(0)
+    }
 }
 
 fn evm_chain_configs(config: &AppConfig) -> Vec<EvmChainConfig> {

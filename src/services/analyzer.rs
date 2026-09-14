@@ -129,9 +129,7 @@ pub async fn analyse_tx(
 
             tx.bridge_event = Some(bridge_event);
         }
-        Err(AppError::TransactionNotFound(_)) => {
-            tx.bridge_event = None;
-        }
+        
         Err(other) => return Err(other),
     }
 

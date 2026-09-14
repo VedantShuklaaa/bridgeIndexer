@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -74,11 +74,15 @@ impl EvmIngester {
     }
 
     async fn run_connection(&self) -> Result<()> {
-        info!(chain = self.chain, ws_url = %self.ws_url, "Connecting to EVM WebSocket");
+        info!(
+            chain = self.chain,
+            ws_url_debug = ?self.ws_url,
+            "Connecting to EVM WebSocket"
+        );
 
         let (ws_stream, _) = connect_async(&self.ws_url)
             .await
-            .context("failed to connect to EVM WebSocket")?;
+            .map_err(|error| anyhow!("failed to connect to EVM WebSocket: {error}"))?;
 
         info!(chain = self.chain, "Connected to EVM WebSocket");
 
