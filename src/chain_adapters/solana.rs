@@ -43,7 +43,7 @@ impl SolanaAdapter {
 
         if let Some(err) = payload.get("error") {
             return Err(AppError::UpstreamProvider {
-                provider: self.name,
+                provider: self.name.to_string(),
                 message: err.to_string(),
             });
         }

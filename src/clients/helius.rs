@@ -53,12 +53,12 @@ pub async fn get_transaction(client: &Client, url: &str, hash: &str) -> Result<V
     let resp = client.post(url).json(&body).send().await?;
 
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return Err(AppError::UpstreamRateLimited("helius"));
+        return Err(AppError::UpstreamRateLimited("helius".to_string()));
     }
 
     if !resp.status().is_success() {
         return Err(AppError::UpstreamProvider {
-            provider: "helius",
+            provider: "helius".to_string(),
             message: format!("status {}", resp.status()),
         });
     }
@@ -67,7 +67,7 @@ pub async fn get_transaction(client: &Client, url: &str, hash: &str) -> Result<V
 
     if let Some(err) = payload.get("error") {
         return Err(AppError::UpstreamProvider {
-            provider: "helius",
+            provider: "helius".to_string(),
             message: err.to_string(),
         });
     }
@@ -101,12 +101,12 @@ pub async fn get_signatures_for_address(
     let resp = client.post(url).json(&body).send().await?;
 
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return Err(AppError::UpstreamRateLimited("helius"));
+        return Err(AppError::UpstreamRateLimited("helius".to_string()));
     }
 
     if !resp.status().is_success() {
         return Err(AppError::UpstreamProvider {
-            provider: "helius",
+            provider: "helius".to_string(),
             message: format!("status {}", resp.status()),
         });
     }
@@ -115,7 +115,7 @@ pub async fn get_signatures_for_address(
 
     if let Some(err) = payload.get("error") {
         return Err(AppError::UpstreamProvider {
-            provider: "helius",
+            provider: "helius".to_string(),
             message: err.to_string(),
         });
     }
@@ -123,7 +123,7 @@ pub async fn get_signatures_for_address(
     match payload.get("result") {
         Some(Value::Array(result)) => Ok(result.clone()),
         _ => Err(AppError::UpstreamProvider {
-            provider: "helius",
+            provider: "helius".to_string(),
             message: "invalid getSignaturesForAddress response".to_string(),
         }),
     }

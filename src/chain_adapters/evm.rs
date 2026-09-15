@@ -71,7 +71,7 @@ impl EvmAdapter {
             .get("result")
             .and_then(Value::as_str)
             .ok_or_else(|| AppError::UpstreamProvider {
-                provider: self.name,
+                provider: self.name.to_string(),
                 message: "no result from eth_blockNumber".into(),
             })?;
 
@@ -102,7 +102,7 @@ impl EvmAdapter {
 
         if let Some(err) = payload.get("error") {
             return Err(AppError::UpstreamProvider {
-                provider: self.name,
+                provider: self.name.to_string(),
                 message: err.to_string(),
             });
         }

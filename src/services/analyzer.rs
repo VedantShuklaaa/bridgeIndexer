@@ -21,8 +21,7 @@ pub async fn analyse_tx(
     let (mut tx, bridge_event, bridge_transfer) = match chain {
         "solana" => {
             let raw =
-                helius::get_transaction(&state.http_client, &state.config.helius_url, hash)
-                    .await?;
+                helius::get_transaction(&state.http_client, &state.config.helius_url, hash).await?;
             let tx = normaliser::solana::normalise(raw, hash)?;
             let (bridge_event, bridge_transfer) =
                 build_bridge_data_via_wormholescan(state, &tx, hash).await?;
@@ -36,7 +35,8 @@ pub async fn analyse_tx(
                 .map_err(|e| AppError::Normalisation(e.to_string()))?;
             // Fetched once and reused for both normalisation and log
             // extraction below — no repeat RPC round-trip.
-            let raw = evm::get_transaction_data(&state.http_client, rpc_url, hash).await?;
+            let raw =
+                evm::get_transaction_data(&state.http_client, rpc_url, evm_chain, hash).await?;
             let tx = normaliser::evm::normalise(raw.clone(), hash, evm_chain)?;
             let (bridge_event, bridge_transfer) =
                 build_bridge_data_from_source_receipt(state, &tx, evm_chain, hash, &raw).await?;
@@ -171,11 +171,8 @@ async fn build_bridge_data_via_wormholescan(
         sequence: decoded.header.sequence,
     };
 
-    let destination_chain_id: Option<u16> = decoded
-        .transfer
-        .as_ref()
-        .map(|t| t.to_chain)
-        .or_else(|| {
+    let destination_chain_id: Option<u16> =
+        decoded.transfer.as_ref().map(|t| t.to_chain).or_else(|| {
             bridge_event
                 .target_chain
                 .as_ref()

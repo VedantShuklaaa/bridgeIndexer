@@ -13,7 +13,7 @@ pub async fn get_operation_by_tx_hash(
 
     if !resp.status().is_success() {
         return Err(AppError::UpstreamProvider {
-            provider: "wormhole",
+            provider: "wormhole".to_string(),
             message: format!("status {}", resp.status()),
         });
     }
