@@ -12,7 +12,7 @@ pub struct CorrelateParams {
     pub destination_chain_id: u16,
     pub token: Option<String>,
     pub token_chain: u16,
-    pub wormholescan_symbol_hint: Option<String>,
+    pub symbol_hint: Option<String>,
     pub raw_amount: Option<u128>,
     pub amount: Option<String>,
     pub destination_wallet: Option<String>,
@@ -30,7 +30,7 @@ pub async fn correlate(
         destination_chain_id,
         token,
         token_chain,
-        wormholescan_symbol_hint,
+        symbol_hint,
         raw_amount,
         amount,
         destination_wallet,
@@ -39,32 +39,20 @@ pub async fn correlate(
 
     let destination_chain = ChainId::from_wormhole_id(destination_chain_id);
 
-    // Unchanged — this part was never the bug, destination lookup correctly
-    // stays keyed by destination_chain_id.
+    // Destination completion is read straight off the destination chain —
+    // EvmAdapter::find_transaction pages eth_getLogs for the token bridge's
+    // TransferRedeemed event. No external indexer in the loop: if we don't
+    // have a chain adapter for the destination yet, or the log scan hasn't
+    // turned it up, the transfer is just Pending until it does.
     let (destination_tx_hash, status) = if let Some(known) = known_destination_tx {
         (Some(known), BridgeStatus::Completed)
     } else {
-        let wormholescan_adapter = registry.get_wormholescan(destination_chain_id);
-        let evm_adapter = registry.get_evm(destination_chain_id);
-
-        let fast = match &wormholescan_adapter {
-            Some(a) => a.find_transaction(&message_id).await?,
-            None => None,
-        };
-
-        match fast {
-            Some(info) => (Some(info.tx_hash), BridgeStatus::Completed),
-            None => match &evm_adapter {
-                Some(a) => match a.find_transaction(&message_id).await? {
-                    Some(info) => (Some(info.tx_hash), BridgeStatus::Completed),
-                    None => (None, BridgeStatus::Pending),
-                },
-
-                None => match wormholescan_adapter {
-                    Some(_) => (None, BridgeStatus::Pending),
-                    None => (None, BridgeStatus::Detected),
-                },
+        match registry.get_evm(destination_chain_id) {
+            Some(adapter) => match adapter.find_transaction(&message_id).await? {
+                Some(info) => (Some(info.tx_hash), BridgeStatus::Completed),
+                None => (None, BridgeStatus::Pending),
             },
+            None => (None, BridgeStatus::Detected),
         }
     };
 
@@ -73,7 +61,7 @@ pub async fn correlate(
 
     let metadata = match &token {
         Some(token_addr) => {
-            resolve_token_metadata(registry, token_chain, token_addr, wormholescan_symbol_hint)
+            resolve_token_metadata(registry, token_chain, token_addr, symbol_hint)
                 .await?
         }
         None => TokenMetadata {

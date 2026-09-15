@@ -195,4 +195,21 @@ impl AppConfig {
             other => anyhow::bail!("no RPC URL configured for chain: {other}"),
         })
     }
+
+    /// The Wormhole Core Bridge contract that emits `LogMessagePublished`
+    /// on this chain — used to read a bridge transfer's own message
+    /// straight off its source transaction, instead of asking WormholeScan
+    /// for it.
+    pub fn core_bridge_contract_for_chain(&self, chain: &str) -> anyhow::Result<&str> {
+        Ok(match chain {
+            "ethereum" => &self.eth_core_bridge_contract,
+            "bsc" => &self.bsc_core_bridge_contract,
+            "polygon" => &self.polygon_core_bridge_contract,
+            "avalanche" => &self.avalanche_core_bridge_contract,
+            "arbitrum" => &self.arbitrum_core_bridge_contract,
+            "optimism" => &self.optimism_core_bridge_contract,
+            "base" => &self.base_core_bridge_contract,
+            other => anyhow::bail!("no core bridge contract configured for chain: {other}"),
+        })
+    }
 }

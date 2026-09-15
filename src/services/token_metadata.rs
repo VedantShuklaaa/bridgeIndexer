@@ -10,7 +10,7 @@ pub async fn resolve_token_metadata(
     registry: &AdapterRegistry,
     token_chain: u16,
     token_address: &str,
-    wormholescan_symbol_hint: Option<String>,
+    symbol_hint: Option<String>,
 ) -> Result<TokenMetadata, AppError> {
     let (symbol, decimals) = match registry.get_token_metadata(token_chain) {
         Some(adapter) => {
@@ -34,7 +34,7 @@ pub async fn resolve_token_metadata(
     };
 
     Ok(TokenMetadata {
-        symbol: symbol.or(wormholescan_symbol_hint), // fallback only, never authoritative
+        symbol: symbol.or(symbol_hint), // fallback only, never authoritative
         decimals,
     })
 }

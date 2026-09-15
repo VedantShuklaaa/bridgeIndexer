@@ -1,0 +1,765 @@
+diff --git a/src/chain_adapters/mod.rs b/src/chain_adapters/mod.rs
+index 127b617..bdd1e0f 100644
+--- a/src/chain_adapters/mod.rs
++++ b/src/chain_adapters/mod.rs
+@@ -6,7 +6,6 @@ pub mod evm;
+ pub mod registry;
+ pub mod setup;
+ pub mod solana;
+-pub mod wormholescan;
+ 
+ #[async_trait]
+ pub trait ChainAdapter: Send + Sync {
+diff --git a/src/chain_adapters/registry.rs b/src/chain_adapters/registry.rs
+index fd51327..401f73f 100644
+--- a/src/chain_adapters/registry.rs
++++ b/src/chain_adapters/registry.rs
+@@ -5,24 +5,18 @@ use super::ChainAdapter;
+ 
+ #[derive(Clone, Default)]
+ pub struct AdapterRegistry {
+-    wormholescan: HashMap<u16, Arc<dyn ChainAdapter>>,
+     evm: HashMap<u16, Arc<dyn ChainAdapter>>,
+-    token_metadata: HashMap<u16, Arc<dyn ChainAdapter>>, // NEW — keyed by token_chain
++    token_metadata: HashMap<u16, Arc<dyn ChainAdapter>>, // keyed by token_chain
+ }
+ 
+ impl AdapterRegistry {
+     pub fn new() -> Self {
+         Self {
+-            wormholescan: HashMap::new(),
+             evm: HashMap::new(),
+             token_metadata: HashMap::new(),
+         }
+     }
+ 
+-    pub fn register_wormholescan(&mut self, chain_id: u16, adapter: Arc<dyn ChainAdapter>) {
+-        self.wormholescan.insert(chain_id, adapter);
+-    }
+-
+     pub fn register_evm(&mut self, chain_id: u16, adapter: Arc<dyn ChainAdapter>) {
+         self.evm.insert(chain_id, adapter);
+     }
+@@ -31,10 +25,6 @@ impl AdapterRegistry {
+         self.token_metadata.insert(chain_id, adapter);
+     }
+ 
+-    pub fn get_wormholescan(&self, chain_id: u16) -> Option<Arc<dyn ChainAdapter>> {
+-        self.wormholescan.get(&chain_id).cloned()
+-    }
+-
+     pub fn get_evm(&self, chain_id: u16) -> Option<Arc<dyn ChainAdapter>> {
+         self.evm.get(&chain_id).cloned()
+     }
+diff --git a/src/chain_adapters/setup.rs b/src/chain_adapters/setup.rs
+index a0ad7e2..8f2e682 100644
+--- a/src/chain_adapters/setup.rs
++++ b/src/chain_adapters/setup.rs
+@@ -2,10 +2,7 @@ use reqwest::Client;
+ use std::sync::Arc;
+ 
+ use crate::{
+-    chain_adapters::{
+-        evm::EvmAdapter, registry::AdapterRegistry, solana::SolanaAdapter,
+-        wormholescan::WormholeScanAdapter,
+-    },
++    chain_adapters::{evm::EvmAdapter, registry::AdapterRegistry, solana::SolanaAdapter},
+     config::AppConfig,
+     domain::bridge_transfer::ChainId,
+ };
+@@ -13,28 +10,6 @@ use crate::{
+ pub fn build_registry(config: &AppConfig, http_client: &Client) -> AdapterRegistry {
+     let mut registry = AdapterRegistry::new();
+ 
+-    for chain in [
+-        ChainId::Solana,
+-        ChainId::Ethereum,
+-        ChainId::Bsc,
+-        ChainId::Polygon,
+-        ChainId::Avalanche,
+-        ChainId::Near,
+-        ChainId::Arbitrum,
+-        ChainId::Optimism,
+-        ChainId::Gnosis,
+-        ChainId::Base,
+-    ] {
+-        registry.register_wormholescan(
+-            chain.wormhole_id(),
+-            Arc::new(WormholeScanAdapter::new(
+-                http_client.clone(),
+-                config.wormhole_url.clone(),
+-                chain_label(&chain),
+-            )),
+-        );
+-    }
+-
+     let solana_adapter: Arc<SolanaAdapter> = Arc::new(SolanaAdapter::new(
+         http_client.clone(),
+         config.helius_url.clone(),
+@@ -125,19 +100,3 @@ pub fn build_registry(config: &AppConfig, http_client: &Client) -> AdapterRegist
+ 
+     registry
+ }
+-
+-fn chain_label(chain: &ChainId) -> &'static str {
+-    match chain {
+-        ChainId::Solana => "solana",
+-        ChainId::Ethereum => "ethereum",
+-        ChainId::Bsc => "bsc",
+-        ChainId::Polygon => "polygon",
+-        ChainId::Avalanche => "avalanche",
+-        ChainId::Near => "near",
+-        ChainId::Arbitrum => "arbitrum",
+-        ChainId::Optimism => "optimism",
+-        ChainId::Gnosis => "gnosis",
+-        ChainId::Base => "base",
+-        ChainId::Unknown(_) => "unknown",
+-    }
+-}
+diff --git a/src/chain_adapters/wormholescan.rs b/src/chain_adapters/wormholescan.rs
+deleted file mode 100644
+index dedc031..0000000
+--- a/src/chain_adapters/wormholescan.rs
++++ /dev/null
+@@ -1,67 +0,0 @@
+-use async_trait::async_trait;
+-use reqwest::Client;
+-use serde_json::Value;
+-
+-use crate::domain::bridge_transfer::BridgeMessageId;
+-use crate::error::AppError;
+-
+-use super::{ChainAdapter, DestinationTxInfo};
+-
+-pub struct WormholeScanAdapter {
+-    client: Client,
+-    base_url: String,
+-    name: &'static str,
+-}
+-
+-impl WormholeScanAdapter {
+-    pub fn new(client: Client, base_url: String, name: &'static str) -> Self {
+-        Self {
+-            client,
+-            base_url,
+-            name,
+-        }
+-    }
+-}
+-
+-#[async_trait]
+-impl ChainAdapter for WormholeScanAdapter {
+-    fn name(&self) -> &'static str {
+-        self.name
+-    }
+-
+-    async fn find_transaction(
+-        &self,
+-        message_id: &BridgeMessageId,
+-    ) -> Result<Option<DestinationTxInfo>, AppError> {
+-        let url = format!(
+-            "{}/api/v1/global-tx/{}/{}/{}",
+-            self.base_url,
+-            message_id.emitter_chain,
+-            message_id.emitter_address,
+-            message_id.sequence
+-        );
+-
+-        let resp = self.client.get(&url).send().await?;
+-
+-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+-            return Ok(None);
+-        }
+-
+-        if !resp.status().is_success() {
+-            return Err(AppError::UpstreamProvider {
+-                provider: self.name,
+-                message: format!("status {}", resp.status()),
+-            });
+-        }
+-
+-        let payload: Value = resp.json().await?;
+-        let tx_hash = payload
+-            .get("destinationTx")
+-            .and_then(|d| d.get("txHash"))
+-            .and_then(Value::as_str);
+-
+-        Ok(tx_hash.map(|h| DestinationTxInfo {
+-            tx_hash: h.to_string(),
+-        }))
+-    }
+-}
+diff --git a/src/config.rs b/src/config.rs
+index e8142fb..224b51d 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -195,4 +195,21 @@ impl AppConfig {
+             other => anyhow::bail!("no RPC URL configured for chain: {other}"),
+         })
+     }
++
++    /// The Wormhole Core Bridge contract that emits `LogMessagePublished`
++    /// on this chain — used to read a bridge transfer's own message
++    /// straight off its source transaction, instead of asking WormholeScan
++    /// for it.
++    pub fn core_bridge_contract_for_chain(&self, chain: &str) -> anyhow::Result<&str> {
++        Ok(match chain {
++            "ethereum" => &self.eth_core_bridge_contract,
++            "bsc" => &self.bsc_core_bridge_contract,
++            "polygon" => &self.polygon_core_bridge_contract,
++            "avalanche" => &self.avalanche_core_bridge_contract,
++            "arbitrum" => &self.arbitrum_core_bridge_contract,
++            "optimism" => &self.optimism_core_bridge_contract,
++            "base" => &self.base_core_bridge_contract,
++            other => anyhow::bail!("no core bridge contract configured for chain: {other}"),
++        })
++    }
+ }
+diff --git a/src/services/analyzer.rs b/src/services/analyzer.rs
+index e2fb3b0..b06c756 100644
+--- a/src/services/analyzer.rs
++++ b/src/services/analyzer.rs
+@@ -1,11 +1,12 @@
+ use crate::clients::{evm, helius, wormhole};
+-use crate::domain::bridge_transfer::BridgeMessageId;
++use crate::domain::bridge::BridgeEvent;
++use crate::domain::bridge_transfer::{BridgeMessageId, BridgeTransfer};
+ use crate::domain::transaction::NormalisedTransaction;
+ use crate::error::AppError;
+ use crate::normaliser;
+ use crate::services::correlator;
+ use crate::state::AppState;
+-use crate::vaa::decode::{decode_destination_address, decode_vaa};
++use crate::vaa::decode::{decode_destination_address, decode_transfer_if_present};
+ use serde_json::Value;
+ 
+ pub async fn analyse_tx(
+@@ -17,144 +18,15 @@ pub async fn analyse_tx(
+         return Err(AppError::InvalidTransactionHash(hash.to_string()));
+     }
+ 
+-    let (source_result, wormhole_result) = tokio::join!(
+-        fetch_source_transaction(state, chain, hash),
+-        wormhole::get_operation_by_tx_hash(&state.http_client, &state.config.wormhole_url, hash),
+-    );
+-
+-    let mut tx = source_result?;
+-    tx.bridge_transfer = None;
+-
+-    match wormhole_result {
+-        Ok(wh_raw) => {
+-            let bridge_event = normaliser::wormhole::normalise(wh_raw.clone())?;
+-
+-            let vaa_b64 = wh_raw
+-                .get("vaa")
+-                .and_then(|v| v.get("raw"))
+-                .and_then(|r| r.as_str())
+-                .ok_or_else(|| AppError::VaaNotAvailable(hash.to_string()))?;
+-
+-            let decoded = decode_vaa(vaa_b64)?;
+-
+-            let message_id = BridgeMessageId {
+-                emitter_chain: decoded.header.emitter_chain,
+-                emitter_address: decoded.header.emitter_address.clone(),
+-                sequence: decoded.header.sequence,
+-            };
+-
+-            let destination_chain_id: Option<u16> =
+-                decoded.transfer.as_ref().map(|t| t.to_chain).or_else(|| {
+-                    bridge_event
+-                        .target_chain
+-                        .as_ref()
+-                        .and_then(|c| c.parse().ok())
+-                });
+-
+-            fn extract_wormholescan_number_field(raw: &Value, field: &str) -> Option<u16> {
+-                raw.get("content")
+-                    .and_then(|c| c.get("standarizedProperties"))
+-                    .and_then(|p| p.get(field))
+-                    .and_then(Value::as_u64)
+-                    .map(|n| n as u16)
+-            }
+-
+-            let token_chain: Option<u16> = decoded
+-                .transfer
+-                .as_ref()
+-                .map(|t| t.token_chain)
+-                .or_else(|| extract_wormholescan_number_field(&wh_raw, "tokenChain"));
+-
+-            let raw_amount: Option<u128> = decoded.transfer.as_ref().map(|t| t.amount);
+-
+-            let amount: Option<String> = decoded
+-                .transfer
+-                .as_ref()
+-                .map(|t| t.amount.to_string())
+-                .or_else(|| bridge_event.amount.clone());
+-
+-            let token: Option<String> = decoded
+-                .transfer
+-                .as_ref()
+-                .and_then(|t| token_chain.map(|c| decode_destination_address(c, &t.token_address)))
+-                //                ^^^^^^^^^^^ was destination_chain_id — token_address decodes per token_chain, not destination
+-                .flatten()
+-                .or_else(|| extract_wormholescan_field(&wh_raw, "tokenAddress"));
+-
+-            tracing::info!(
+-                "WormholeScan standardizedProperties: {:?}",
+-                wh_raw
+-                    .get("content")
+-                    .and_then(|c| c.get("standarizedProperties"))
+-            );
+-
+-            let wormholescan_symbol_hint: Option<String> =
+-                extract_wormholescan_field(&wh_raw, "tokenSymbol");
+-
+-            let destination_wallet: Option<String> = decoded
+-                .transfer
+-                .as_ref()
+-                .and_then(|t| {
+-                    destination_chain_id.map(|c| decode_destination_address(c, &t.to_address))
+-                })
+-                .flatten()
+-                .or_else(|| extract_wormholescan_field(&wh_raw, "toAddress"));
+-
+-            let known_destination_tx: Option<String> = wh_raw
+-                .get("globalTx")
+-                .and_then(|g| g.get("destinationTx"))
+-                .and_then(|d| d.get("txHash"))
+-                .and_then(|h| h.as_str())
+-                .map(String::from);
+-
+-            tx.bridge_transfer = Some(
+-                correlator::correlate(
+-                    &state.registry,
+-                    correlator::CorrelateParams {
+-                        source_tx_hash: hash.to_string(),
+-                        source_wallet: tx.signer.clone(),
+-                        message_id,
+-                        destination_chain_id: destination_chain_id.unwrap_or(0),
+-                        token,
+-                        token_chain: token_chain.unwrap_or(0),
+-                        wormholescan_symbol_hint,
+-                        raw_amount,
+-                        amount,
+-                        destination_wallet,
+-                        known_destination_tx,
+-                    },
+-                )
+-                .await?,
+-            );
+-
+-            tx.bridge_event = Some(bridge_event);
+-        }
+-        
+-        Err(other) => return Err(other),
+-    }
+-
+-    Ok(tx)
+-}
+-
+-fn extract_wormholescan_field(raw: &Value, field: &str) -> Option<String> {
+-    raw.get("content")
+-        .and_then(|c| c.get("standarizedProperties"))
+-        .and_then(|p| p.get(field))
+-        .and_then(|v| v.as_str())
+-        .filter(|s| !s.is_empty())
+-        .map(String::from)
+-}
+-
+-async fn fetch_source_transaction(
+-    state: &AppState,
+-    chain: &str,
+-    hash: &str,
+-) -> Result<NormalisedTransaction, AppError> {
+-    match chain {
++    let (mut tx, bridge_event, bridge_transfer) = match chain {
+         "solana" => {
+             let raw =
+-                helius::get_transaction(&state.http_client, &state.config.helius_url, hash).await?;
+-            normaliser::solana::normalise(raw, hash)
++                helius::get_transaction(&state.http_client, &state.config.helius_url, hash)
++                    .await?;
++            let tx = normaliser::solana::normalise(raw, hash)?;
++            let (bridge_event, bridge_transfer) =
++                build_bridge_data_via_wormholescan(state, &tx, hash).await?;
++            (tx, bridge_event, bridge_transfer)
+         }
+         evm_chain @ ("ethereum" | "bsc" | "polygon" | "avalanche" | "arbitrum" | "optimism"
+         | "gnosis" | "base") => {
+@@ -162,11 +34,225 @@ async fn fetch_source_transaction(
+                 .config
+                 .rpc_url_for_chain(evm_chain)
+                 .map_err(|e| AppError::Normalisation(e.to_string()))?;
++            // Fetched once and reused for both normalisation and log
++            // extraction below — no repeat RPC round-trip.
+             let raw = evm::get_transaction_data(&state.http_client, rpc_url, hash).await?;
+-            normaliser::evm::normalise(raw, hash, evm_chain)
++            let tx = normaliser::evm::normalise(raw.clone(), hash, evm_chain)?;
++            let (bridge_event, bridge_transfer) =
++                build_bridge_data_from_source_receipt(state, &tx, evm_chain, hash, &raw).await?;
++            (tx, bridge_event, bridge_transfer)
++        }
++        other => {
++            return Err(AppError::Normalisation(format!(
++                "unsupported chain: {other}"
++            )));
+         }
+-        other => Err(AppError::Normalisation(format!(
+-            "unsupported chain: {other}"
+-        ))),
++    };
++
++    tx.bridge_event = Some(bridge_event);
++    tx.bridge_transfer = Some(bridge_transfer);
++
++    Ok(tx)
++}
++
++/// EVM path: the transfer is decoded entirely from the source transaction's
++/// own receipt — the Core Bridge's `LogMessagePublished` event. No
++/// WormholeScan call, no guardian VAA fetch; the payload bytes are
++/// identical either way, we just read them a step earlier.
++async fn build_bridge_data_from_source_receipt(
++    state: &AppState,
++    tx: &NormalisedTransaction,
++    chain: &str,
++    hash: &str,
++    raw: &Value,
++) -> Result<(BridgeEvent, BridgeTransfer), AppError> {
++    let core_bridge_contract = state
++        .config
++        .core_bridge_contract_for_chain(chain)
++        .map_err(|e| AppError::Normalisation(e.to_string()))?;
++
++    let receipt = raw
++        .get("receipt")
++        .ok_or_else(|| AppError::Normalisation("missing receipt".into()))?;
++
++    let own_wormhole_chain_id = crate::domain::transaction::Chain::from_label(chain)
++        .ok_or_else(|| AppError::Normalisation(format!("unknown EVM chain: {chain}")))?
++        .wormhole_id();
++
++    let msg = crate::vaa::evm_log::extract_source_message(
++        receipt,
++        core_bridge_contract,
++        own_wormhole_chain_id,
++    )?;
++
++    let transfer = decode_transfer_if_present(&msg.payload)?;
++
++    let message_id = BridgeMessageId {
++        emitter_chain: msg.emitter_chain,
++        emitter_address: msg.emitter_address.clone(),
++        sequence: msg.sequence,
++    };
++
++    let destination_chain_id = transfer.as_ref().map(|t| t.to_chain);
++    let token_chain = transfer.as_ref().map(|t| t.token_chain);
++    let raw_amount = transfer.as_ref().map(|t| t.amount);
++    let amount = transfer.as_ref().map(|t| t.amount.to_string());
++
++    let token = transfer
++        .as_ref()
++        .and_then(|t| token_chain.map(|c| decode_destination_address(c, &t.token_address)))
++        .flatten();
++
++    let destination_wallet = transfer
++        .as_ref()
++        .and_then(|t| destination_chain_id.map(|c| decode_destination_address(c, &t.to_address)))
++        .flatten();
++
++    let bridge_event = BridgeEvent {
++        sequence: msg.sequence,
++        emitter_chain: msg.emitter_chain.to_string(),
++        emitter_address: msg.emitter_address,
++        target_chain: destination_chain_id.map(|c| c.to_string()),
++        amount: amount.clone(),
++    };
++
++    let bridge_transfer = correlator::correlate(
++        &state.registry,
++        correlator::CorrelateParams {
++            source_tx_hash: hash.to_string(),
++            source_wallet: tx.signer.clone(),
++            message_id,
++            destination_chain_id: destination_chain_id.unwrap_or(0),
++            token,
++            token_chain: token_chain.unwrap_or(0),
++            symbol_hint: None, // no external hint anymore; resolve_token_metadata falls back to on-chain reads only
++            raw_amount,
++            amount,
++            destination_wallet,
++            known_destination_tx: None, // always look this up ourselves now
++        },
++    )
++    .await?;
++
++    Ok((bridge_event, bridge_transfer))
++}
++
++/// Solana path — TEMPORARY. Still goes through WormholeScan for the VAA.
++///
++/// Extracting the same data straight from a Solana transaction means
++/// decoding the token bridge program's own instruction layout (Borsh), and
++/// getting those byte offsets wrong silently corrupts amounts/addresses
++/// rather than erroring — not something to guess at from memory. Left
++/// as-is on purpose until it can be verified against the actual program
++/// IDL, rather than shipping an EVM-only fix and pretending Solana is
++/// covered too.
++async fn build_bridge_data_via_wormholescan(
++    state: &AppState,
++    tx: &NormalisedTransaction,
++    hash: &str,
++) -> Result<(BridgeEvent, BridgeTransfer), AppError> {
++    let wh_raw =
++        wormhole::get_operation_by_tx_hash(&state.http_client, &state.config.wormhole_url, hash)
++            .await?;
++
++    let bridge_event = normaliser::wormhole::normalise(wh_raw.clone())?;
++
++    let vaa_b64 = wh_raw
++        .get("vaa")
++        .and_then(|v| v.get("raw"))
++        .and_then(|r| r.as_str())
++        .ok_or_else(|| AppError::VaaNotAvailable(hash.to_string()))?;
++
++    let decoded = crate::vaa::decode::decode_vaa(vaa_b64)?;
++
++    let message_id = BridgeMessageId {
++        emitter_chain: decoded.header.emitter_chain,
++        emitter_address: decoded.header.emitter_address.clone(),
++        sequence: decoded.header.sequence,
++    };
++
++    let destination_chain_id: Option<u16> = decoded
++        .transfer
++        .as_ref()
++        .map(|t| t.to_chain)
++        .or_else(|| {
++            bridge_event
++                .target_chain
++                .as_ref()
++                .and_then(|c| c.parse().ok())
++        });
++
++    fn extract_wormholescan_number_field(raw: &Value, field: &str) -> Option<u16> {
++        raw.get("content")
++            .and_then(|c| c.get("standarizedProperties"))
++            .and_then(|p| p.get(field))
++            .and_then(Value::as_u64)
++            .map(|n| n as u16)
+     }
++
++    fn extract_wormholescan_field(raw: &Value, field: &str) -> Option<String> {
++        raw.get("content")
++            .and_then(|c| c.get("standarizedProperties"))
++            .and_then(|p| p.get(field))
++            .and_then(|v| v.as_str())
++            .filter(|s| !s.is_empty())
++            .map(String::from)
++    }
++
++    let token_chain: Option<u16> = decoded
++        .transfer
++        .as_ref()
++        .map(|t| t.token_chain)
++        .or_else(|| extract_wormholescan_number_field(&wh_raw, "tokenChain"));
++
++    let raw_amount: Option<u128> = decoded.transfer.as_ref().map(|t| t.amount);
++
++    let amount: Option<String> = decoded
++        .transfer
++        .as_ref()
++        .map(|t| t.amount.to_string())
++        .or_else(|| bridge_event.amount.clone());
++
++    let token: Option<String> = decoded
++        .transfer
++        .as_ref()
++        .and_then(|t| token_chain.map(|c| decode_destination_address(c, &t.token_address)))
++        .flatten()
++        .or_else(|| extract_wormholescan_field(&wh_raw, "tokenAddress"));
++
++    let symbol_hint: Option<String> = extract_wormholescan_field(&wh_raw, "tokenSymbol");
++
++    let destination_wallet: Option<String> = decoded
++        .transfer
++        .as_ref()
++        .and_then(|t| destination_chain_id.map(|c| decode_destination_address(c, &t.to_address)))
++        .flatten()
++        .or_else(|| extract_wormholescan_field(&wh_raw, "toAddress"));
++
++    let known_destination_tx: Option<String> = wh_raw
++        .get("globalTx")
++        .and_then(|g| g.get("destinationTx"))
++        .and_then(|d| d.get("txHash"))
++        .and_then(|h| h.as_str())
++        .map(String::from);
++
++    let bridge_transfer = correlator::correlate(
++        &state.registry,
++        correlator::CorrelateParams {
++            source_tx_hash: hash.to_string(),
++            source_wallet: tx.signer.clone(),
++            message_id,
++            destination_chain_id: destination_chain_id.unwrap_or(0),
++            token,
++            token_chain: token_chain.unwrap_or(0),
++            symbol_hint,
++            raw_amount,
++            amount,
++            destination_wallet,
++            known_destination_tx,
++        },
++    )
++    .await?;
++
++    Ok((bridge_event, bridge_transfer))
+ }
+diff --git a/src/services/correlator.rs b/src/services/correlator.rs
+index fd777f5..e7bf384 100644
+--- a/src/services/correlator.rs
++++ b/src/services/correlator.rs
+@@ -12,7 +12,7 @@ pub struct CorrelateParams {
+     pub destination_chain_id: u16,
+     pub token: Option<String>,
+     pub token_chain: u16,
+-    pub wormholescan_symbol_hint: Option<String>,
++    pub symbol_hint: Option<String>,
+     pub raw_amount: Option<u128>,
+     pub amount: Option<String>,
+     pub destination_wallet: Option<String>,
+@@ -30,7 +30,7 @@ pub async fn correlate(
+         destination_chain_id,
+         token,
+         token_chain,
+-        wormholescan_symbol_hint,
++        symbol_hint,
+         raw_amount,
+         amount,
+         destination_wallet,
+@@ -39,32 +39,20 @@ pub async fn correlate(
+ 
+     let destination_chain = ChainId::from_wormhole_id(destination_chain_id);
+ 
+-    // Unchanged — this part was never the bug, destination lookup correctly
+-    // stays keyed by destination_chain_id.
++    // Destination completion is read straight off the destination chain —
++    // EvmAdapter::find_transaction pages eth_getLogs for the token bridge's
++    // TransferRedeemed event. No external indexer in the loop: if we don't
++    // have a chain adapter for the destination yet, or the log scan hasn't
++    // turned it up, the transfer is just Pending until it does.
+     let (destination_tx_hash, status) = if let Some(known) = known_destination_tx {
+         (Some(known), BridgeStatus::Completed)
+     } else {
+-        let wormholescan_adapter = registry.get_wormholescan(destination_chain_id);
+-        let evm_adapter = registry.get_evm(destination_chain_id);
+-
+-        let fast = match &wormholescan_adapter {
+-            Some(a) => a.find_transaction(&message_id).await?,
+-            None => None,
+-        };
+-
+-        match fast {
+-            Some(info) => (Some(info.tx_hash), BridgeStatus::Completed),
+-            None => match &evm_adapter {
+-                Some(a) => match a.find_transaction(&message_id).await? {
+-                    Some(info) => (Some(info.tx_hash), BridgeStatus::Completed),
+-                    None => (None, BridgeStatus::Pending),
+-                },
+-
+-                None => match wormholescan_adapter {
+-                    Some(_) => (None, BridgeStatus::Pending),
+-                    None => (None, BridgeStatus::Detected),
+-                },
++        match registry.get_evm(destination_chain_id) {
++            Some(adapter) => match adapter.find_transaction(&message_id).await? {
++                Some(info) => (Some(info.tx_hash), BridgeStatus::Completed),
++                None => (None, BridgeStatus::Pending),
+             },
++            None => (None, BridgeStatus::Detected),
+         }
+     };
+ 
+@@ -73,7 +61,7 @@ pub async fn correlate(
+ 
+     let metadata = match &token {
+         Some(token_addr) => {
+-            resolve_token_metadata(registry, token_chain, token_addr, wormholescan_symbol_hint)
++            resolve_token_metadata(registry, token_chain, token_addr, symbol_hint)
+                 .await?
+         }
+         None => TokenMetadata {
+diff --git a/src/services/token_metadata.rs b/src/services/token_metadata.rs
+index 8174aeb..bd400f7 100644
+--- a/src/services/token_metadata.rs
++++ b/src/services/token_metadata.rs
+@@ -10,7 +10,7 @@ pub async fn resolve_token_metadata(
+     registry: &AdapterRegistry,
+     token_chain: u16,
+     token_address: &str,
+-    wormholescan_symbol_hint: Option<String>,
++    symbol_hint: Option<String>,
+ ) -> Result<TokenMetadata, AppError> {
+     let (symbol, decimals) = match registry.get_token_metadata(token_chain) {
+         Some(adapter) => {
+@@ -34,7 +34,7 @@ pub async fn resolve_token_metadata(
+     };
+ 
+     Ok(TokenMetadata {
+-        symbol: symbol.or(wormholescan_symbol_hint), // fallback only, never authoritative
++        symbol: symbol.or(symbol_hint), // fallback only, never authoritative
+         decimals,
+     })
+ }
+diff --git a/src/vaa/decode.rs b/src/vaa/decode.rs
+index 6a785cc..3e18c31 100644
+--- a/src/vaa/decode.rs
++++ b/src/vaa/decode.rs
+@@ -65,11 +65,7 @@ pub fn decode_vaa(vaa_b64: &str) -> Result<DecodedVaa, AppError> {
+     let payload = &body[51..];
+     tracing::debug!(payload_id = ?payload.first(), payload_len = payload.len(), "vaa payload");
+ 
+-    let transfer = match payload.first() {
+-        Some(1) | Some(3) => Some(decode_token_transfer(payload)?),
+-        _ => None,
+-    };
+-    // ---- end paste ----
++    let transfer = decode_transfer_if_present(payload)?;
+ 
+     Ok(DecodedVaa {
+         header: VaaHeader {
+@@ -81,7 +77,25 @@ pub fn decode_vaa(vaa_b64: &str) -> Result<DecodedVaa, AppError> {
+     })
+ }
+ 
+-fn decode_token_transfer(payload: &[u8]) -> Result<TokenTransferPayload, AppError> {
++/// A Wormhole token-bridge payload starts with a one-byte type tag: 1 for a
++/// plain transfer, 3 for a transfer-with-payload. Anything else isn't a
++/// token transfer we know how to decode (could be an attestation, a
++/// governance message, etc.), so we return `None` rather than erroring.
++///
++/// This works the same whether `payload` came from a guardian-signed VAA
++/// body or straight out of a source chain's `LogMessagePublished` /
++/// `postMessage` event — the payload bytes are identical either way, since
++/// the guardians never modify the message, only attach signatures to it.
++pub fn decode_transfer_if_present(
++    payload: &[u8],
++) -> Result<Option<TokenTransferPayload>, AppError> {
++    match payload.first() {
++        Some(1) | Some(3) => Ok(Some(decode_token_transfer(payload)?)),
++        _ => Ok(None),
++    }
++}
++
++pub fn decode_token_transfer(payload: &[u8]) -> Result<TokenTransferPayload, AppError> {
+     if payload.len() < 101 {
+         return Err(AppError::Normalisation("transfer payload too short".into()));
+     }
+diff --git a/src/vaa/mod.rs b/src/vaa/mod.rs
+index 5ac80bb..5913613 100644
+--- a/src/vaa/mod.rs
++++ b/src/vaa/mod.rs
+@@ -1 +1,2 @@
+ pub mod decode;
++pub mod evm_log;

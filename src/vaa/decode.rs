@@ -65,11 +65,7 @@ pub fn decode_vaa(vaa_b64: &str) -> Result<DecodedVaa, AppError> {
     let payload = &body[51..];
     tracing::debug!(payload_id = ?payload.first(), payload_len = payload.len(), "vaa payload");
 
-    let transfer = match payload.first() {
-        Some(1) | Some(3) => Some(decode_token_transfer(payload)?),
-        _ => None,
-    };
-    // ---- end paste ----
+    let transfer = decode_transfer_if_present(payload)?;
 
     Ok(DecodedVaa {
         header: VaaHeader {
@@ -81,7 +77,25 @@ pub fn decode_vaa(vaa_b64: &str) -> Result<DecodedVaa, AppError> {
     })
 }
 
-fn decode_token_transfer(payload: &[u8]) -> Result<TokenTransferPayload, AppError> {
+/// A Wormhole token-bridge payload starts with a one-byte type tag: 1 for a
+/// plain transfer, 3 for a transfer-with-payload. Anything else isn't a
+/// token transfer we know how to decode (could be an attestation, a
+/// governance message, etc.), so we return `None` rather than erroring.
+///
+/// This works the same whether `payload` came from a guardian-signed VAA
+/// body or straight out of a source chain's `LogMessagePublished` /
+/// `postMessage` event — the payload bytes are identical either way, since
+/// the guardians never modify the message, only attach signatures to it.
+pub fn decode_transfer_if_present(
+    payload: &[u8],
+) -> Result<Option<TokenTransferPayload>, AppError> {
+    match payload.first() {
+        Some(1) | Some(3) => Ok(Some(decode_token_transfer(payload)?)),
+        _ => Ok(None),
+    }
+}
+
+pub fn decode_token_transfer(payload: &[u8]) -> Result<TokenTransferPayload, AppError> {
     if payload.len() < 101 {
         return Err(AppError::Normalisation("transfer payload too short".into()));
     }

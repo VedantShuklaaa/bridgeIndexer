@@ -6,7 +6,6 @@ pub mod evm;
 pub mod registry;
 pub mod setup;
 pub mod solana;
-pub mod wormholescan;
 
 #[async_trait]
 pub trait ChainAdapter: Send + Sync {

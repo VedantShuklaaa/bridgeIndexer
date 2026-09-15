@@ -2,38 +2,13 @@ use reqwest::Client;
 use std::sync::Arc;
 
 use crate::{
-    chain_adapters::{
-        evm::EvmAdapter, registry::AdapterRegistry, solana::SolanaAdapter,
-        wormholescan::WormholeScanAdapter,
-    },
+    chain_adapters::{evm::EvmAdapter, registry::AdapterRegistry, solana::SolanaAdapter},
     config::AppConfig,
     domain::bridge_transfer::ChainId,
 };
 
 pub fn build_registry(config: &AppConfig, http_client: &Client) -> AdapterRegistry {
     let mut registry = AdapterRegistry::new();
-
-    for chain in [
-        ChainId::Solana,
-        ChainId::Ethereum,
-        ChainId::Bsc,
-        ChainId::Polygon,
-        ChainId::Avalanche,
-        ChainId::Near,
-        ChainId::Arbitrum,
-        ChainId::Optimism,
-        ChainId::Gnosis,
-        ChainId::Base,
-    ] {
-        registry.register_wormholescan(
-            chain.wormhole_id(),
-            Arc::new(WormholeScanAdapter::new(
-                http_client.clone(),
-                config.wormhole_url.clone(),
-                chain_label(&chain),
-            )),
-        );
-    }
 
     let solana_adapter: Arc<SolanaAdapter> = Arc::new(SolanaAdapter::new(
         http_client.clone(),
@@ -124,20 +99,4 @@ pub fn build_registry(config: &AppConfig, http_client: &Client) -> AdapterRegist
     registry.register_token_metadata(ChainId::Gnosis.wormhole_id(), gnosis_adapter);
 
     registry
-}
-
-fn chain_label(chain: &ChainId) -> &'static str {
-    match chain {
-        ChainId::Solana => "solana",
-        ChainId::Ethereum => "ethereum",
-        ChainId::Bsc => "bsc",
-        ChainId::Polygon => "polygon",
-        ChainId::Avalanche => "avalanche",
-        ChainId::Near => "near",
-        ChainId::Arbitrum => "arbitrum",
-        ChainId::Optimism => "optimism",
-        ChainId::Gnosis => "gnosis",
-        ChainId::Base => "base",
-        ChainId::Unknown(_) => "unknown",
-    }
 }
