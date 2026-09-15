@@ -1,3 +1,4 @@
+use crate::chain_adapters::registry::AdapterRegistry;
 use crate::clients::{evm, helius, wormhole};
 use crate::domain::bridge::BridgeEvent;
 use crate::domain::bridge_transfer::{BridgeMessageId, BridgeTransfer};
@@ -38,8 +39,16 @@ pub async fn analyse_tx(
             let raw =
                 evm::get_transaction_data(&state.http_client, rpc_url, evm_chain, hash).await?;
             let tx = normaliser::evm::normalise(raw.clone(), hash, evm_chain)?;
-            let (bridge_event, bridge_transfer) =
-                build_bridge_data_from_source_receipt(state, &tx, evm_chain, hash, &raw).await?;
+            let (bridge_event, bridge_transfer) = build_bridge_data_from_source_receipt(
+                state,
+                &state.registry,
+                &tx,
+                evm_chain,
+                hash,
+                &raw,
+            )
+            .await?;
+
             (tx, bridge_event, bridge_transfer)
         }
         other => {
@@ -55,12 +64,9 @@ pub async fn analyse_tx(
     Ok(tx)
 }
 
-/// EVM path: the transfer is decoded entirely from the source transaction's
-/// own receipt — the Core Bridge's `LogMessagePublished` event. No
-/// WormholeScan call, no guardian VAA fetch; the payload bytes are
-/// identical either way, we just read them a step earlier.
 async fn build_bridge_data_from_source_receipt(
     state: &AppState,
+    registry: &AdapterRegistry,
     tx: &NormalisedTransaction,
     chain: &str,
     hash: &str,
@@ -117,7 +123,7 @@ async fn build_bridge_data_from_source_receipt(
     };
 
     let bridge_transfer = correlator::correlate(
-        &state.registry,
+        registry, // ← was &state.registry
         correlator::CorrelateParams {
             source_tx_hash: hash.to_string(),
             source_wallet: tx.signer.clone(),
@@ -125,11 +131,11 @@ async fn build_bridge_data_from_source_receipt(
             destination_chain_id: destination_chain_id.unwrap_or(0),
             token,
             token_chain: token_chain.unwrap_or(0),
-            symbol_hint: None, // no external hint anymore; resolve_token_metadata falls back to on-chain reads only
+            symbol_hint: None,
             raw_amount,
             amount,
             destination_wallet,
-            known_destination_tx: None, // always look this up ourselves now
+            known_destination_tx: None,
         },
     )
     .await?;
@@ -137,15 +143,6 @@ async fn build_bridge_data_from_source_receipt(
     Ok((bridge_event, bridge_transfer))
 }
 
-/// Solana path — TEMPORARY. Still goes through WormholeScan for the VAA.
-///
-/// Extracting the same data straight from a Solana transaction means
-/// decoding the token bridge program's own instruction layout (Borsh), and
-/// getting those byte offsets wrong silently corrupts amounts/addresses
-/// rather than erroring — not something to guess at from memory. Left
-/// as-is on purpose until it can be verified against the actual program
-/// IDL, rather than shipping an EVM-only fix and pretending Solana is
-/// covered too.
 async fn build_bridge_data_via_wormholescan(
     state: &AppState,
     tx: &NormalisedTransaction,
@@ -252,4 +249,54 @@ async fn build_bridge_data_via_wormholescan(
     .await?;
 
     Ok((bridge_event, bridge_transfer))
+}
+
+pub async fn analyse_tx_ondemand(
+    state: &AppState,
+    chain: &str,
+    hash: &str,
+) -> Result<NormalisedTransaction, AppError> {
+    if hash.trim().is_empty() {
+        return Err(AppError::InvalidTransactionHash(hash.to_string()));
+    }
+
+    let (mut tx, bridge_event, bridge_transfer) = match chain {
+        "solana" => {
+            let raw =
+                helius::get_transaction(&state.http_client, &state.config.helius_url, hash).await?;
+            let tx = normaliser::solana::normalise(raw, hash)?;
+            let (bridge_event, bridge_transfer) =
+                build_bridge_data_via_wormholescan(state, &tx, hash).await?;
+            (tx, bridge_event, bridge_transfer)
+        }
+        evm_chain @ ("ethereum" | "bsc" | "polygon" | "avalanche" | "arbitrum" | "optimism"
+        | "gnosis" | "base") => {
+            // ↓ only difference from analyse_tx
+            let rpc_url = state
+                .config
+                .ondemand_rpc_url_for_chain(evm_chain)
+                .map_err(|e| AppError::BadRequest(e.to_string()))?;
+            let raw =
+                evm::get_transaction_data(&state.http_client, rpc_url, evm_chain, hash).await?;
+            let tx = normaliser::evm::normalise(raw.clone(), hash, evm_chain)?;
+            let (bridge_event, bridge_transfer) = build_bridge_data_from_source_receipt(
+                state,
+                &state.ondemand_registry,
+                &tx,
+                evm_chain,
+                hash,
+                &raw,
+            )
+            .await?;
+            (tx, bridge_event, bridge_transfer)
+        }
+        other => {
+            return Err(AppError::BadRequest(format!("unsupported chain: {other}")));
+        }
+    };
+
+    tx.bridge_event = Some(bridge_event);
+    tx.bridge_transfer = Some(bridge_transfer);
+
+    Ok(tx)
 }

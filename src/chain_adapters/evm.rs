@@ -58,7 +58,7 @@ impl EvmAdapter {
             token_bridge_contract,
             deploy_block,
             name,
-            block_range,
+            block_range: block_range.max(1),
         }
     }
 
@@ -231,7 +231,7 @@ impl ChainAdapter for EvmAdapter {
 
         for _ in 0..MAX_CHUNKS {
             let from = to
-                .saturating_sub(self.block_range - 1)
+                .saturating_sub(self.block_range.saturating_sub(1))
                 .max(self.deploy_block);
             let logs = self.get_logs_resilient(from, to, &topics).await?;
 
@@ -247,7 +247,7 @@ impl ChainAdapter for EvmAdapter {
             if from <= self.deploy_block {
                 break;
             }
-            to = from - 1;
+            to = from.saturating_sub(1);
         }
 
         Ok(None)

@@ -22,6 +22,6 @@ pub async fn analyse_handler(
     State(state): State<AppState>,
     Query(params): Query<AnalyseQuery>,
 ) -> Result<Json<NormalisedTransaction>, AppError> {
-    let tx = analyzer::analyse_tx(&state, &params.chain, &params.transaction_hash).await?;
+    let tx = analyzer::analyse_tx_ondemand(&state, &params.chain, &params.transaction_hash).await?;
     Ok(Json(tx))
 }

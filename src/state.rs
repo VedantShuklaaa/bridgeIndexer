@@ -14,6 +14,7 @@ pub struct AppState {
     pub http_client: Client,
     pub config: AppConfig,
     pub registry: Arc<AdapterRegistry>,
+    pub ondemand_registry: Arc<AdapterRegistry>, // ← add
     pub tx_broadcast: broadcast::Sender<String>,
 }
 
@@ -23,14 +24,15 @@ impl AppState {
         config: AppConfig,
         http_client: Client,
         registry: AdapterRegistry,
+        ondemand_registry: AdapterRegistry, // ← add
     ) -> anyhow::Result<Self> {
         let (tx_broadcast, _) = broadcast::channel(BROADCAST_CAPACITY);
-
         Ok(Self {
             db,
             http_client,
             config,
             registry: Arc::new(registry),
+            ondemand_registry: Arc::new(ondemand_registry), // ← add
             tx_broadcast,
         })
     }

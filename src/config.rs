@@ -75,6 +75,16 @@ pub struct AppConfig {
     pub solana_ws_url: String,
 
     pub allowed_origins: Vec<String>,
+
+    //On demand
+    pub eth_ondemand_rpc_url: Option<String>,
+    pub bsc_ondemand_rpc_url: Option<String>,
+    pub polygon_ondemand_rpc_url: Option<String>,
+    pub avalanche_ondemand_rpc_url: Option<String>,
+    pub arbitrum_ondemand_rpc_url: Option<String>,
+    pub optimism_ondemand_rpc_url: Option<String>,
+    pub gnosis_ondemand_rpc_url: Option<String>,
+    pub base_ondemand_rpc_url: Option<String>,
 }
 
 impl AppConfig {
@@ -179,6 +189,15 @@ impl AppConfig {
             near_rpc_url: optional("NEAR_RPC_URL", "https://rpc.mainnet.near.org"),
             near_token_bridge_contract: required("NEAR_TOKEN_BRIDGE_CONTRACT")?,
             allowed_origins: csv_list("ALLOWED_ORIGINS"),
+
+            eth_ondemand_rpc_url: std::env::var("ETH_ONDEMAND_RPC_URL").ok(),
+            bsc_ondemand_rpc_url: std::env::var("BSC_ONDEMAND_RPC_URL").ok(),
+            polygon_ondemand_rpc_url: std::env::var("POLYGON_ONDEMAND_RPC_URL").ok(),
+            avalanche_ondemand_rpc_url: std::env::var("AVALANCHE_ONDEMAND_RPC_URL").ok(),
+            arbitrum_ondemand_rpc_url: std::env::var("ARBITRUM_ONDEMAND_RPC_URL").ok(),
+            optimism_ondemand_rpc_url: std::env::var("OPTIMISM_ONDEMAND_RPC_URL").ok(),
+            gnosis_ondemand_rpc_url: std::env::var("GNOSIS_ONDEMAND_RPC_URL").ok(),
+            base_ondemand_rpc_url: std::env::var("BASE_ONDEMAND_RPC_URL").ok(),
         })
     }
 
@@ -196,10 +215,6 @@ impl AppConfig {
         })
     }
 
-    /// The Wormhole Core Bridge contract that emits `LogMessagePublished`
-    /// on this chain — used to read a bridge transfer's own message
-    /// straight off its source transaction, instead of asking WormholeScan
-    /// for it.
     pub fn core_bridge_contract_for_chain(&self, chain: &str) -> anyhow::Result<&str> {
         Ok(match chain {
             "ethereum" => &self.eth_core_bridge_contract,
@@ -211,5 +226,23 @@ impl AppConfig {
             "base" => &self.base_core_bridge_contract,
             other => anyhow::bail!("no core bridge contract configured for chain: {other}"),
         })
+    }
+
+    pub fn ondemand_rpc_url_for_chain(&self, chain: &str) -> anyhow::Result<&str> {
+        let ondemand = match chain {
+            "ethereum" => self.eth_ondemand_rpc_url.as_deref(),
+            "bsc" => self.bsc_ondemand_rpc_url.as_deref(),
+            "polygon" => self.polygon_ondemand_rpc_url.as_deref(),
+            "avalanche" => self.avalanche_ondemand_rpc_url.as_deref(),
+            "arbitrum" => self.arbitrum_ondemand_rpc_url.as_deref(),
+            "optimism" => self.optimism_ondemand_rpc_url.as_deref(),
+            "gnosis" => self.gnosis_ondemand_rpc_url.as_deref(),
+            "base" => self.base_ondemand_rpc_url.as_deref(),
+            other => anyhow::bail!("no RPC URL configured for chain: {other}"),
+        };
+        // fall back to primary if no dedicated key
+        let url = ondemand.unwrap_or(self.rpc_url_for_chain(chain)?);
+        tracing::debug!(chain, url, "ondemand rpc url selected");
+        Ok(ondemand.unwrap_or(self.rpc_url_for_chain(chain)?))
     }
 }

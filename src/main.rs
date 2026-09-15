@@ -1,4 +1,4 @@
-use bridge::chain_adapters::setup::build_registry;
+use bridge::chain_adapters::setup::{build_ondemand_registry, build_registry};
 use bridge::config::AppConfig;
 use bridge::db;
 use bridge::ingestion::setup::spawn_evm_ingesters;
@@ -57,11 +57,20 @@ async fn main() -> anyhow::Result<()> {
     let http_client = Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
-    let registry = build_registry(&config, &http_client);
-    let state = AppState::new(db.clone(), config.clone(), http_client.clone(), registry)?;
 
+    // Redis must be constructed before state consumes config
     let redis = RedisProducer::new(&config.redis_url).await?;
     redis.test_connection().await?;
+
+    let registry = build_registry(&config, &http_client);
+    let ondemand_registry = build_ondemand_registry(&config, &http_client);
+    let state = AppState::new(
+        db.clone(),
+        config.clone(),
+        http_client.clone(),
+        registry,
+        ondemand_registry,
+    )?;
 
     let shutdown = CancellationToken::new();
     {
