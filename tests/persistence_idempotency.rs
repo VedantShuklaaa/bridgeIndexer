@@ -34,6 +34,8 @@ fn sample_tx(hash: &str) -> NormalisedTransaction {
             },
             status: BridgeStatus::Pending,
         }),
+
+        decoded_actions: Vec::new(),
     }
 }
 

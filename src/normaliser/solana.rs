@@ -3,8 +3,6 @@ use serde_json::Value;
 use crate::domain::transaction::{Chain, NormalisedTransaction, TxStatus};
 use crate::error::AppError;
 
-/// Pure transform: raw Helius `jsonParsed` result -> our domain type.
-/// No network calls, unit-testable with a saved fixture.
 pub fn normalise(raw: Value, hash: &str) -> Result<NormalisedTransaction, AppError> {
     let slot = raw
         .get("slot")
@@ -50,9 +48,6 @@ pub fn normalise(raw: Value, hash: &str) -> Result<NormalisedTransaction, AppErr
         signer,
         bridge_event: None,
         bridge_transfer: None,
-        // Solana isn't EVM — the generic EVM decoder never runs for this
-        // chain, so there's nothing to populate here. Kept as an empty
-        // Vec (not skipped) so the field always exists on every response.
         decoded_actions: Vec::new(),
     })
 }
