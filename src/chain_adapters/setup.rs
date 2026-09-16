@@ -98,6 +98,107 @@ pub fn build_registry(config: &AppConfig, http_client: &Client) -> AdapterRegist
     registry.register_evm(ChainId::Gnosis.wormhole_id(), gnosis_adapter.clone());
     registry.register_token_metadata(ChainId::Gnosis.wormhole_id(), gnosis_adapter);
 
+    // in build_registry — add after existing chains:
+    let moonbeam_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        config.moonbeam_rpc_url.clone(),
+        config.moonbeam_token_bridge_contract.clone(),
+        config.moonbeam_token_bridge_deploy_block.clone(),
+        "moonbeam",
+    ));
+    registry.register_evm(ChainId::Moonbeam.wormhole_id(), moonbeam_adapter.clone());
+    registry.register_token_metadata(ChainId::Moonbeam.wormhole_id(), moonbeam_adapter);
+
+    let celo_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        config.celo_rpc_url.clone(),
+        config.celo_token_bridge_contract.clone(),
+        config.celo_token_bridge_deploy_block.clone(),
+        "celo",
+    ));
+    registry.register_evm(ChainId::Celo.wormhole_id(), celo_adapter.clone());
+    registry.register_token_metadata(ChainId::Celo.wormhole_id(), celo_adapter);
+
+    let kaia_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        config.kaia_rpc_url.clone(),
+        config.kaia_token_bridge_contract.clone(),
+        config.kaia_token_bridge_deploy_block.clone(),
+        "kaia",
+    ));
+    registry.register_evm(ChainId::Kaia.wormhole_id(), kaia_adapter.clone());
+    registry.register_token_metadata(ChainId::Kaia.wormhole_id(), kaia_adapter);
+
+    let scroll_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        config.scroll_rpc_url.clone(),
+        config.scroll_token_bridge_contract.clone(),
+        config.scroll_token_bridge_deploy_block.clone(),
+        "scroll",
+    ));
+    registry.register_evm(ChainId::Scroll.wormhole_id(), scroll_adapter.clone());
+    registry.register_token_metadata(ChainId::Scroll.wormhole_id(), scroll_adapter);
+
+    let linea_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        config.linea_rpc_url.clone(),
+        config.linea_token_bridge_contract.clone(),
+        config.linea_token_bridge_deploy_block.clone(),
+        "linea",
+    ));
+    registry.register_evm(ChainId::Linea.wormhole_id(), linea_adapter.clone());
+    registry.register_token_metadata(ChainId::Linea.wormhole_id(), linea_adapter);
+
+    let berachain_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        config.berachain_rpc_url.clone(),
+        config.berachain_token_bridge_contract.clone(),
+        config.berachain_token_bridge_deploy_block.clone(),
+        "berachain",
+    ));
+    registry.register_evm(ChainId::Berachain.wormhole_id(), berachain_adapter.clone());
+    registry.register_token_metadata(ChainId::Berachain.wormhole_id(), berachain_adapter);
+
+    let seievm_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        config.seievm_rpc_url.clone(),
+        config.seievm_token_bridge_contract.clone(),
+        config.seievm_token_bridge_deploy_block.clone(),
+        "seievm",
+    ));
+    registry.register_evm(ChainId::Seievm.wormhole_id(), seievm_adapter.clone());
+    registry.register_token_metadata(ChainId::Seievm.wormhole_id(), seievm_adapter);
+
+    let unichain_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        config.unichain_rpc_url.clone(),
+        config.unichain_token_bridge_contract.clone(),
+        config.unichain_token_bridge_deploy_block.clone(),
+        "unichain",
+    ));
+    registry.register_evm(ChainId::Unichain.wormhole_id(), unichain_adapter.clone());
+    registry.register_token_metadata(ChainId::Unichain.wormhole_id(), unichain_adapter);
+
+    let ink_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        config.ink_rpc_url.clone(),
+        config.ink_token_bridge_contract.clone(),
+        config.ink_token_bridge_deploy_block.clone(),
+        "ink",
+    ));
+    registry.register_evm(ChainId::Ink.wormhole_id(), ink_adapter.clone());
+    registry.register_token_metadata(ChainId::Ink.wormhole_id(), ink_adapter);
+
+    let sonic_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        config.sonic_rpc_url.clone(),
+        config.sonic_token_bridge_contract.clone(),
+        config.sonic_token_bridge_deploy_block.clone(),
+        "sonic",
+    ));
+    registry.register_evm(ChainId::Sonic.wormhole_id(), sonic_adapter.clone());
+    registry.register_token_metadata(ChainId::Sonic.wormhole_id(), sonic_adapter);
+
     registry
 }
 
@@ -226,6 +327,146 @@ pub fn build_ondemand_registry(config: &AppConfig, http_client: &Client) -> Adap
     ));
     registry.register_evm(ChainId::Base.wormhole_id(), base_adapter.clone());
     registry.register_token_metadata(ChainId::Base.wormhole_id(), base_adapter);
+
+    let moonbeam_url = config
+        .moonbeam_ondemand_rpc_url
+        .clone()
+        .unwrap_or_else(|| config.moonbeam_rpc_url.clone());
+    let moonbeam_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        moonbeam_url,
+        config.moonbeam_token_bridge_contract.clone(),
+        config.moonbeam_token_bridge_deploy_block.clone(),
+        "moonbeam",
+    ));
+    registry.register_evm(ChainId::Moonbeam.wormhole_id(), moonbeam_adapter.clone());
+    registry.register_token_metadata(ChainId::Moonbeam.wormhole_id(), moonbeam_adapter);
+
+    let celo_url = config
+        .celo_ondemand_rpc_url
+        .clone()
+        .unwrap_or_else(|| config.celo_rpc_url.clone());
+    let celo_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        celo_url,
+        config.celo_token_bridge_contract.clone(),
+        config.celo_token_bridge_deploy_block.clone(),
+        "celo",
+    ));
+    registry.register_evm(ChainId::Celo.wormhole_id(), celo_adapter.clone());
+    registry.register_token_metadata(ChainId::Celo.wormhole_id(), celo_adapter);
+
+    let kaia_url = config
+        .kaia_ondemand_rpc_url
+        .clone()
+        .unwrap_or_else(|| config.kaia_rpc_url.clone());
+    let kaia_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        kaia_url,
+        config.kaia_token_bridge_contract.clone(),
+        config.kaia_token_bridge_deploy_block.clone(),
+        "kaia",
+    ));
+    registry.register_evm(ChainId::Kaia.wormhole_id(), kaia_adapter.clone());
+    registry.register_token_metadata(ChainId::Kaia.wormhole_id(), kaia_adapter);
+
+    let scroll_url = config
+        .scroll_ondemand_rpc_url
+        .clone()
+        .unwrap_or_else(|| config.scroll_rpc_url.clone());
+    let scroll_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        scroll_url,
+        config.scroll_token_bridge_contract.clone(),
+        config.scroll_token_bridge_deploy_block.clone(),
+        "scroll",
+    ));
+    registry.register_evm(ChainId::Scroll.wormhole_id(), scroll_adapter.clone());
+    registry.register_token_metadata(ChainId::Scroll.wormhole_id(), scroll_adapter);
+
+    let linea_url = config
+        .linea_ondemand_rpc_url
+        .clone()
+        .unwrap_or_else(|| config.linea_rpc_url.clone());
+    let linea_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        linea_url,
+        config.linea_token_bridge_contract.clone(),
+        config.linea_token_bridge_deploy_block.clone(),
+        "linea",
+    ));
+    registry.register_evm(ChainId::Linea.wormhole_id(), linea_adapter.clone());
+    registry.register_token_metadata(ChainId::Linea.wormhole_id(), linea_adapter);
+
+    let berachain_url = config
+        .berachain_ondemand_rpc_url
+        .clone()
+        .unwrap_or_else(|| config.berachain_rpc_url.clone());
+    let berachain_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        berachain_url,
+        config.berachain_token_bridge_contract.clone(),
+        config.berachain_token_bridge_deploy_block.clone(),
+        "berachain",
+    ));
+    registry.register_evm(ChainId::Berachain.wormhole_id(), berachain_adapter.clone());
+    registry.register_token_metadata(ChainId::Berachain.wormhole_id(), berachain_adapter);
+
+    let seievm_url = config
+        .seievm_ondemand_rpc_url
+        .clone()
+        .unwrap_or_else(|| config.seievm_rpc_url.clone());
+    let seievm_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        seievm_url,
+        config.seievm_token_bridge_contract.clone(),
+        config.seievm_token_bridge_deploy_block.clone(),
+        "seievm",
+    ));
+    registry.register_evm(ChainId::Seievm.wormhole_id(), seievm_adapter.clone());
+    registry.register_token_metadata(ChainId::Seievm.wormhole_id(), seievm_adapter);
+
+    let unichain_url = config
+        .unichain_ondemand_rpc_url
+        .clone()
+        .unwrap_or_else(|| config.unichain_rpc_url.clone());
+    let unichain_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        unichain_url,
+        config.unichain_token_bridge_contract.clone(),
+        config.unichain_token_bridge_deploy_block.clone(),
+        "unichain",
+    ));
+    registry.register_evm(ChainId::Unichain.wormhole_id(), unichain_adapter.clone());
+    registry.register_token_metadata(ChainId::Unichain.wormhole_id(), unichain_adapter);
+
+    let ink_url = config
+        .ink_ondemand_rpc_url
+        .clone()
+        .unwrap_or_else(|| config.ink_rpc_url.clone());
+    let ink_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        ink_url,
+        config.ink_token_bridge_contract.clone(),
+        config.ink_token_bridge_deploy_block.clone(),
+        "ink",
+    ));
+    registry.register_evm(ChainId::Ink.wormhole_id(), ink_adapter.clone());
+    registry.register_token_metadata(ChainId::Ink.wormhole_id(), ink_adapter);
+
+    let sonic_url = config
+        .sonic_ondemand_rpc_url
+        .clone()
+        .unwrap_or_else(|| config.sonic_rpc_url.clone());
+    let sonic_adapter: Arc<EvmAdapter> = Arc::new(EvmAdapter::new(
+        http_client.clone(),
+        sonic_url,
+        config.sonic_token_bridge_contract.clone(),
+        config.sonic_token_bridge_deploy_block.clone(),
+        "sonic",
+    ));
+    registry.register_evm(ChainId::Sonic.wormhole_id(), sonic_adapter.clone());
+    registry.register_token_metadata(ChainId::Sonic.wormhole_id(), sonic_adapter);
 
     registry
 }

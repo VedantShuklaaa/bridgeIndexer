@@ -35,6 +35,10 @@ redis = {
 chrono = { version = "0.4", features = ["serde"] }
 tower-http = { version = "0.5", features = ["cors"] }
 tokio-util = "0.7"
+alloy-primitives = { version = "1", features = ["serde"] }
+alloy-dyn-abi = "1"
+alloy-json-abi = "1"
+alloy-sol-types = "1"
 
 [dev-dependencies]
 testcontainers-modules = { version = "0.11", features = ["postgres"] }

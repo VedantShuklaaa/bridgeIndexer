@@ -68,6 +68,86 @@ pub struct AppConfig {
     pub base_core_bridge_contract: String,
     pub base_core_bridge_deploy_block: String,
 
+    // Moonbeam
+    pub moonbeam_rpc_url: String,
+    pub moonbeam_token_bridge_contract: String,
+    pub moonbeam_token_bridge_deploy_block: String,
+    pub moonbeam_ws_url: String,
+    pub moonbeam_core_bridge_contract: String,
+    pub moonbeam_core_bridge_deploy_block: String,
+
+    // Celo
+    pub celo_rpc_url: String,
+    pub celo_token_bridge_contract: String,
+    pub celo_token_bridge_deploy_block: String,
+    pub celo_ws_url: String,
+    pub celo_core_bridge_contract: String,
+    pub celo_core_bridge_deploy_block: String,
+
+    // Kaia
+    pub kaia_rpc_url: String,
+    pub kaia_token_bridge_contract: String,
+    pub kaia_token_bridge_deploy_block: String,
+    pub kaia_ws_url: String,
+    pub kaia_core_bridge_contract: String,
+    pub kaia_core_bridge_deploy_block: String,
+
+    // Scroll
+    pub scroll_rpc_url: String,
+    pub scroll_token_bridge_contract: String,
+    pub scroll_token_bridge_deploy_block: String,
+    pub scroll_ws_url: String,
+    pub scroll_core_bridge_contract: String,
+    pub scroll_core_bridge_deploy_block: String,
+
+    // Linea
+    pub linea_rpc_url: String,
+    pub linea_token_bridge_contract: String,
+    pub linea_token_bridge_deploy_block: String,
+    pub linea_ws_url: String,
+    pub linea_core_bridge_contract: String,
+    pub linea_core_bridge_deploy_block: String,
+
+    // Berachain
+    pub berachain_rpc_url: String,
+    pub berachain_token_bridge_contract: String,
+    pub berachain_token_bridge_deploy_block: String,
+    pub berachain_ws_url: String,
+    pub berachain_core_bridge_contract: String,
+    pub berachain_core_bridge_deploy_block: String,
+
+    // Seievm
+    pub seievm_rpc_url: String,
+    pub seievm_token_bridge_contract: String,
+    pub seievm_token_bridge_deploy_block: String,
+    pub seievm_ws_url: String,
+    pub seievm_core_bridge_contract: String,
+    pub seievm_core_bridge_deploy_block: String,
+
+    // Unichain
+    pub unichain_rpc_url: String,
+    pub unichain_token_bridge_contract: String,
+    pub unichain_token_bridge_deploy_block: String,
+    pub unichain_ws_url: String,
+    pub unichain_core_bridge_contract: String,
+    pub unichain_core_bridge_deploy_block: String,
+
+    // Ink
+    pub ink_rpc_url: String,
+    pub ink_token_bridge_contract: String,
+    pub ink_token_bridge_deploy_block: String,
+    pub ink_ws_url: String,
+    pub ink_core_bridge_contract: String,
+    pub ink_core_bridge_deploy_block: String,
+
+    // Sonic
+    pub sonic_rpc_url: String,
+    pub sonic_token_bridge_contract: String,
+    pub sonic_token_bridge_deploy_block: String,
+    pub sonic_ws_url: String,
+    pub sonic_core_bridge_contract: String,
+    pub sonic_core_bridge_deploy_block: String,
+
     // Non-EVM chains
     pub solana_token_bridge_program: String,
     pub near_rpc_url: String,
@@ -85,6 +165,16 @@ pub struct AppConfig {
     pub optimism_ondemand_rpc_url: Option<String>,
     pub gnosis_ondemand_rpc_url: Option<String>,
     pub base_ondemand_rpc_url: Option<String>,
+    pub moonbeam_ondemand_rpc_url: Option<String>,
+    pub celo_ondemand_rpc_url: Option<String>,
+    pub kaia_ondemand_rpc_url: Option<String>,
+    pub scroll_ondemand_rpc_url: Option<String>,
+    pub linea_ondemand_rpc_url: Option<String>,
+    pub berachain_ondemand_rpc_url: Option<String>,
+    pub seievm_ondemand_rpc_url: Option<String>,
+    pub unichain_ondemand_rpc_url: Option<String>,
+    pub ink_ondemand_rpc_url: Option<String>,
+    pub sonic_ondemand_rpc_url: Option<String>,
 }
 
 impl AppConfig {
@@ -190,6 +280,98 @@ impl AppConfig {
             near_token_bridge_contract: required("NEAR_TOKEN_BRIDGE_CONTRACT")?,
             allowed_origins: csv_list("ALLOWED_ORIGINS"),
 
+            moonbeam_rpc_url: optional("MOONBEAM_RPC_URL", "https://rpc.api.moonbeam.network"),
+            moonbeam_token_bridge_contract: required("MOONBEAM_TOKEN_BRIDGE_CONTRACT")?,
+            moonbeam_token_bridge_deploy_block: optional(
+                "MOONBEAM_TOKEN_BRIDGE_DEPLOY_BLOCK",
+                "0x0",
+            ),
+            moonbeam_ws_url: required("MOONBEAM_WS_URL")?,
+            moonbeam_core_bridge_contract: required("MOONBEAM_CORE_BRIDGE_CONTRACT")?,
+            moonbeam_core_bridge_deploy_block: optional("MOONBEAM_CORE_BRIDGE_DEPLOY_BLOCK", "0x0"),
+
+            celo_rpc_url: optional("CELO_RPC_URL", "https://forno.celo.org"),
+            celo_token_bridge_contract: required("CELO_TOKEN_BRIDGE_CONTRACT")?,
+            celo_token_bridge_deploy_block: optional("CELO_TOKEN_BRIDGE_DEPLOY_BLOCK", "0x0"),
+            celo_ws_url: required("CELO_WS_URL")?,
+            celo_core_bridge_contract: required("CELO_CORE_BRIDGE_CONTRACT")?,
+            celo_core_bridge_deploy_block: optional("CELO_CORE_BRIDGE_DEPLOY_BLOCK", "0x0"),
+
+            kaia_rpc_url: optional("KAIA_RPC_URL", "https://public-en.node.kaia.io"),
+            kaia_token_bridge_contract: required("KAIA_TOKEN_BRIDGE_CONTRACT")?,
+            kaia_token_bridge_deploy_block: optional("KAIA_TOKEN_BRIDGE_DEPLOY_BLOCK", "0x0"),
+            kaia_ws_url: required("KAIA_WS_URL")?,
+            kaia_core_bridge_contract: required("KAIA_CORE_BRIDGE_CONTRACT")?,
+            kaia_core_bridge_deploy_block: optional("KAIA_CORE_BRIDGE_DEPLOY_BLOCK", "0x0"),
+
+            scroll_rpc_url: optional("SCROLL_RPC_URL", "https://rpc.scroll.io"),
+            scroll_token_bridge_contract: required("SCROLL_TOKEN_BRIDGE_CONTRACT")?,
+            scroll_token_bridge_deploy_block: optional("SCROLL_TOKEN_BRIDGE_DEPLOY_BLOCK", "0x0"),
+            scroll_ws_url: required("SCROLL_WS_URL")?,
+            scroll_core_bridge_contract: required("SCROLL_CORE_BRIDGE_CONTRACT")?,
+            scroll_core_bridge_deploy_block: optional("SCROLL_CORE_BRIDGE_DEPLOY_BLOCK", "0x0"),
+
+            linea_rpc_url: optional("LINEA_RPC_URL", "https://rpc.linea.build"),
+            linea_token_bridge_contract: required("LINEA_TOKEN_BRIDGE_CONTRACT")?,
+            linea_token_bridge_deploy_block: optional("LINEA_TOKEN_BRIDGE_DEPLOY_BLOCK", "0x0"),
+            linea_ws_url: required("LINEA_WS_URL")?,
+            linea_core_bridge_contract: required("LINEA_CORE_BRIDGE_CONTRACT")?,
+            linea_core_bridge_deploy_block: optional("LINEA_CORE_BRIDGE_DEPLOY_BLOCK", "0x0"),
+
+            berachain_rpc_url: optional("BERACHAIN_RPC_URL", "https://rpc.berachain.com"),
+            berachain_token_bridge_contract: required("BERACHAIN_TOKEN_BRIDGE_CONTRACT")?,
+            berachain_token_bridge_deploy_block: optional(
+                "BERACHAIN_TOKEN_BRIDGE_DEPLOY_BLOCK",
+                "0x0",
+            ),
+            berachain_ws_url: required("BERACHAIN_WS_URL")?,
+            berachain_core_bridge_contract: required("BERACHAIN_CORE_BRIDGE_CONTRACT")?,
+            berachain_core_bridge_deploy_block: optional(
+                "BERACHAIN_CORE_BRIDGE_DEPLOY_BLOCK",
+                "0x0",
+            ),
+
+            seievm_rpc_url: optional("SEIEVM_RPC_URL", "https://evm-rpc.sei-apis.com"),
+            seievm_token_bridge_contract: required("SEIEVM_TOKEN_BRIDGE_CONTRACT")?,
+            seievm_token_bridge_deploy_block: optional("SEIEVM_TOKEN_BRIDGE_DEPLOY_BLOCK", "0x0"),
+            seievm_ws_url: required("SEIEVM_WS_URL")?,
+            seievm_core_bridge_contract: required("SEIEVM_CORE_BRIDGE_CONTRACT")?,
+            seievm_core_bridge_deploy_block: optional("SEIEVM_CORE_BRIDGE_DEPLOY_BLOCK", "0x0"),
+
+            unichain_rpc_url: optional("UNICHAIN_RPC_URL", "https://mainnet.unichain.org"),
+            unichain_token_bridge_contract: required("UNICHAIN_TOKEN_BRIDGE_CONTRACT")?,
+            unichain_token_bridge_deploy_block: optional(
+                "UNICHAIN_TOKEN_BRIDGE_DEPLOY_BLOCK",
+                "0x0",
+            ),
+            unichain_ws_url: required("UNICHAIN_WS_URL")?,
+            unichain_core_bridge_contract: required("UNICHAIN_CORE_BRIDGE_CONTRACT")?,
+            unichain_core_bridge_deploy_block: optional("UNICHAIN_CORE_BRIDGE_DEPLOY_BLOCK", "0x0"),
+
+            ink_rpc_url: optional("INK_RPC_URL", "https://rpc-gel.inkonchain.com"),
+            ink_token_bridge_contract: required("INK_TOKEN_BRIDGE_CONTRACT")?,
+            ink_token_bridge_deploy_block: optional("INK_TOKEN_BRIDGE_DEPLOY_BLOCK", "0x0"),
+            ink_ws_url: required("INK_WS_URL")?,
+            ink_core_bridge_contract: required("INK_CORE_BRIDGE_CONTRACT")?,
+            ink_core_bridge_deploy_block: optional("INK_CORE_BRIDGE_DEPLOY_BLOCK", "0x0"),
+
+            sonic_rpc_url: optional("SONIC_RPC_URL", "https://rpc.soniclabs.com"),
+            sonic_token_bridge_contract: required("SONIC_TOKEN_BRIDGE_CONTRACT")?,
+            sonic_token_bridge_deploy_block: optional("SONIC_TOKEN_BRIDGE_DEPLOY_BLOCK", "0x0"),
+            sonic_ws_url: required("SONIC_WS_URL")?,
+            sonic_core_bridge_contract: required("SONIC_CORE_BRIDGE_CONTRACT")?,
+            sonic_core_bridge_deploy_block: optional("SONIC_CORE_BRIDGE_DEPLOY_BLOCK", "0x0"),
+
+            moonbeam_ondemand_rpc_url: std::env::var("MOONBEAM_ONDEMAND_RPC_URL").ok(),
+            celo_ondemand_rpc_url: std::env::var("CELO_ONDEMAND_RPC_URL").ok(),
+            kaia_ondemand_rpc_url: std::env::var("KAIA_ONDEMAND_RPC_URL").ok(),
+            scroll_ondemand_rpc_url: std::env::var("SCROLL_ONDEMAND_RPC_URL").ok(),
+            linea_ondemand_rpc_url: std::env::var("LINEA_ONDEMAND_RPC_URL").ok(),
+            berachain_ondemand_rpc_url: std::env::var("BERACHAIN_ONDEMAND_RPC_URL").ok(),
+            seievm_ondemand_rpc_url: std::env::var("SEIEVM_ONDEMAND_RPC_URL").ok(),
+            unichain_ondemand_rpc_url: std::env::var("UNICHAIN_ONDEMAND_RPC_URL").ok(),
+            ink_ondemand_rpc_url: std::env::var("INK_ONDEMAND_RPC_URL").ok(),
+            sonic_ondemand_rpc_url: std::env::var("SONIC_ONDEMAND_RPC_URL").ok(),
             eth_ondemand_rpc_url: std::env::var("ETH_ONDEMAND_RPC_URL").ok(),
             bsc_ondemand_rpc_url: std::env::var("BSC_ONDEMAND_RPC_URL").ok(),
             polygon_ondemand_rpc_url: std::env::var("POLYGON_ONDEMAND_RPC_URL").ok(),
@@ -211,6 +393,16 @@ impl AppConfig {
             "optimism" => &self.optimism_rpc_url,
             "gnosis" => &self.gnosis_rpc_url,
             "base" => &self.base_rpc_url,
+            "moonbeam" => &self.moonbeam_rpc_url,
+            "celo" => &self.celo_rpc_url,
+            "kaia" => &self.kaia_rpc_url,
+            "scroll" => &self.scroll_rpc_url,
+            "linea" => &self.linea_rpc_url,
+            "berachain" => &self.berachain_rpc_url,
+            "seievm" => &self.seievm_rpc_url,
+            "unichain" => &self.unichain_rpc_url,
+            "ink" => &self.ink_rpc_url,
+            "sonic" => &self.sonic_rpc_url,
             other => anyhow::bail!("no RPC URL configured for chain: {other}"),
         })
     }
@@ -224,6 +416,16 @@ impl AppConfig {
             "arbitrum" => &self.arbitrum_core_bridge_contract,
             "optimism" => &self.optimism_core_bridge_contract,
             "base" => &self.base_core_bridge_contract,
+            "moonbeam" => &self.moonbeam_core_bridge_contract,
+            "celo" => &self.celo_core_bridge_contract,
+            "kaia" => &self.kaia_core_bridge_contract,
+            "scroll" => &self.scroll_core_bridge_contract,
+            "linea" => &self.linea_core_bridge_contract,
+            "berachain" => &self.berachain_core_bridge_contract,
+            "seievm" => &self.seievm_core_bridge_contract,
+            "unichain" => &self.unichain_core_bridge_contract,
+            "ink" => &self.ink_core_bridge_contract,
+            "sonic" => &self.sonic_core_bridge_contract,
             other => anyhow::bail!("no core bridge contract configured for chain: {other}"),
         })
     }
@@ -238,6 +440,16 @@ impl AppConfig {
             "optimism" => self.optimism_ondemand_rpc_url.as_deref(),
             "gnosis" => self.gnosis_ondemand_rpc_url.as_deref(),
             "base" => self.base_ondemand_rpc_url.as_deref(),
+            "moonbeam" => self.moonbeam_ondemand_rpc_url.as_deref(),
+            "celo" => self.celo_ondemand_rpc_url.as_deref(),
+            "kaia" => self.kaia_ondemand_rpc_url.as_deref(),
+            "scroll" => self.scroll_ondemand_rpc_url.as_deref(),
+            "linea" => self.linea_ondemand_rpc_url.as_deref(),
+            "berachain" => self.berachain_ondemand_rpc_url.as_deref(),
+            "seievm" => self.seievm_ondemand_rpc_url.as_deref(),
+            "unichain" => self.unichain_ondemand_rpc_url.as_deref(),
+            "ink" => self.ink_ondemand_rpc_url.as_deref(),
+            "sonic" => self.sonic_ondemand_rpc_url.as_deref(),
             other => anyhow::bail!("no RPC URL configured for chain: {other}"),
         };
         // fall back to primary if no dedicated key

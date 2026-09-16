@@ -86,6 +86,82 @@ fn evm_chain_configs(config: &AppConfig) -> Vec<EvmChainConfig> {
         },
         // Gnosis intentionally omitted — read-only Core Contract, never
         // originates LogMessagePublished (see README roadmap note).
+        EvmChainConfig {
+            name: "moonbeam",
+            ws_url: config.moonbeam_ws_url.clone(),
+            rpc_url: config.moonbeam_rpc_url.clone(),
+            core_bridge_contract: config.moonbeam_core_bridge_contract.clone(),
+            core_bridge_deploy_block: config.moonbeam_core_bridge_deploy_block.clone(),
+            block_range: 2000, // adjust down if the RPC provider caps eth_getLogs tighter
+        },
+        EvmChainConfig {
+            name: "celo",
+            ws_url: config.celo_ws_url.clone(),
+            rpc_url: config.celo_rpc_url.clone(),
+            core_bridge_contract: config.celo_core_bridge_contract.clone(),
+            core_bridge_deploy_block: config.celo_core_bridge_deploy_block.clone(),
+            block_range: 2000,
+        },
+        EvmChainConfig {
+            name: "kaia",
+            ws_url: config.kaia_ws_url.clone(),
+            rpc_url: config.kaia_rpc_url.clone(),
+            core_bridge_contract: config.kaia_core_bridge_contract.clone(),
+            core_bridge_deploy_block: config.kaia_core_bridge_deploy_block.clone(),
+            block_range: 2000,
+        },
+        EvmChainConfig {
+            name: "scroll",
+            ws_url: config.scroll_ws_url.clone(),
+            rpc_url: config.scroll_rpc_url.clone(),
+            core_bridge_contract: config.scroll_core_bridge_contract.clone(),
+            core_bridge_deploy_block: config.scroll_core_bridge_deploy_block.clone(),
+            block_range: 2000,
+        },
+        EvmChainConfig {
+            name: "linea",
+            ws_url: config.linea_ws_url.clone(),
+            rpc_url: config.linea_rpc_url.clone(),
+            core_bridge_contract: config.linea_core_bridge_contract.clone(),
+            core_bridge_deploy_block: config.linea_core_bridge_deploy_block.clone(),
+            block_range: 2000,
+        },
+        EvmChainConfig {
+            name: "berachain",
+            ws_url: config.berachain_ws_url.clone(),
+            rpc_url: config.berachain_rpc_url.clone(),
+            core_bridge_contract: config.berachain_core_bridge_contract.clone(),
+            core_bridge_deploy_block: config.berachain_core_bridge_deploy_block.clone(),
+            block_range: 2000,
+        },
+        EvmChainConfig {
+            name: "seievm",
+            ws_url: config.seievm_ws_url.clone(),
+            rpc_url: config.seievm_rpc_url.clone(),
+            core_bridge_contract: config.seievm_core_bridge_contract.clone(),
+            core_bridge_deploy_block: config.seievm_core_bridge_deploy_block.clone(),
+            block_range: 2000,
+        },
+        EvmChainConfig {
+            name: "unichain",
+            ws_url: config.unichain_ws_url.clone(),
+            rpc_url: config.unichain_rpc_url.clone(),
+            core_bridge_contract: config.unichain_core_bridge_contract.clone(),
+            core_bridge_deploy_block: config.unichain_core_bridge_deploy_block.clone(),
+            block_range: 2000,
+        },
+        EvmChainConfig {
+            name: "ink",
+            ws_url: config.ink_ws_url.clone(),
+            rpc_url: config.ink_rpc_url.clone(),
+            core_bridge_contract: config.ink_core_bridge_contract.clone(),
+            core_bridge_deploy_block: config.ink_core_bridge_deploy_block.clone(),
+            block_range: 2000,
+        },
+        // Sonic intentionally omitted — its Core Contract is a Wormhole
+        // "read-only" deployment: it can receive/verify messages but
+        // cannot originate them, so it will never emit LogMessagePublished
+        // (same situation as Gnosis above).
     ]
 }
 

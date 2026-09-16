@@ -48,7 +48,11 @@ pub fn normalise(raw: Value, hash: &str) -> Result<NormalisedTransaction, AppErr
         timestamp,
         fee_lamports,
         signer,
-        bridge_event: None, 
-        bridge_transfer: None, 
+        bridge_event: None,
+        bridge_transfer: None,
+        // Solana isn't EVM — the generic EVM decoder never runs for this
+        // chain, so there's nothing to populate here. Kept as an empty
+        // Vec (not skipped) so the field always exists on every response.
+        decoded_actions: Vec::new(),
     })
 }

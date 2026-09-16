@@ -28,8 +28,12 @@ pub async fn analyse_tx(
                 build_bridge_data_via_wormholescan(state, &tx, hash).await?;
             (tx, bridge_event, bridge_transfer)
         }
+        // "sonic" deliberately excluded — read-only Wormhole deployment,
+        // can't originate a LogMessagePublished for us to read (see
+        // ingestion::setup and chain_adapters::setup for the same note).
         evm_chain @ ("ethereum" | "bsc" | "polygon" | "avalanche" | "arbitrum" | "optimism"
-        | "gnosis" | "base") => {
+        | "gnosis" | "base" | "moonbeam" | "celo" | "kaia" | "scroll" | "linea"
+        | "berachain" | "seievm" | "unichain" | "ink") => {
             let rpc_url = state
                 .config
                 .rpc_url_for_chain(evm_chain)
@@ -38,7 +42,11 @@ pub async fn analyse_tx(
             // extraction below — no repeat RPC round-trip.
             let raw =
                 evm::get_transaction_data(&state.http_client, rpc_url, evm_chain, hash).await?;
-            let tx = normaliser::evm::normalise(raw.clone(), hash, evm_chain)?;
+            // `abi: None` — no per-request ABI-supply mechanism wired up yet.
+            // When one exists (e.g. looked up from a registry keyed by `to`
+            // address, or passed in via the request), thread it through here
+            // to unlock DecodedAction::ContractCall for arbitrary contracts.
+            let tx = normaliser::evm::normalise(raw.clone(), hash, evm_chain, None)?;
             let (bridge_event, bridge_transfer) = build_bridge_data_from_source_receipt(
                 state,
                 &state.registry,
@@ -269,8 +277,11 @@ pub async fn analyse_tx_ondemand(
                 build_bridge_data_via_wormholescan(state, &tx, hash).await?;
             (tx, bridge_event, bridge_transfer)
         }
+        // "sonic" excluded here too — same read-only-deployment reason as
+        // analyse_tx above. This match must stay in sync with that one.
         evm_chain @ ("ethereum" | "bsc" | "polygon" | "avalanche" | "arbitrum" | "optimism"
-        | "gnosis" | "base") => {
+        | "gnosis" | "base" | "moonbeam" | "celo" | "kaia" | "scroll" | "linea"
+        | "berachain" | "seievm" | "unichain" | "ink") => {
             // ↓ only difference from analyse_tx
             let rpc_url = state
                 .config
@@ -278,7 +289,8 @@ pub async fn analyse_tx_ondemand(
                 .map_err(|e| AppError::BadRequest(e.to_string()))?;
             let raw =
                 evm::get_transaction_data(&state.http_client, rpc_url, evm_chain, hash).await?;
-            let tx = normaliser::evm::normalise(raw.clone(), hash, evm_chain)?;
+            // `abi: None` — see note in analyse_tx above.
+            let tx = normaliser::evm::normalise(raw.clone(), hash, evm_chain, None)?;
             let (bridge_event, bridge_transfer) = build_bridge_data_from_source_receipt(
                 state,
                 &state.ondemand_registry,

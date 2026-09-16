@@ -122,11 +122,11 @@ impl EvmAdapter {
         to: u64,
         topics: &[String; 4],
     ) -> Result<Vec<Value>, AppError> {
-        let mut window = to - from + 1;
+        let mut window = to.saturating_sub(from) + 1;
         let cursor_to = to;
 
         loop {
-            let cursor_from = cursor_to.saturating_sub(window - 1).max(from);
+            let cursor_from = cursor_to.saturating_sub(window.saturating_sub(1)).max(from);
 
             match self.get_logs_in_range(cursor_from, cursor_to, topics).await {
                 Ok(logs) => {

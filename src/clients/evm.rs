@@ -37,12 +37,40 @@ async fn rpc_call(
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/// Fetches everything the generic EVM decoder needs for one transaction:
+/// the transaction itself (to/input/value/from), its receipt (status,
+/// gasUsed, logs), and the block timestamp. Chain-agnostic — caller supplies
+/// the RPC URL for whichever EVM chain the tx lives on.
+///
+/// Returns:
+/// { "transaction": <eth_getTransactionByHash result>,
+///   "receipt": <eth_getTransactionReceipt result>,
+///   "timestamp": <hex string from the block, or null> }
 pub async fn get_transaction_data(
     client: &reqwest::Client,
     rpc_url: &str,
     provider: &str,
     tx_hash: &str,
 ) -> Result<Value, AppError> {
+    let tx_response = rpc_call(
+        client,
+        provider,
+        rpc_url,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "eth_getTransactionByHash",
+            "params": [tx_hash],
+        }),
+    )
+    .await?;
+
+    let transaction = tx_response
+        .get("result")
+        .filter(|v| !v.is_null())
+        .cloned()
+        .ok_or_else(|| AppError::TransactionNotFound(tx_hash.to_string()))?;
+
     let receipt = rpc_call(
         client,
         provider,
@@ -56,6 +84,8 @@ pub async fn get_transaction_data(
     )
     .await?;
 
+    // A mined tx can still have a null receipt if it's not yet included;
+    // eth_getTransactionByHash succeeding doesn't guarantee this.
     let receipt_result = receipt
         .get("result")
         .filter(|v| !v.is_null())
@@ -85,5 +115,9 @@ pub async fn get_transaction_data(
         .and_then(|b| b.get("timestamp"))
         .and_then(Value::as_str);
 
-    Ok(json!({ "receipt": receipt_result, "timestamp": timestamp }))
+    Ok(json!({
+        "transaction": transaction,
+        "receipt": receipt_result,
+        "timestamp": timestamp,
+    }))
 }
