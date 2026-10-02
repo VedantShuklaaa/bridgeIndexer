@@ -63,7 +63,7 @@ pub struct BridgeMessageId {
     pub sequence: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BridgeTransfer {
     pub source_chain: ChainId,
     pub source_tx_hash: String,

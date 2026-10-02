@@ -46,13 +46,13 @@ impl Chain {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum TxStatus {
     Success,
     Failed,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct NormalisedTransaction {
     pub hash: String,
     pub chain: Chain,
