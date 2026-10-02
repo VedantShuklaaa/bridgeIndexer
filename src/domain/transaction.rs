@@ -1,8 +1,8 @@
 use super::bridge::BridgeEvent;
+use serde::{Deserialize, Serialize};
 use super::bridge_transfer::BridgeTransfer;
-use serde::Serialize;
 
-#[derive(Debug, Serialize, Clone, Copy)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 pub enum Chain {
     Solana,
     Ethereum,
@@ -46,13 +46,13 @@ impl Chain {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum TxStatus {
     Success,
     Failed,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct NormalisedTransaction {
     pub hash: String,
     pub chain: Chain,

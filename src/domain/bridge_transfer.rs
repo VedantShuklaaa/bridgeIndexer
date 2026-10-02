@@ -1,6 +1,6 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ChainId {
     Solana,
     Ethereum,
@@ -49,21 +49,21 @@ impl ChainId {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BridgeStatus {
     Detected,
     Pending,
     Completed,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeMessageId {
     pub emitter_chain: u16,
     pub emitter_address: String,
     pub sequence: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BridgeTransfer {
     pub source_chain: ChainId,
     pub source_tx_hash: String,

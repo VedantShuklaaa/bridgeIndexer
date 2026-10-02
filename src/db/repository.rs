@@ -38,7 +38,8 @@ pub async fn persist_transaction(pool: &PgPool, tx: &NormalisedTransaction) -> a
     .await?;
 
     if let Some(bridge) = &tx.bridge_transfer {
-        persist_bridge_transfer(&mut db_tx, transaction_id, bridge).await?;
+        let analysis = serde_json::to_value(tx)?;
+        persist_bridge_transfer(&mut db_tx, transaction_id, bridge, &analysis).await?;
     }
 
     db_tx.commit().await?;
@@ -50,35 +51,24 @@ async fn persist_bridge_transfer(
     db_tx: &mut Transaction<'_, Postgres>,
     transaction_id: i64,
     bridge: &BridgeTransfer,
+    analysis: &serde_json::Value,
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         INSERT INTO bridge_transfers (
-            transaction_id,
-            source_tx_hash,
-            source_chain,
-            source_wallet,
-            source_explorer_url,
-            emitter_chain,
-            emitter_address,
-            sequence,
-            destination_chain,
-            destination_wallet,
-            destination_tx_hash,
-            destination_explorer_url,
-            token,
-            token_symbol,
-            amount,
-            amount_formatted,
-            status
+            transaction_id, source_tx_hash, source_chain, source_wallet,
+            source_explorer_url, emitter_chain, emitter_address, sequence,
+            destination_chain, destination_wallet, destination_tx_hash,
+            destination_explorer_url, token, token_symbol, amount,
+            amount_formatted, status, analysis
         )
         VALUES (
             $1, $2, $3, $4, $5,
             $6, $7, $8::numeric,
             $9, $10, $11, $12,
-            $13, $14, $15, $16, $17
+            $13, $14, $15, $16, $17, $18
         )
-                ON CONFLICT (emitter_chain, emitter_address, sequence)
+        ON CONFLICT (emitter_chain, emitter_address, sequence)
         DO UPDATE SET
             destination_tx_hash = COALESCE(EXCLUDED.destination_tx_hash, bridge_transfers.destination_tx_hash),
             destination_wallet = COALESCE(EXCLUDED.destination_wallet, bridge_transfers.destination_wallet),
@@ -87,6 +77,9 @@ async fn persist_bridge_transfer(
             amount_formatted = COALESCE(EXCLUDED.amount_formatted, bridge_transfers.amount_formatted),
             status = CASE WHEN bridge_transfers.status = 'Completed'
                           THEN 'Completed' ELSE EXCLUDED.status END,
+            -- only replace the cached response if it describes the same source tx
+            analysis = CASE WHEN bridge_transfers.source_tx_hash = EXCLUDED.source_tx_hash
+                            THEN EXCLUDED.analysis ELSE bridge_transfers.analysis END,
             updated_at = NOW()
         "#,
     )
@@ -107,6 +100,7 @@ async fn persist_bridge_transfer(
     .bind(&bridge.amount)
     .bind(&bridge.amount_formatted)
     .bind(format!("{:?}", bridge.status))
+    .bind(analysis)
     .execute(&mut **db_tx)
     .await?;
 
@@ -135,4 +129,18 @@ pub async fn set_last_ingested_slot(pool: &PgPool, chain: &str, slot: u64) -> Re
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub async fn get_cached_analysis(pool: &PgPool, hash: &str) -> Result<Option<serde_json::Value>> {
+    Ok(sqlx::query_scalar(
+        r#"
+        SELECT analysis FROM bridge_transfers
+        WHERE source_tx_hash = $1
+          AND analysis IS NOT NULL
+          AND (status = 'Completed' OR updated_at > NOW() - INTERVAL '30 seconds')
+        "#,
+    )
+    .bind(hash)
+    .fetch_optional(pool)
+    .await?)
 }

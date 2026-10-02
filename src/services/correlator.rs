@@ -39,17 +39,28 @@ pub async fn correlate(
 
     let destination_chain = ChainId::from_wormhole_id(destination_chain_id);
 
-    // Unchanged — this part was never the bug, destination lookup correctly
-    // stays keyed by destination_chain_id.
+    let t = std::time::Instant::now();
     let (destination_tx_hash, status) = if let Some(known) = known_destination_tx {
+        tracing::info!(branch = "known_destination", "correlate");
         (Some(known), BridgeStatus::Completed)
     } else {
         match registry.get_wormholescan(destination_chain_id) {
-            Some(adapter) => match adapter.find_transaction(&message_id).await? {
-                Some(info) => (Some(info.tx_hash), BridgeStatus::Completed),
-                None => (None, BridgeStatus::Pending),
-            },
-            None => (None, BridgeStatus::Detected),
+            Some(adapter) => {
+                let r = adapter.find_transaction(&message_id).await?;
+                tracing::info!(
+                    branch = "find_transaction",
+                    ms = t.elapsed().as_millis() as u64,
+                    "correlate"
+                );
+                match r {
+                    Some(info) => (Some(info.tx_hash), BridgeStatus::Completed),
+                    None => (None, BridgeStatus::Pending),
+                }
+            }
+            None => {
+                tracing::info!(branch = "no_adapter", "correlate");
+                (None, BridgeStatus::Detected)
+            }
         }
     };
 

@@ -17,9 +17,25 @@ pub async fn analyse_tx(
         return Err(AppError::InvalidTransactionHash(hash.to_string()));
     }
 
+    let t_total = std::time::Instant::now();
     let (source_result, wormhole_result) = tokio::join!(
-        fetch_source_transaction(state, chain, hash),
-        wormhole::get_operation_by_tx_hash(&state.http_client, &state.config.wormhole_url, hash),
+        async {
+            let t = std::time::Instant::now();
+            let r = fetch_source_transaction(state, chain, hash).await;
+            tracing::info!(helius_ms = t.elapsed().as_millis() as u64, "source fetch");
+            r
+        },
+        async {
+            let t = std::time::Instant::now();
+            let r = wormhole::get_operation_by_tx_hash(
+                &state.http_client,
+                &state.config.wormhole_url,
+                hash,
+            )
+            .await;
+            tracing::info!(wormhole_ms = t.elapsed().as_millis() as u64, "wormholescan");
+            r
+        },
     );
 
     let mut tx = source_result?;
@@ -100,25 +116,29 @@ pub async fn analyse_tx(
                 .and_then(|h| h.as_str())
                 .map(String::from);
 
-            tx.bridge_transfer = Some(
-                correlator::correlate(
-                    &state.registry,
-                    correlator::CorrelateParams {
-                        source_tx_hash: hash.to_string(),
-                        source_wallet: tx.signer.clone(),
-                        message_id,
-                        destination_chain_id: destination_chain_id.unwrap_or(0),
-                        token,
-                        token_chain: token_chain.unwrap_or(0),
-                        wormholescan_symbol_hint,
-                        raw_amount,
-                        amount,
-                        destination_wallet,
-                        known_destination_tx,
-                    },
-                )
-                .await?,
+            let t_corr = std::time::Instant::now();
+            let correlated = correlator::correlate(
+                &state.registry,
+                correlator::CorrelateParams {
+                    source_tx_hash: hash.to_string(),
+                    source_wallet: tx.signer.clone(),
+                    message_id,
+                    destination_chain_id: destination_chain_id.unwrap_or(0),
+                    token,
+                    token_chain: token_chain.unwrap_or(0),
+                    wormholescan_symbol_hint,
+                    raw_amount,
+                    amount,
+                    destination_wallet,
+                    known_destination_tx,
+                },
+            )
+            .await?;
+            tracing::info!(
+                correlate_ms = t_corr.elapsed().as_millis() as u64,
+                "correlate"
             );
+            tx.bridge_transfer = Some(correlated);
 
             tx.bridge_event = Some(bridge_event);
         }
@@ -126,6 +146,10 @@ pub async fn analyse_tx(
         Err(other) => return Err(other),
     }
 
+    tracing::info!(
+        total_ms = t_total.elapsed().as_millis() as u64,
+        "analyse_tx total"
+    );
     Ok(tx)
 }
 

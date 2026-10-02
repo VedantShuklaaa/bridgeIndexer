@@ -115,7 +115,11 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    {
+    let ingest_enabled = std::env::var("INGEST_ENABLED")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+
+    if ingest_enabled {
         let solana_ingester = SolanaIngester::new(
             config.solana_ws_url.clone(),
             config.solana_token_bridge_program.clone(),
