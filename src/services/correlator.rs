@@ -39,34 +39,19 @@ pub async fn correlate(
 
     let destination_chain = ChainId::from_wormhole_id(destination_chain_id);
 
-    let t = std::time::Instant::now();
     let (destination_tx_hash, status) = if let Some(known) = known_destination_tx {
-        tracing::info!(branch = "known_destination", "correlate");
         (Some(known), BridgeStatus::Completed)
+    } else if registry.get_wormholescan(destination_chain_id).is_some() {
+        // VAA exists but the operation payload has no destination tx yet
+        (None, BridgeStatus::Pending)
     } else {
-        match registry.get_wormholescan(destination_chain_id) {
-            Some(adapter) => {
-                let r = adapter.find_transaction(&message_id).await?;
-                tracing::info!(
-                    branch = "find_transaction",
-                    ms = t.elapsed().as_millis() as u64,
-                    "correlate"
-                );
-                match r {
-                    Some(info) => (Some(info.tx_hash), BridgeStatus::Completed),
-                    None => (None, BridgeStatus::Pending),
-                }
-            }
-            None => {
-                tracing::info!(branch = "no_adapter", "correlate");
-                (None, BridgeStatus::Detected)
-            }
-        }
+        (None, BridgeStatus::Detected)
     };
 
     let effective_raw_amount: Option<u128> =
         raw_amount.or_else(|| amount.as_ref().and_then(|a| a.parse::<u128>().ok()));
 
+    let t = std::time::Instant::now();
     let metadata = match &token {
         Some(token_addr) => {
             resolve_token_metadata(registry, token_chain, token_addr, wormholescan_symbol_hint)
@@ -77,6 +62,10 @@ pub async fn correlate(
             decimals: None,
         },
     };
+    tracing::info!(
+        metadata_ms = t.elapsed().as_millis() as u64,
+        "token metadata"
+    );
 
     let amount_formatted = effective_raw_amount.map(|r| format_amount(r, metadata.decimals));
 
