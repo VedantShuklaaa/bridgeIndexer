@@ -9,7 +9,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::{
-    clients::helius::get_signatures_for_address, db::repository::{get_last_ingested_slot, set_last_ingested_slot}, ingestion::types::{CandidateTransaction, LogsConfig, LogsFilter, SolanaRpcRequest}, redis::producer::RedisProducer,
+    clients::helius::get_signatures_for_address,
+    db::repository::{get_last_ingested_slot, set_last_ingested_slot},
+    ingestion::types::{CandidateTransaction, LogsConfig, LogsFilter, SolanaRpcRequest},
+    redis::producer::RedisProducer,
 };
 
 pub struct SolanaIngester {
@@ -58,11 +61,8 @@ impl SolanaIngester {
     }
 
     async fn run_connection(&self) -> Result<()> {
-        info!(
-            ws_url = %self.ws_url,
-            bridge_program = %self.bridge_program,
-            "Connecting to Solana WebSocket"
-        );
+        let ws_host = self.ws_url.split('?').next().unwrap_or_default();
+        info!(ws_host, bridge_program = %self.bridge_program, "Connecting to Solana WebSocket");
 
         let (ws_stream, _) = connect_async(&self.ws_url)
             .await
@@ -222,6 +222,14 @@ impl SolanaIngester {
     async fn handle_message(&self, text: &str) -> Result<()> {
         let message: Value = serde_json::from_str(text).context("invalid Solana WebSocket JSON")?;
         if message.get("method").and_then(Value::as_str) != Some("logsNotification") {
+            return Ok(());
+        }
+
+        if message.get("id").and_then(Value::as_u64) == Some(1) {
+            if let Some(err) = message.get("error") {
+                anyhow::bail!("logsSubscribe rejected: {err}");
+            }
+            info!(subscription = ?message.get("result"), "logsSubscribe confirmed");
             return Ok(());
         }
 

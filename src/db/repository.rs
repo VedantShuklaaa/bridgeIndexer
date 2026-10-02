@@ -78,14 +78,15 @@ async fn persist_bridge_transfer(
             $9, $10, $11, $12,
             $13, $14, $15, $16, $17
         )
-        ON CONFLICT (source_tx_hash)
+                ON CONFLICT (emitter_chain, emitter_address, sequence)
         DO UPDATE SET
-            destination_tx_hash = EXCLUDED.destination_tx_hash,
-            destination_wallet = EXCLUDED.destination_wallet,
-            destination_explorer_url = EXCLUDED.destination_explorer_url,
-            token_symbol = EXCLUDED.token_symbol,
-            amount_formatted = EXCLUDED.amount_formatted,
-            status = EXCLUDED.status,
+            destination_tx_hash = COALESCE(EXCLUDED.destination_tx_hash, bridge_transfers.destination_tx_hash),
+            destination_wallet = COALESCE(EXCLUDED.destination_wallet, bridge_transfers.destination_wallet),
+            destination_explorer_url = COALESCE(EXCLUDED.destination_explorer_url, bridge_transfers.destination_explorer_url),
+            token_symbol = COALESCE(EXCLUDED.token_symbol, bridge_transfers.token_symbol),
+            amount_formatted = COALESCE(EXCLUDED.amount_formatted, bridge_transfers.amount_formatted),
+            status = CASE WHEN bridge_transfers.status = 'Completed'
+                          THEN 'Completed' ELSE EXCLUDED.status END,
             updated_at = NOW()
         "#,
     )

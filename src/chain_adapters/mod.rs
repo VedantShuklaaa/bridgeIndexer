@@ -2,7 +2,6 @@ use crate::domain::bridge_transfer::BridgeMessageId;
 use crate::error::AppError;
 use async_trait::async_trait;
 
-pub mod evm;
 pub mod registry;
 pub mod setup;
 pub mod solana;

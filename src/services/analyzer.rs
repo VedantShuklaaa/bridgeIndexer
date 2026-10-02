@@ -1,4 +1,4 @@
-use crate::clients::{evm, helius, wormhole};
+use crate::clients::{helius, wormhole};
 use crate::domain::bridge_transfer::BridgeMessageId;
 use crate::domain::transaction::NormalisedTransaction;
 use crate::error::AppError;
@@ -81,13 +81,6 @@ pub async fn analyse_tx(
                 .flatten()
                 .or_else(|| extract_wormholescan_field(&wh_raw, "tokenAddress"));
 
-            tracing::info!(
-                "WormholeScan standardizedProperties: {:?}",
-                wh_raw
-                    .get("content")
-                    .and_then(|c| c.get("standarizedProperties"))
-            );
-
             let wormholescan_symbol_hint: Option<String> =
                 extract_wormholescan_field(&wh_raw, "tokenSymbol");
 
@@ -129,7 +122,7 @@ pub async fn analyse_tx(
 
             tx.bridge_event = Some(bridge_event);
         }
-        
+
         Err(other) => return Err(other),
     }
 
@@ -155,15 +148,6 @@ async fn fetch_source_transaction(
             let raw =
                 helius::get_transaction(&state.http_client, &state.config.helius_url, hash).await?;
             normaliser::solana::normalise(raw, hash)
-        }
-        evm_chain @ ("ethereum" | "bsc" | "polygon" | "avalanche" | "arbitrum" | "optimism"
-        | "gnosis" | "base") => {
-            let rpc_url = state
-                .config
-                .rpc_url_for_chain(evm_chain)
-                .map_err(|e| AppError::Normalisation(e.to_string()))?;
-            let raw = evm::get_transaction_data(&state.http_client, rpc_url, hash).await?;
-            normaliser::evm::normalise(raw, hash, evm_chain)
         }
         other => Err(AppError::Normalisation(format!(
             "unsupported chain: {other}"

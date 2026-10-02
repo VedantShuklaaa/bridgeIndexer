@@ -44,27 +44,12 @@ pub async fn correlate(
     let (destination_tx_hash, status) = if let Some(known) = known_destination_tx {
         (Some(known), BridgeStatus::Completed)
     } else {
-        let wormholescan_adapter = registry.get_wormholescan(destination_chain_id);
-        let evm_adapter = registry.get_evm(destination_chain_id);
-
-        let fast = match &wormholescan_adapter {
-            Some(a) => a.find_transaction(&message_id).await?,
-            None => None,
-        };
-
-        match fast {
-            Some(info) => (Some(info.tx_hash), BridgeStatus::Completed),
-            None => match &evm_adapter {
-                Some(a) => match a.find_transaction(&message_id).await? {
-                    Some(info) => (Some(info.tx_hash), BridgeStatus::Completed),
-                    None => (None, BridgeStatus::Pending),
-                },
-
-                None => match wormholescan_adapter {
-                    Some(_) => (None, BridgeStatus::Pending),
-                    None => (None, BridgeStatus::Detected),
-                },
+        match registry.get_wormholescan(destination_chain_id) {
+            Some(adapter) => match adapter.find_transaction(&message_id).await? {
+                Some(info) => (Some(info.tx_hash), BridgeStatus::Completed),
+                None => (None, BridgeStatus::Pending),
             },
+            None => (None, BridgeStatus::Detected),
         }
     };
 
