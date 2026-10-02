@@ -36,11 +36,22 @@ async fn lookup(state: &AppState, hash: &str) -> Option<NormalisedTransaction> {
     }
 }
 
+fn is_valid_solana_signature(s: &str) -> bool {
+    bs58::decode(s)
+        .into_vec()
+        .map(|v| v.len() == 64)
+        .unwrap_or(false)
+}
+
 pub async fn analyse_cached(
     state: &AppState,
     chain: &str,
     hash: &str,
 ) -> Result<NormalisedTransaction, AppError> {
+    if chain == "solana" && !is_valid_solana_signature(hash) {
+        return Err(AppError::InvalidTransactionHash(hash.to_string()));
+    }
+
     if let Some(hit) = lookup(state, hash).await {
         return Ok(hit);
     }
