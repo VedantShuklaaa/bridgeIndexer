@@ -1,3 +1,4 @@
+use crate::clients::limiter::call_upstream;
 use crate::clients::{helius, wormhole};
 use crate::domain::bridge_transfer::BridgeMessageId;
 use crate::domain::transaction::NormalisedTransaction;
@@ -27,11 +28,13 @@ pub async fn analyse_tx(
         },
         async {
             let t = std::time::Instant::now();
-            let r = wormhole::get_operation_by_tx_hash(
-                &state.http_client,
-                &state.config.wormhole_url,
-                hash,
-            )
+            let r = call_upstream(&state.wormhole_limiter, || {
+                wormhole::get_operation_by_tx_hash(
+                    &state.http_client,
+                    &state.config.wormhole_url,
+                    hash,
+                )
+            })
             .await;
             tracing::info!(wormhole_ms = t.elapsed().as_millis() as u64, "wormholescan");
             r
@@ -169,8 +172,10 @@ async fn fetch_source_transaction(
 ) -> Result<NormalisedTransaction, AppError> {
     match chain {
         "solana" => {
-            let raw =
-                helius::get_transaction(&state.http_client, &state.config.helius_url, hash).await?;
+            let raw = call_upstream(&state.helius_limiter, || {
+                helius::get_transaction(&state.http_client, &state.config.helius_url, hash)
+            })
+            .await?;
             normaliser::solana::normalise(raw, hash)
         }
         other => Err(AppError::Normalisation(format!(

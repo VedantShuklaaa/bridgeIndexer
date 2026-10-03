@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header::RETRY_AFTER},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -34,6 +34,9 @@ pub enum AppError {
     #[error("invalid request: {0}")]
     BadRequest(String),
 
+    #[error("service overloaded, retry shortly")]
+    Overloaded,
+
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
 }
@@ -64,6 +67,7 @@ impl AppError {
                 (StatusCode::UNPROCESSABLE_ENTITY, "NORMALISATION_FAILED")
             }
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
+            AppError::Overloaded => (StatusCode::SERVICE_UNAVAILABLE, "OVERLOADED"),
             AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
         }
     }
@@ -84,13 +88,24 @@ impl IntoResponse for AppError {
             other => other.to_string(),
         };
 
-        (
+        let retry_after = matches!(
+            self,
+            AppError::Overloaded | AppError::UpstreamRateLimited(_)
+        );
+
+        let mut resp = (
             status,
             Json(ErrorBody {
                 error: ErrorDetail { code, message },
             }),
         )
-            .into_response()
+            .into_response();
+
+        if retry_after {
+            resp.headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        resp
     }
 }
 
