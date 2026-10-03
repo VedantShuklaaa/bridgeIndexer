@@ -71,7 +71,7 @@ impl ReadThrough {
                 .build(),
             open: Cache::builder()
                 .max_capacity(10_000)
-                .time_to_live(Duration::from_secs(5))
+                .time_to_live(Duration::from_secs(30))
                 .build(),
             // lower this (e.g. 5-10s) if freshly sent txs must show up quickly
             not_found: Cache::builder()
