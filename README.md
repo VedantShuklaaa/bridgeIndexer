@@ -150,8 +150,8 @@ default.
 Measured with [`oha`](https://github.com/hatoo/oha) from a separate EC2
 instance in the same VPC (two instances, 30-second runs, 50 connections,
 769 distinct Solana transactions, 1.2 KiB responses, warm cache).
-
-<!-- TODO: add instance types -->
+The server ran on an `m7i-flex.large` (2 vCPU); the load generator was a
+burstable `t3.micro` (2 vCPU) and was the first to hit 100% CPU.
 
 | Workload | Result |
 | --- | --- |
