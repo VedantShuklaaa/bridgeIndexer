@@ -3,16 +3,17 @@ use dashmap::DashMap;
 use moka::future::Cache;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
-use crate::db::repository::{get_cached_analysis, persist_transaction};
+use crate::db::repository::{get_analysis_any_age, persist_transaction};
 use crate::domain::transaction::NormalisedTransaction;
 use crate::error::AppError;
 use crate::services::analyzer::analyse_tx;
 use crate::state::AppState;
 
-/// A failure worth remembering briefly, so repeated requests for the same
-/// hash don't each redo the full upstream attempt (and queue on the lock).
+const FRESH_SECS: f64 = 60.0;
+const MAX_BACKGROUND_REFRESHES: usize = 8;
+
 #[derive(Clone)]
 enum Neg {
     NotFound,
@@ -30,8 +31,6 @@ impl Neg {
             AppError::UpstreamRateLimited(_) => Some(Neg::RateLimited),
             AppError::UpstreamTimeout(_) => Some(Neg::Timeout),
             AppError::UpstreamProvider { .. } => Some(Neg::Provider),
-            // Overloaded is local backpressure, bad input is never reached,
-            // Normalisation/Internal may be bugs: don't cache those.
             _ => None,
         }
     }
@@ -58,6 +57,9 @@ pub struct ReadThrough {
     // negative caches
     not_found: Cache<String, Neg>, // tx doesn't exist: longer TTL
     failed: Cache<String, Neg>,    // transient upstream failure: very short TTL
+    // stale-while-revalidate
+    refresh_permits: Arc<Semaphore>,
+    refresh_cooldown: Cache<String, ()>, // at most one refresh attempt per key per TTL
 }
 
 impl ReadThrough {
@@ -71,7 +73,7 @@ impl ReadThrough {
                 .build(),
             open: Cache::builder()
                 .max_capacity(10_000)
-                .time_to_live(Duration::from_secs(30))
+                .time_to_live(Duration::from_secs(15))
                 .build(),
             // lower this (e.g. 5-10s) if freshly sent txs must show up quickly
             not_found: Cache::builder()
@@ -82,13 +84,20 @@ impl ReadThrough {
                 .max_capacity(10_000)
                 .time_to_live(Duration::from_secs(2))
                 .build(),
+            refresh_permits: Arc::new(Semaphore::new(MAX_BACKGROUND_REFRESHES)),
+            refresh_cooldown: Cache::builder()
+                .max_capacity(50_000)
+                .time_to_live(Duration::from_secs(15))
+                .build(),
         }
     }
 }
 
-async fn lookup(state: &AppState, hash: &str) -> Option<NormalisedTransaction> {
-    match get_cached_analysis(&state.db, hash).await {
-        Ok(Some(value)) => serde_json::from_value(value)
+/// DB lookup of any stored analysis. Returns (analysis, is_fresh).
+async fn lookup(state: &AppState, hash: &str) -> Option<(NormalisedTransaction, bool)> {
+    match get_analysis_any_age(&state.db, hash, FRESH_SECS).await {
+        Ok(Some(c)) => serde_json::from_value(c.analysis)
+            .map(|tx| (tx, c.fresh))
             .map_err(|e| tracing::warn!(error = %e, "cached analysis has stale shape, ignoring"))
             .ok(),
         Ok(None) => None,
@@ -128,6 +137,55 @@ async fn check_memory(
     None
 }
 
+/// Background refresh of a stale entry. Failures are only logged: the stale
+/// copy keeps being served and the cooldown spaces out the next attempt.
+async fn refresh(state: AppState, chain: String, hash: String, _slot: OwnedSemaphorePermit) {
+    let rt = &state.read_through;
+
+    let fetched = async {
+        let _permit = rt
+            .upstream_permits
+            .acquire()
+            .await
+            .expect("semaphore closed");
+        analyse_tx(&state, &chain, &hash).await
+    }
+    .await;
+
+    match fetched {
+        Ok(tx) if tx.bridge_transfer.is_some() => {
+            if let Err(e) = persist_transaction(&state.db, &tx).await {
+                tracing::warn!(error = %e, hash = %hash, "refresh write-back failed");
+            }
+            remember(rt, &hash, &tx).await;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, hash = %hash, "background refresh failed, still serving stale");
+        }
+    }
+}
+
+async fn maybe_spawn_refresh(state: &AppState, chain: &str, hash: &str) {
+    let rt = &state.read_through;
+
+    if rt.refresh_cooldown.contains_key(hash) {
+        return;
+    }
+    // bounded number of concurrent background refreshes; skip if all busy
+    let Ok(slot) = rt.refresh_permits.clone().try_acquire_owned() else {
+        return;
+    };
+    rt.refresh_cooldown.insert(hash.to_string(), ()).await;
+
+    let state = state.clone();
+    let chain = chain.to_string();
+    let hash = hash.to_string();
+    tokio::spawn(async move {
+        refresh(state, chain, hash, slot).await;
+    });
+}
+
 fn is_valid_solana_signature(s: &str) -> bool {
     bs58::decode(s)
         .into_vec()
@@ -151,8 +209,6 @@ pub async fn analyse_cached(
         return r;
     }
 
-    // 2: single-flight per key. Everything below (DB lookup + upstream)
-    //    runs once per key; waiters re-check memory when they get the lock.
     let key = format!("{chain}:{hash}");
     let lock = rt
         .inflight
@@ -167,13 +223,15 @@ pub async fn analyse_cached(
             return r;
         }
 
-        // DB hit: fill memory
-        if let Some(hit) = lookup(state, hash).await {
+        if let Some((hit, fresh)) = lookup(state, hash).await {
             remember(rt, hash, &hit).await;
+            if !fresh {
+                maybe_spawn_refresh(state, chain, hash).await;
+            }
             return Ok(hit);
         }
 
-        // upstream, bounded wait for a permit so overload fails fast
+        // nothing stored anywhere: real cold fetch, bounded wait for a permit
         let fetched = async {
             let _permit =
                 tokio::time::timeout(Duration::from_secs(2), rt.upstream_permits.acquire())

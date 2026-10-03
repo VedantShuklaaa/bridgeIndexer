@@ -144,3 +144,38 @@ pub async fn get_cached_analysis(pool: &PgPool, hash: &str) -> Result<Option<ser
     .fetch_optional(pool)
     .await?)
 }
+
+/// A stored analysis plus whether it is still fresh.
+pub struct CachedAnalysis {
+    pub analysis: serde_json::Value,
+    pub fresh: bool,
+}
+
+/// Returns the stored analysis regardless of age, flagged fresh/stale.
+/// Completed transfers are always fresh; anything else is fresh for `fresh_secs`
+/// after its last update. Used for stale-while-revalidate.
+pub async fn get_analysis_any_age(
+    pool: &PgPool,
+    hash: &str,
+    fresh_secs: f64,
+) -> Result<Option<CachedAnalysis>> {
+    let row: Option<(serde_json::Value, bool)> = sqlx::query_as(
+        r#"
+        SELECT analysis,
+               COALESCE(
+                   status = 'Completed'
+                   OR updated_at > NOW() - ($2::double precision * INTERVAL '1 second'),
+                   FALSE
+               ) AS fresh
+        FROM bridge_transfers
+        WHERE source_tx_hash = $1
+          AND analysis IS NOT NULL
+        "#,
+    )
+    .bind(hash)
+    .bind(fresh_secs)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|(analysis, fresh)| CachedAnalysis { analysis, fresh }))
+}
