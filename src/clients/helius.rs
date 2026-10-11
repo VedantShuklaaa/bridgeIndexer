@@ -39,7 +39,7 @@ impl JsonRpcRequest<(String, GetTransactionOptions)> {
                 hash.to_string(),
                 GetTransactionOptions {
                     encoding: "jsonParsed",
-                    max_supported_transaction_version: 0,
+                    max_supported_transaction_version: 1,
                     commitment: "confirmed",
                 },
             ),

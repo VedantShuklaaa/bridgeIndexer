@@ -4,7 +4,7 @@ use crate::state::AppState;
 use crate::{domain::transaction::NormalisedTransaction, services::analyzer::analyse_tx};
 use anyhow::{Context, Result};
 use redis::Value;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -140,28 +140,48 @@ impl RedisConsumer {
         Ok(())
     }
 
+    /// Analyses a transaction, waiting out the cases that fix themselves.
+    ///
+    /// A fresh Solana transfer has no Wormhole VAA until the guardians have seen it
+    /// finalised, which takes well over the few seconds the other transient errors
+    /// get, so a missing VAA is retried on its own, longer schedule.
     async fn analyse_with_retry(
         &self,
         chain: &str,
         tx_hash: &str,
     ) -> Result<NormalisedTransaction, AppError> {
-        const MAX_ATTEMPTS: u32 = 5;
+        const MAX_TRANSIENT_ATTEMPTS: u32 = 5;
+        const VAA_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+        const VAA_MAX_WAIT: Duration = Duration::from_secs(90);
 
-        for attempt in 1..=MAX_ATTEMPTS {
+        let started = Instant::now();
+        let mut transient_attempts = 0u32;
+
+        loop {
             match analyse_tx(&self.state, chain, tx_hash).await {
                 Ok(tx) => return Ok(tx),
 
-                Err(AppError::TransactionNotFound(_))
-                | Err(AppError::VaaNotAvailable(_))
-                | Err(AppError::UpstreamRateLimited(_))
-                | Err(AppError::UpstreamTimeout(_))
-                    if attempt < MAX_ATTEMPTS =>
-                {
-                    let delay_ms = 500 * 2_u64.pow(attempt - 1);
+                Err(AppError::VaaNotAvailable(_)) if started.elapsed() < VAA_MAX_WAIT => {
+                    info!(
+                        tx_hash = %tx_hash,
+                        waited_secs = started.elapsed().as_secs(),
+                        "VAA not available yet, retrying"
+                    );
+                    tokio::time::sleep(VAA_RETRY_INTERVAL).await;
+                }
+
+                Err(
+                    AppError::TransactionNotFound(_)
+                    | AppError::UpstreamRateLimited(_)
+                    | AppError::UpstreamTimeout(_)
+                    | AppError::Overloaded,
+                ) if transient_attempts + 1 < MAX_TRANSIENT_ATTEMPTS => {
+                    transient_attempts += 1;
+                    let delay_ms = 500 * 2_u64.pow(transient_attempts - 1);
 
                     tracing::warn!(
                         tx_hash = %tx_hash,
-                        attempt,
+                        attempt = transient_attempts,
                         delay_ms,
                         "Transaction not available yet, retrying"
                     );
@@ -172,8 +192,6 @@ impl RedisConsumer {
                 Err(error) => return Err(error),
             }
         }
-
-        unreachable!()
     }
 
     async fn persist_with_retry(&self, transaction: &NormalisedTransaction) -> Result<()> {
@@ -298,6 +316,8 @@ impl RedisConsumer {
             return Ok(());
         };
 
+        let mut batch: Vec<(String, CandidateTransaction)> = Vec::new();
+
         for stream in streams {
             let Value::Array(mut stream_parts) = stream else {
                 continue;
@@ -376,78 +396,97 @@ impl RedisConsumer {
                     "Parsed transaction from Redis"
                 );
 
-                match self
-                    .analyse_with_retry(&candidate.chain, &candidate.tx_hash)
-                    .await
-                {
-                    Ok(analysed) => {
-                        if let Err(error) = self.persist_with_retry(&analysed).await {
-                            tracing::error!(
-                                worker = %self.consumer_name,
-                                message_id = %message_id,
-                                tx_hash = %candidate.tx_hash,
-                                ?error,
-                                "Failed to persist transaction after retries"
-                            );
+                batch.push((message_id, candidate));
+            }
+        }
 
-                            self.dead_letter(
-                                connection,
-                                &message_id,
-                                &candidate,
-                                &error.to_string(),
-                            )
-                            .await?;
+        // A transaction waiting for its VAA can take a while, so a batch is handled
+        // concurrently instead of letting one slow transaction hold up the rest.
+        let results =
+            futures_util::future::join_all(batch.into_iter().map(|(message_id, candidate)| {
+                let mut connection = connection.clone();
+                async move {
+                    self.process_candidate(&mut connection, &message_id, &candidate)
+                        .await
+                }
+            }))
+            .await;
 
-                            continue;
-                        }
+        for result in results {
+            result?;
+        }
 
-                        tracing::info!(
-                            worker = %self.consumer_name,
-                            message_id = %message_id,
-                            tx_hash = %candidate.tx_hash,
-                            "Transaction persisted successfully"
-                        );
+        Ok(())
+    }
 
-                        match serde_json::to_string(&analysed) {
-                            Ok(payload) => {
-                                let _ = self.state.tx_broadcast.send(payload);
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    ?error,
-                                    "Failed to serialize transaction for broadcast"
-                                );
-                            }
-                        }
+    async fn process_candidate(
+        &self,
+        connection: &mut redis::aio::MultiplexedConnection,
+        message_id: &str,
+        candidate: &CandidateTransaction,
+    ) -> Result<()> {
+        match self
+            .analyse_with_retry(&candidate.chain, &candidate.tx_hash)
+            .await
+        {
+            Ok(analysed) => {
+                if let Err(error) = self.persist_with_retry(&analysed).await {
+                    tracing::error!(
+                        worker = %self.consumer_name,
+                        message_id = %message_id,
+                        tx_hash = %candidate.tx_hash,
+                        ?error,
+                        "Failed to persist transaction after retries"
+                    );
 
-                        let _: i64 = redis::cmd("XACK")
-                            .arg(BRIDGE_TX_STREAM)
-                            .arg(CONSUMER_GROUP)
-                            .arg(&message_id)
-                            .query_async(&mut *connection)
-                            .await?;
+                    self.dead_letter(connection, &message_id, &candidate, &error.to_string())
+                        .await?;
 
-                        tracing::info!(
-                            worker = %self.consumer_name,
-                            message_id = %message_id,
-                            tx_hash = %candidate.tx_hash,
-                            "Redis message acknowledged"
-                        );
+                    return Ok(());
+                }
+
+                tracing::info!(
+                    worker = %self.consumer_name,
+                    message_id = %message_id,
+                    tx_hash = %candidate.tx_hash,
+                    "Transaction persisted successfully"
+                );
+
+                match serde_json::to_string(&analysed) {
+                    Ok(payload) => {
+                        let _ = self.state.tx_broadcast.send(payload);
                     }
-
                     Err(error) => {
-                        tracing::error!(
-                            worker = %self.consumer_name,
-                            message_id = %message_id,
-                            tx_hash = %candidate.tx_hash,
-                            ?error,
-                            "Failed to analyse transaction"
-                        );
-
-                        self.dead_letter(connection, &message_id, &candidate, &error.to_string())
-                            .await?;
+                        tracing::warn!(?error, "Failed to serialize transaction for broadcast");
                     }
                 }
+
+                let _: i64 = redis::cmd("XACK")
+                    .arg(BRIDGE_TX_STREAM)
+                    .arg(CONSUMER_GROUP)
+                    .arg(&message_id)
+                    .query_async(&mut *connection)
+                    .await?;
+
+                tracing::info!(
+                    worker = %self.consumer_name,
+                    message_id = %message_id,
+                    tx_hash = %candidate.tx_hash,
+                    "Redis message acknowledged"
+                );
+            }
+
+            Err(error) => {
+                tracing::error!(
+                    worker = %self.consumer_name,
+                    message_id = %message_id,
+                    tx_hash = %candidate.tx_hash,
+                    ?error,
+                    "Failed to analyse transaction"
+                );
+
+                self.dead_letter(connection, &message_id, &candidate, &error.to_string())
+                    .await?;
             }
         }
 

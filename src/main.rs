@@ -1,6 +1,7 @@
 use bridge::chain_adapters::setup::build_registry;
 use bridge::config::AppConfig;
 use bridge::db;
+use bridge::ingestion::on_demand::run_on_demand;
 use bridge::ingestion::solana::SolanaIngester;
 use bridge::redis::consumer::RedisConsumer;
 use bridge::redis::producer::RedisProducer;
@@ -10,6 +11,7 @@ use bridge::state::AppState;
 use reqwest::Client;
 use rustls::crypto::ring;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -59,6 +61,13 @@ async fn main() -> anyhow::Result<()> {
     let registry = build_registry(&config, &http_client);
     let state = AppState::new(db.clone(), config.clone(), http_client.clone(), registry)?;
 
+    // The live pipeline (backfill + consumer workers) gets its own Helius endpoint, registry
+    // and rate limiter, so it can't use up the GET API's quota.
+    let live_config = config.clone();
+
+    let live_registry = build_registry(&live_config, &http_client);
+    let live_state = state.for_live(live_config, live_registry);
+
     let redis = RedisProducer::new(&config.redis_url).await?;
     redis.test_connection().await?;
 
@@ -75,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
     for worker_id in 1..=5 {
         let worker_name = format!("worker-{worker_id}");
         let redis_url = config.redis_url.clone();
-        let worker_state = state.clone();
+        let worker_state = live_state.clone();
         let worker_shutdown = shutdown.clone();
 
         spawn_supervised("redis-consumer", shutdown.clone(), move || {
@@ -94,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
 
     {
         let redis_url = config.redis_url.clone();
-        let recovery_state = state.clone();
+        let recovery_state = live_state.clone();
         let recovery_shutdown = shutdown.clone();
 
         spawn_supervised("redis-recovery", shutdown.clone(), move || {
@@ -120,21 +129,23 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(true);
 
     if ingest_enabled {
-        let solana_ingester = SolanaIngester::new(
+        let solana_ingester = Arc::new(SolanaIngester::new(
             config.solana_ws_url.clone(),
             config.solana_token_bridge_program.clone(),
             redis.clone(),
             db.clone(),
             http_client.clone(),
-            config.helius_url.clone(),
-            shutdown.clone(),
-        );
+            config.helius_live_url.clone(),
+            config.live_backfill,
+        ));
 
-        tokio::spawn(async move {
-            if let Err(error) = solana_ingester.run().await {
-                tracing::error!(%error, "Solana ingester stopped");
-            }
-        });
+        // Starts only when the first /stream client connects, stops after the last one leaves.
+        tokio::spawn(run_on_demand(
+            solana_ingester,
+            state.live_clients.subscribe(),
+            Duration::from_secs(config.live_idle_grace_secs),
+            shutdown.clone(),
+        ));
     }
 
     let app = build_router(state);

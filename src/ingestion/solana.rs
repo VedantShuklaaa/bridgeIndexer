@@ -22,7 +22,7 @@ pub struct SolanaIngester {
     db: PgPool,
     client: reqwest::Client,
     helius_url: String,
-    shutdown: CancellationToken,
+    backfill_enabled: bool,
 }
 
 impl SolanaIngester {
@@ -33,7 +33,7 @@ impl SolanaIngester {
         db: PgPool,
         client: reqwest::Client,
         helius_url: String,
-        shutdown: CancellationToken,
+        backfill_enabled: bool,
     ) -> Self {
         Self {
             ws_url,
@@ -42,31 +42,35 @@ impl SolanaIngester {
             db,
             client,
             helius_url,
-            shutdown,
+            backfill_enabled,
         }
     }
 
-    pub async fn run(&self) -> Result<()> {
+    /// Runs (and reconnects) until `stop` is cancelled.
+    pub async fn run(&self, stop: CancellationToken) -> Result<()> {
         loop {
-            match self.run_connection().await {
+            match self.run_connection(&stop).await {
                 Ok(()) => warn!("Solana WebSocket connection closed"),
                 Err(error) => error!(%error, "Solana ingestion connection failed"),
             }
 
             tokio::select! {
-                _ = self.shutdown.cancelled() => return Ok(()),
+                _ = stop.cancelled() => return Ok(()),
                 _ = sleep(Duration::from_secs(5)) => {}
             }
         }
     }
 
-    async fn run_connection(&self) -> Result<()> {
+    async fn run_connection(&self, stop: &CancellationToken) -> Result<()> {
         let ws_host = self.ws_url.split('?').next().unwrap_or_default();
         info!(ws_host, bridge_program = %self.bridge_program, "Connecting to Solana WebSocket");
 
-        let (ws_stream, _) = connect_async(&self.ws_url)
-            .await
-            .context("failed to connect to Solana WebSocket")?;
+        let (ws_stream, _) = tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            result = connect_async(&self.ws_url) => {
+                result.context("failed to connect to Solana WebSocket")?
+            }
+        };
 
         info!("Connected to Solana WebSocket");
 
@@ -95,14 +99,16 @@ impl SolanaIngester {
             "Subscribed to Solana bridge logs"
         );
 
-        if let Err(error) = self.backfill_missed_transactions().await {
-            warn!(%error, "Solana transaction backfill failed, continuing with live ingestion");
+        if self.backfill_enabled {
+            if let Err(error) = self.backfill_missed_transactions(stop).await {
+                warn!(%error, "Solana transaction backfill failed, continuing with live ingestion");
+            }
         }
 
         loop {
             tokio::select! {
-                _ = self.shutdown.cancelled() => {
-                    warn!("shutdown requested, closing Solana WebSocket");
+                _ = stop.cancelled() => {
+                    info!("stop requested, closing Solana WebSocket");
                     let _ = write.send(Message::Close(None)).await;
                     return Ok(());
                 }
@@ -134,7 +140,7 @@ impl SolanaIngester {
         Ok(())
     }
 
-    async fn backfill_missed_transactions(&self) -> Result<()> {
+    async fn backfill_missed_transactions(&self, stop: &CancellationToken) -> Result<()> {
         let last_ingested_slot = get_last_ingested_slot(&self.db, "solana").await?;
 
         info!(last_ingested_slot, "Starting Solana transaction backfill");
@@ -143,6 +149,10 @@ impl SolanaIngester {
         let mut recovered = 0usize;
 
         loop {
+            if stop.is_cancelled() {
+                return Ok(());
+            }
+
             let signatures = get_signatures_for_address(
                 &self.client,
                 &self.helius_url,
@@ -229,7 +239,16 @@ impl SolanaIngester {
             if let Some(err) = message.get("error") {
                 anyhow::bail!("logsSubscribe rejected: {err}");
             }
-            info!(subscription = ?message.get("result"), "logsSubscribe confirmed");
+
+            info!(
+                subscription = ?message.get("result"),
+                "logsSubscribe confirmed"
+            );
+
+            return Ok(());
+        }
+
+        if message.get("method").and_then(Value::as_str) != Some("logsNotification") {
             return Ok(());
         }
 
