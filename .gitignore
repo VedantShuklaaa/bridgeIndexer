@@ -1,4 +1,32 @@
+# ── Rust / Cargo ──────────────────────────────
 /target
+# Keep Cargo.lock committed: this is an application, not just a library
+# Cargo.lock
+
+# ── Environment & secrets ─────────────────────
 .env
 .env.*
-!.env.example.env
+!.env.example
+
+# ── Local data ────────────────────────────────
+*.log
+*.pid
+/data
+dump.rdb
+
+# ── Editors & IDEs ────────────────────────────
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# ── OS junk ───────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Profiling & debugging ─────────────────────
+flamegraph.svg
+perf.data*
+*.profraw
