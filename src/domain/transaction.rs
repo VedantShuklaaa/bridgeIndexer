@@ -1,6 +1,6 @@
 use super::bridge::BridgeEvent;
-use serde::{Deserialize, Serialize};
 use super::bridge_transfer::BridgeTransfer;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 pub enum Chain {

@@ -48,7 +48,7 @@ pub fn normalise(raw: Value, hash: &str) -> Result<NormalisedTransaction, AppErr
         timestamp,
         fee_lamports,
         signer,
-        bridge_event: None, 
-        bridge_transfer: None, 
+        bridge_event: None,
+        bridge_transfer: None,
     })
 }

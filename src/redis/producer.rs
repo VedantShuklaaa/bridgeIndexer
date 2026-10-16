@@ -4,7 +4,6 @@ use redis::aio::ConnectionManager;
 
 use crate::ingestion::types::CandidateTransaction;
 
-
 const BRIDGE_TX_STREAM: &str = "bridge:transactions";
 
 #[derive(Clone)]

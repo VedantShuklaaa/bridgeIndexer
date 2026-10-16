@@ -18,7 +18,7 @@ pub trait ChainAdapter: Send + Sync {
     async fn token_decimals(&self, _token_address: &str) -> Result<Option<u8>, AppError> {
         Ok(None)
     }
-    
+
     async fn token_symbol(&self, _token_address: &str) -> Result<Option<String>, AppError> {
         Ok(None)
     }

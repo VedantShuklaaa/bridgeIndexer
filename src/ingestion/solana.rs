@@ -91,7 +91,7 @@ impl SolanaIngester {
         };
 
         write
-            .send(Message::Text(serde_json::to_string(&request)?.into()))
+            .send(Message::Text(serde_json::to_string(&request)?))
             .await?;
 
         info!(
@@ -99,10 +99,10 @@ impl SolanaIngester {
             "Subscribed to Solana bridge logs"
         );
 
-        if self.backfill_enabled {
-            if let Err(error) = self.backfill_missed_transactions(stop).await {
-                warn!(%error, "Solana transaction backfill failed, continuing with live ingestion");
-            }
+        if self.backfill_enabled
+            && let Err(error) = self.backfill_missed_transactions(stop).await
+        {
+            warn!(%error, "Solana transaction backfill failed, continuing with live ingestion");
         }
 
         loop {

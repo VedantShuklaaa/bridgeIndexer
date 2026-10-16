@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use crate::domain::transaction::NormalisedTransaction;
 use crate::error::AppError;
-use crate::services::{read_through};
+use crate::services::read_through;
 use crate::state::AppState;
 
 fn default_chain() -> String {
