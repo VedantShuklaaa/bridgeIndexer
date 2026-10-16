@@ -439,7 +439,7 @@ impl RedisConsumer {
                         "Failed to persist transaction after retries"
                     );
 
-                    self.dead_letter(connection, &message_id, &candidate, &error.to_string())
+                    self.dead_letter(connection, message_id, candidate, &error.to_string())
                         .await?;
 
                     return Ok(());
@@ -464,7 +464,7 @@ impl RedisConsumer {
                 let _: i64 = redis::cmd("XACK")
                     .arg(BRIDGE_TX_STREAM)
                     .arg(CONSUMER_GROUP)
-                    .arg(&message_id)
+                    .arg(message_id)
                     .query_async(&mut *connection)
                     .await?;
 
@@ -485,7 +485,7 @@ impl RedisConsumer {
                     "Failed to analyse transaction"
                 );
 
-                self.dead_letter(connection, &message_id, &candidate, &error.to_string())
+                self.dead_letter(connection, message_id, candidate, &error.to_string())
                     .await?;
             }
         }
