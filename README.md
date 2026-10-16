@@ -6,6 +6,16 @@ destination-chain completion, persists it, and streams it live to clients
 over WebSocket. Currently indexes Solana, with additional chains landing
 incrementally.
 
+## Status
+
+| Area | State |
+| --- | --- |
+| Read path (`/analyse`) | Working, cache-hit throughput measured (see [Results](#results)) |
+| Destination tx resolution | **Broken**: transfers stay `Pending` even when WormholeScan shows them finalized. Fix is Phase 1 |
+| WebSocket ingestion | **Lossy**: misses transactions, no measurement yet. Fix is Phase 4 |
+| CI | None yet. Phase 0 |
+| Deploy | Manual (`git clone` + `cargo run` on EC2, Postgres on RDS). Automated in Phase 2 |
+
 ## Architecture
 
 ```mermaid
@@ -25,6 +35,115 @@ Every successfully analysed transaction is persisted to Postgres and, in the
 same step, broadcast to any connected WebSocket clients — so the live feed and
 the durable record come from a single source of truth, not two separate paths
 that can drift.
+
+### Target architecture (after Phase 2)
+
+Helius rate limits are per key, so the user-facing read path and the ingestion
+pipeline must not share one. The same binary runs in two roles with separate
+Helius keys, limiters and hostnames. `ROLE=all` stays available for local dev.
+
+```mermaid
+flowchart LR
+    subgraph api["api.<domain>  (ROLE=api, Helius key A)"]
+        H1["GET /analyse"] --> RT[Read-through cache]
+        RT --> LA[Limiter A]
+    end
+    subgraph stream["stream.<domain>  (ROLE=stream, Helius key B)"]
+        ING[Ingester + reconcile] --> RS[(Redis Stream)]
+        RS --> WK[Workers]
+        WK --> LB[Limiter B]
+        WK --> BC[Broadcast]
+        BC --> WSX["WS /stream"]
+    end
+    RT --> PG[(Postgres)]
+    WK --> PG
+    LA --> HEL[Helius]
+    LB --> HEL
+    LA --> WHS[WormholeScan]
+    LB --> WHS
+```
+
+## Project structure
+
+bridgeIndexer/
+├── .github/
+│   └── workflows/
+│       └── ci.yml                      # fmt, clippy, test (Phase 0)
+├── .sqlx/                              # offline query data
+├── migrations/
+│   ├── 20260912071405_create_bridge_transfers.sql
+│   ├── 20260912162718_create_indexer_state.sql
+│   ├── 20260912232059_fix_indexer_state_key_name.sql
+│   └── 20261002150000_analysis_and_read_indexes.sql
+├── scripts/
+│   └── capture_fixtures.sh             # save Helius + WormholeScan fixtures (Phase 0)
+├── src/
+│   ├── main.rs                         # wiring, supervised workers, HTTP server
+│   ├── lib.rs
+│   ├── config.rs                       # env config
+│   ├── state.rs                        # AppState, limiters, caches
+│   ├── error.rs                        # AppError -> HTTP responses
+│   ├── shutdown.rs                     # SIGTERM / Ctrl+C
+│   ├── bin/                            # (planned)
+│   │   ├── replay.rs                   # status agreement vs WormholeScan (Phase 1)
+│   │   └── reconcile.rs                # stream recall vs getSignaturesForAddress (Phase 4)
+│   ├── domain/                         # types only, no IO
+│   │   ├── bridge.rs
+│   │   ├── bridge_transfer.rs
+│   │   └── transaction.rs
+│   ├── vaa/
+│   │   └── decode.rs                   # VAA, address and amount decoding (pure)
+│   ├── normaliser/                     # raw provider JSON -> domain (pure)
+│   │   ├── solana.rs
+│   │   └── wormhole.rs
+│   ├── clients/                        # provider HTTP + rate limiting
+│   │   ├── helius.rs
+│   │   ├── wormhole.rs
+│   │   └── limiter.rs
+│   ├── chain_adapters/                 # destination lookups, token metadata
+│   │   ├── mod.rs                      # ChainAdapter trait
+│   │   ├── registry.rs
+│   │   ├── setup.rs
+│   │   ├── solana.rs
+│   │   └── wormholescan.rs
+│   ├── ingestion/                      # Solana WS listener + backfill
+│   │   ├── solana.rs
+│   │   └── types.rs
+│   ├── redis/                          # stream producer, consumer group, recovery
+│   │   ├── producer.rs
+│   │   └── consumer.rs
+│   ├── services/                       # orchestration
+│   │   ├── analyzer.rs                 # analyse_tx (split into fetch/decode/enrich in Phase 1)
+│   │   ├── correlator.rs
+│   │   ├── token_metadata.rs
+│   │   └── read_through.rs             # caches, single-flight, stale-while-revalidate
+│   ├── db/
+│   │   ├── connection.rs
+│   │   └── repository.rs
+│   ├── handler/                        # HTTP and WS handlers
+│   │   ├── analyse.rs
+│   │   └── stream.rs
+│   ├── routes/
+│   │   ├── mod.rs                      # router + CORS
+│   │   └── v1/
+│   │       ├── mod.rs
+│   │       └── transactions.rs
+│   └── util/
+│       └── explorer.rs                 # explorer URLs per chain
+├── tests/
+│   ├── decode_unit.rs                  # pure decode tests (Phase 0)
+│   ├── fixtures_decode.rs              # decoders over captured fixtures (Phase 0)
+│   ├── persistence_idempotency.rs      # testcontainers Postgres
+│   └── fixtures/                       # helius_<name>.json, wormhole_<name>.json
+├── benches/                            # (planned) criterion: pure decode (Phase 1)
+├── .env.example                        # (Phase 0)
+├── .dockerignore
+├── .gitignore
+├── Cargo.toml
+├── Cargo.lock
+├── docker-compose.yml
+├── dockerfile
+└── README.md
 
 ### Why Redis Streams, not Kafka
 
@@ -102,14 +221,6 @@ which has to stay under the configured provider quotas.
   a crashed consumer via `XAUTOCLAIM` every 30s.
 * **Graceful shutdown.** SIGTERM/Ctrl+C stops new work being picked up, lets
   in-flight messages finish, and drains open HTTP/WS connections before exit.
-* **RPC rate-limit resilience.** Destination-chain lookups (`chain_adapters::evm`)
-  page through `eth_getLogs` in provider-configurable block-size chunks rather
-  than one unbounded query — the default is 2000 blocks, but any chain can be
-  constructed with a tighter cap via `EvmAdapter::with_block_range(...)` for
-  RPC providers on rate-limited tiers (e.g. Base on a free-tier Alchemy key,
-  capped at 10 blocks per call). If a provider rejects a range as too wide at
-  runtime, the adapter automatically shrinks the window and retries rather
-  than failing the transaction outright.
 * **Upstream protection on the read path.** Per-provider rate limiters, retries
   with backoff and jitter, a bounded concurrency semaphore, and fail-fast 503s
   with `Retry-After` keep a burst of new transactions from turning into a
@@ -145,54 +256,16 @@ chain; anything else returns `422 NORMALISATION_FAILED`.
 CORS is origin-allowlisted via `ALLOWED_ORIGINS` — nothing is permitted by
 default.
 
-## Performance
-
-Measured with [`oha`](https://github.com/hatoo/oha) from a separate EC2
-instance in the same VPC (two instances, 30-second runs, 50 connections,
-769 distinct Solana transactions, 1.2 KiB responses, warm cache).
-The server ran on an `m7i-flex.large` (2 vCPU); the load generator was a
-burstable `t3.micro` (2 vCPU) and was the first to hit 100% CPU.
-
-| Workload | Result |
-| --- | --- |
-| Cache hits | 36.5k and 37.1k req/s over two runs, 1.1M requests each, every response a 200 |
-| Median latency | about 0.8 ms (p99 about 33 ms) |
-| 200 connections | 33.9k req/s, load generator CPU at 100% |
-| Cold burst, 50 concurrent requests for one hash | 1 upstream fetch, all 50 served in a 28 ms window |
-| Junk hashes | about 55k req/s of cheap 400s, zero upstream calls |
-
-What these numbers do and don't mean:
-
-* They are cache-hit throughput, and a lower bound: at 200 connections the
-  load generator was CPU-bound, so the server's own ceiling hasn't been measured.
-* Uncached transactions are limited by the providers. With the default quotas
-  (40/s Helius, 20/s Wormholescan) that is roughly 20 new lookups per second;
-  overflow gets a 503 after 2 s.
-* There is a cluster of 33–45 ms requests that hasn't been explained yet.
-* The cache lives in one process, so several instances would each refresh
-  their own copies.
-
-### Reproducing
-
-Build a file with one URL per line (valid Solana signatures only, since
-`oha`'s "success rate" counts any HTTP response, so always read the status
-code distribution):
-
-```bash
-oha -z 30s -c 50 --urls-from-file urls.txt
-```
-
-Run it twice. The first run fills the cache and the second is the warm number.
-
 ## Running locally
 
 Requires Postgres and Redis reachable at the URLs below.
 
 ```bash
-cp .env.example .env   # fill in RPC URLs, bridge contract addresses, etc.
-sqlx migrate run
+cp .env.example .env   # fill in RPC URLs and the bridge program address
 cargo run
 ```
+
+Migrations run on startup.
 
 ## Testing
 
@@ -200,27 +273,117 @@ cargo run
 cargo test
 ```
 
-`tests/persistence_idempotency.rs` spins up a real Postgres container
-(via `testcontainers`) and asserts that redelivering the same transaction —
-the scenario `XAUTOCLAIM` recovery guarantees will happen — never produces a
-duplicate row.
+* `tests/decode_unit.rs` — VAA decoding (hand-built VAAs, malformed input),
+  address decoding, amount formatting. No network, no Docker.
+* `tests/fixtures_decode.rs` — runs the pure decoders over real captured
+  provider responses in `tests/fixtures/`. Capture new ones with
+  `scripts/capture_fixtures.sh`.
+* `tests/persistence_idempotency.rs` — spins up a real Postgres container
+  (via `testcontainers`, needs Docker) and asserts that redelivering the same
+  transaction — the scenario `XAUTOCLAIM` recovery guarantees will happen —
+  never produces a duplicate row.
 
-## Roadmap: multi-chain ingestion
+***
 
-Ingestion currently watches Solana only — transfers are correctly attributed
-to their real source/destination chain in either direction (Solana → X or
-X → Solana), but a transfer that never touches Solana isn't observed yet.
+# Roadmap
 
-The correlation layer (`services::correlator`) and the destination-lookup
-adapters (`chain_adapters::evm`, `chain_adapters::wormholescan`) are already
-chain-agnostic and already wired up in `AdapterRegistry` for Ethereum, BSC,
-Polygon, Avalanche, Arbitrum, Optimism, Gnosis, and Base — specifically so
-adding a chain doesn't require touching correlation logic. What's missing per
-chain is the ingestion side: a chain-specific listener that watches its Token
-Bridge contract and pushes candidates onto the same `bridge:transactions`
-Redis stream Solana's ingester already writes to.
+Every checkpoint follows the same loop:
 
-Planned rollout, one chain at a time:
+1. Branch: `fix/…` for correctness, `perf/…` for speed, `ci/…` / `chore/…` for infra. One change per branch.
+2. Tests first or alongside. Fixtures for anything that parses provider data.
+3. Run the benchmark for that phase, same workload as the previous tag.
+4. Add a row to [Results](#results): version, change, before, after.
+5. PR, CI green, merge, tag (`v0`, `v1`, …), deploy.
+6. Re-run the benchmark on EC2. Numbers in this README are EC2 numbers; laptop numbers are for iteration only.
+
+Rule for the numbers: two runs, warm and cold kept separate, read the status
+code distribution (a 4xx/5xx still counts as "success" in most load tools),
+record the git SHA and instance type next to every row.
+
+## Phase 0 — foundation
+
+* \[ ] GitHub Actions CI: `cargo fmt --check`, `clippy -D warnings`, `cargo test`
+* \[ ] Unit tests for VAA decode, address decode, amount formatting
+* \[ ] Fixture capture script and fixture-driven decode tests
+* \[ ] `.env.example`, README drift fixed
+* \[ ] Tag `v0` (baseline numbers below)
+
+Exit: CI green on `main`.
+
+## Phase 1 — core decoder (metric: correctness)
+
+Problem: every transfer reports `Pending`. The destination tx is read from
+`globalTx.destinationTx.txHash` on the `/operations` response, which does not
+carry that field, and `WormholeScanAdapter::find_transaction` (which hits
+`/global-tx/...`) is never called.
+
+* \[ ] 1a. Split `analyse_tx` into fetch (IO), decode (pure, no network or state), enrich (IO)
+* \[ ] 1b. Destination tx resolution: operation payload paths first, then the `global-tx` lookup through the WormholeScan limiter
+* \[ ] 1c. Provider lanes: `Lane::Api` and `Lane::Ingest`, each with its own Helius URL (`HELIUS_API_URL`, `HELIUS_STREAM_URL`) and its own limiter. Fall back to `HELIUS_URL` when unset
+* \[ ] 1d. Golden tests per fixture, status matrix test (known tx → `Completed`, none + registered chain → `Pending`, unregistered → `Detected`)
+* \[ ] 1e. `src/bin/replay.rs`: take the last N signatures, run `analyse_tx`, compare our status with WormholeScan's `global-tx`
+* \[ ] 1f. Criterion bench for the pure decode path
+
+Benchmarks: decode ns/op (criterion); replay agreement %, Pending %, errors by kind, cold p50/p99.
+Exit: ≥ 99% agreement on transfers older than 15 minutes; `Pending` only when WormholeScan itself has no destination tx.
+
+## Phase 2 — deploy pipeline and roles
+
+* \[ ] `ROLE=api|stream|all`. `api` serves `/analyse`; `stream` runs ingester, workers, recovery and `/stream`. Shared Postgres and Redis
+* \[ ] Hostnames `api.<domain>` and `stream.<domain>`, each process with its own Helius key
+* \[ ] CI builds the release binary; CD over SSH on merge to `main`: deploy key, one systemd unit per role, health check, rollback to previous binary
+* \[ ] `/health` (Postgres and Redis ping) and metrics: request latency histogram, cache hit/miss counters, limiter wait time, stream lag
+* \[ ] Hardening: compose publishes Postgres/Redis on `127.0.0.1` only, no default credentials on a public box, security group allows only 80/443 and SSH from a fixed IP
+* \[ ] Load generator on a second instance in the same VPC, larger than the `t3.micro` used for v0
+
+Exit: merge to `main` deploys both roles; the API benchmark runs against the deployed service.
+
+## Phase 3 — scale the API (reads and writes)
+
+Measure before changing anything. Each item is one tagged experiment with the same workloads.
+
+* \[ ] 3a. True server ceiling: re-run `R-hit` with a stronger load generator; profile (samply / `perf`, `tokio-console`); explain the 33–45 ms latency cluster
+* \[ ] 3b. `v1` cache pre-serialized response bytes instead of cloning `NormalisedTransaction` and re-serializing per hit
+* \[ ] 3c. `v2` one cache lookup instead of four
+* \[ ] 3d. `v3` two API instances behind a proxy: per-process caches duplicate refreshes; compare a Redis-shared cache against sticky routing
+* \[ ] 3e. Cold path: fake upstream server replaying fixtures with injected latency and 429s so quota isn't burned; try JSON-RPC batching for Helius, priority for user requests over background refresh, limiters set to the real plan limits
+* \[ ] 3f. Write path: consumer throughput against the fake upstream. Try larger `XREADGROUP COUNT`, concurrent processing inside a worker, batched upserts per Postgres transaction, pool sizing against RDS limits
+* \[ ] 3g. List endpoint using the `idx_bt_*` indexes with keyset pagination, benchmarked on ~1M seeded rows with `EXPLAIN ANALYZE`
+
+Exit: documented ceiling for each workload and what limits it (CPU, Postgres, provider quota).
+
+## Phase 4 — WebSocket stream (metric: recall)
+
+First build `src/bin/reconcile.rs`: for a time window, take `getSignaturesForAddress` as ground truth, diff against the `transactions` table, report missed count, missed %, and ingestion lag (block time → published). That is the stream's `v0`.
+
+Known suspects, most likely first:
+
+1. Checkpoint is slot-granular and backfill stops at `slot <= checkpoint`, so other transactions in the checkpoint's slot are lost on any reconnect
+2. Backfill runs before the read loop with a 150 ms sleep per signature, so live notifications queue up behind it
+3. No keepalive or watchdog: a silently dead socket produces neither errors nor data
+4. A rejected `logsSubscribe` is swallowed (the check is unreachable), and any publish error tears down the connection
+5. The ingester is not under `spawn_supervised`, so a panic stops it permanently
+6. The checkpoint is written on every message and can move backwards on out-of-order slots
+
+Work items:
+
+* \[ ] 4a. `reconcile` bin and baseline recall over 24 h
+* \[ ] 4b. Rewind the checkpoint a few slots on reconnect and dedupe by signature (persistence is already idempotent)
+* \[ ] 4c. Backfill as a separate task, concurrent with live reads
+* \[ ] 4d. Ping/pong keepalive and a no-message watchdog that forces a reconnect
+* \[ ] 4e. Surface subscribe errors, supervise the ingester, `GREATEST` on the checkpoint
+* \[ ] 4f. Periodic reconciliation poll as a completeness guarantee: WebSocket is the low-latency path, polling is the safety net
+* \[ ] 4g. Evaluate Helius' other streaming options against current docs before building anything custom
+
+Exit: recall ≥ 99.9% over 24 h, p99 ingestion lag recorded.
+
+## Phase 5 — multi-chain ingestion
+
+Destination lookups already go through chain-agnostic WormholeScan adapters
+registered for Ethereum, BSC, Polygon, Avalanche, Arbitrum, Optimism, Gnosis
+and Base. No EVM RPC adapter ships today. What is missing per chain is the
+ingestion side: a chain-specific listener that watches its Token Bridge
+contract and pushes candidates onto the same `bridge:transactions` stream.
 
 * \[x] Solana
 * \[ ] Ethereum
@@ -228,5 +391,81 @@ Planned rollout, one chain at a time:
 * \[ ] additional EVM chains, as the pattern proves out
 
 Each addition is a new `ingestion::<chain>` module plus a normaliser for that
-chain's transaction shape — the Redis pipeline, correlator, persistence, and
-WebSocket fanout all stay untouched.
+chain's transaction shape. The Redis pipeline, correlator, persistence and
+WebSocket fanout stay untouched.
+
+***
+
+# Benchmarks
+
+## Workloads
+
+| ID | What | Tool |
+| --- | --- | --- |
+| `R-hit` | 769 distinct signatures, warm cache, 50 connections, 30 s | `oha` |
+| `R-mix` | 90% hot / 10% cold keys against the fake upstream | `oha` |
+| `R-cold` | all-unique signatures against the fake upstream (50 ms latency) | `oha` |
+| `R-junk` | invalid hashes, must never reach an upstream | `oha` |
+| `W-ingest` | 100k candidates `XADD`ed, fake upstream, measure persisted tx/s and stream lag | custom bin |
+| `S-recall` | 24 h reconciliation against `getSignaturesForAddress` | `reconcile` bin |
+| `D-decode` | pure decode path, ns per operation | `criterion` |
+| `C-agree` | status agreement with WormholeScan over the last N signatures | `replay` bin |
+
+Reproducing `R-hit`: build a file with one URL per line (valid Solana
+signatures only), then run it twice. The first run fills the cache, the second
+is the warm number.
+
+```bash
+oha -z 30s -c 50 --urls-from-file urls.txt
+```
+
+## Results
+
+Server: `m7i-flex.large` (2 vCPU). Load generator: `t3.micro` in the same VPC,
+the first thing to hit 100% CPU. 30 s runs, 50 connections, 769 distinct
+transactions, 1.2 KiB responses.
+
+### Baseline (`v0`)
+
+| Workload | Result |
+| --- | --- |
+| `R-hit` | 36.5k and 37.1k req/s over two runs, 1.1M requests each, every response a 200 |
+| `R-hit` latency | about 0.8 ms median, p99 about 33 ms |
+| `R-hit`, 200 connections | 33.9k req/s, load generator CPU at 100% |
+| Cold burst, 50 concurrent requests for one hash | 1 upstream fetch, all 50 served in a 28 ms window |
+| `R-junk` | about 55k req/s of cheap 400s, zero upstream calls |
+
+What these do and don't mean:
+
+* Cache-hit throughput is a lower bound: at 200 connections the load generator was CPU-bound, so the server's ceiling hasn't been measured.
+* Uncached transactions are limited by the providers. With the default quotas (40/s Helius, 20/s WormholeScan) that is roughly 20 new lookups per second; overflow gets a 503 after 2 s.
+* There is a cluster of 33–45 ms requests that hasn't been explained yet.
+* The cache lives in one process, so several instances would each refresh their own copies.
+
+### Phase 1 — correctness
+
+| Version | Change | `C-agree` | Pending % | `D-decode` ns/op | Cold p50 / p99 |
+| --- | --- | --- | --- | --- | --- |
+| v0 | baseline | — | ~100% (bug) | — | ~360 ms median |
+| v1 | | — | — | — | — |
+
+### Phase 2 — deploy pipeline
+
+| Version | Change | Merge → live | Rollback | Health check | Roles deployed |
+| --- | --- | --- | --- | --- | --- |
+| v0 | manual `git clone` + `cargo run` | — | — | none | 1 (all in one) |
+| | | | | | |
+
+### Phase 3 — API reads and writes
+
+| Version | Change | `R-hit` req/s | `R-hit` p99 | `R-cold` req/s | `W-ingest` tx/s | Limited by |
+| --- | --- | --- | --- | --- | --- | --- |
+| v0 | baseline | 36.5k | ~33 ms | ~20 (quota) | — | load generator |
+| | | | | | | |
+
+### Phase 4 — stream
+
+| Version | Change | `S-recall` | Missed | p99 lag |
+| --- | --- | --- | --- | --- |
+| v0 | baseline | — | — | — |
+| | | | | |

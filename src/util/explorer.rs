@@ -10,6 +10,6 @@ pub fn explorer_tx_url(chain_id: u16, tx_hash: &str) -> Option<String> {
         24 => Some(format!("https://optimistic.etherscan.io/tx/{tx_hash}")),
         25 => Some(format!("https://gnosisscan.io/tx/{tx_hash}")),
         30 => Some(format!("https://basescan.org/tx/{tx_hash}")),
-        _ => None, 
+        _ => None,
     }
 }
