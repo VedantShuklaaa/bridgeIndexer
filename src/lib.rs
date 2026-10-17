@@ -1,4 +1,5 @@
 pub mod chain_adapters;
+pub mod chains;
 pub mod clients;
 pub mod config;
 pub mod db;
@@ -7,6 +8,7 @@ pub mod error;
 pub mod handler;
 pub mod ingestion;
 pub mod normaliser;
+pub mod protocols;
 pub mod redis;
 pub mod routes;
 pub mod services;
