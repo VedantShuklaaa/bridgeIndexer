@@ -18,8 +18,9 @@ WormholeScan. The [Roadmap](#roadmap) tracks the move.
 | --- | --- |
 | Protocol coverage | Wormhole Token Bridge only. The set of protocols is derived from DefiLlama bridge data for Solana when each protocol phase starts, not fixed in this README (see [Protocol coverage](#protocol-coverage)) |
 | Detection | **Gated on WormholeScan**: a transaction with no WormholeScan operation or VAA yet is retried, then dead-lettered instead of being persisted as `Detected`. Fix is Phase A |
-| Domain model and schema | **Wormhole-shaped**: `emitter_*` and `sequence` are `NOT NULL` and `UNIQUE` on `bridge_transfers`, so no other protocol can be stored. Generalised in Phase A |
-| Chains | **Hardcoded** enums keyed by Wormhole chain IDs. Replaced by a DB-backed registry in Phase A |
+| Domain model and schema | Types exist (`protocols::{Protocol, MessageId, Direction, DetectedTransfer, Reject}`, `RawAmount`), but the `bridge_transfers` table is still **Wormhole-shaped**: `emitter_*` and `sequence` are `NOT NULL` and `UNIQUE`, so no other protocol can be stored. The migration lands in A2 |
+| Chains | **Registry tables and loader exist** (`chains`, `protocol_chain_ids`, seeded with 10 chains, loaded by `chains::db`). The pipeline still uses the hardcoded `ChainId` enum. Wiring is the rest of A3 |
+| Protocol core | `BridgeAdapter` trait, program-ID registry, `compose`, pure `SolanaTx`: merged but **not wired into the pipeline**. No adapter is implemented yet, so the Wormhole adapter is the remaining A1 work |
 | Read path (`/analyse`) | Working, cache-hit throughput measured (see [Results](#results)) |
 | Destination tx resolution | **Broken**: transfers stay `Pending` even when WormholeScan shows them finalized. Fix is Phase 1 |
 | WebSocket ingestion | **Lossy**: misses transactions, no measurement yet. It also runs only while a `/stream` client is connected, so the database is not a complete record. Fix is Phase A (always-on) and Phase 4 (recall) |
@@ -75,6 +76,27 @@ WormholeScan. The [Roadmap](#roadmap) tracks the move.
   cross-checked against an authoritative source (Wormhole chain list, Circle's
   CCTP domain list, LayerZero endpoint metadata). Lookups are rate-limited and
   cached, one per unresolved `(protocol, id)`, with a negative cache.
+
+Implemented so far (no pipeline wiring yet):
+
+* `MessageId` is an enum with one variant per protocol (only `Wormhole` today).
+  `MessageId::key()` is the canonical string stored as `bridge_transfers.message_key`,
+  unique per `(protocol, message_key)`.
+* `BridgeAdapter` is pure: `classify(&SolanaTx)` returns either the transfers it
+  contains or a `Reject` of kind `not_transfer`, `unsupported` or `malformed`, with a
+  reason. `ProtocolRegistry` routes a tx to every adapter whose program appears
+  top-level **or in an inner instruction**, so an aggregator and its underlying rail
+  both see it, and `compose()` merges them into one transfer with `via` recorded.
+* Amounts are `RawAmount`, a decimal string validated for `NUMERIC(78,0)` (fits a `u256`).
+* Adapters emit a `RawChainRef` in the protocol's own namespace. `chains::Snapshot`
+  resolves it to a canonical chain, or to `ChainRef::Unresolved`, never an error.
+  Only `active` rows resolve, in both tables, and a mapping must point at an active
+  chain, so a `pending_review` proposal can never label a real transfer.
+* The migration seeds the 10 current chains plus the `wormhole` namespace (checked
+  against `sdk/vaa/structs.go` in wormhole-foundation/wormhole) and the `evm`
+  namespace (checked against ethereum-lists/chains). Each mapping row carries
+  `status`, `origin` (`seed`, `manual`, `llm`), `evidence` and `verified_at`, which is
+  the provenance the later LLM-proposal upgrade needs.
 
 ## Architecture
 
@@ -169,6 +191,7 @@ bridgeIndexer/
 │   ├── 20260912162718_create_indexer_state.sql
 │   ├── 20260912232059_fix_indexer_state_key_name.sql
 │   └── 20261002150000_analysis_and_read_indexes.sql
+│   ├── 20261017090000_chain_registry.sql
 ├── scripts/
 │   └── capture_fixtures.sh             # save Helius + WormholeScan fixtures (Phase 0)
 ├── src/
@@ -200,12 +223,16 @@ bridgeIndexer/
 │   │   ├── setup.rs
 │   │   ├── solana.rs
 │   │   └── wormholescan.rs
-│   ├── protocols/                      # (planned, Phase A) one adapter per bridge protocol
-│   │   ├── mod.rs                      # BridgeAdapter trait, classification, message identity
-│   │   ├── registry.rs                 # program ID -> adapter
+│   ├── protocols/                      # protocol-agnostic core (Phase A, partly done, not wired)
+│   │   ├── mod.rs                      # BridgeAdapter trait, Protocol, MessageId, Direction, DetectedTransfer, Reject
+│   │   ├── registry.rs                 # program ID -> adapters, SOLANA_BRIDGE_PROGRAMS override parser
 │   │   ├── compose.rs                  # one transfer per message identity, router recorded as via
-│   │   └── wormhole/                   # Token Bridge, NTT, other Wormhole programs (pure decode)
-│   ├── chains/                         # (planned, Phase A) DB-backed chain registry, unresolved handling
+│   │   ├── solana_tx.rs                # pure SolanaTx view built from Helius jsonParsed
+│   │   ├── amount.rs                   # RawAmount: decimal string for NUMERIC(78,0)
+│   │   └── wormhole/                   # (planned, A1) Token Bridge, NTT, other Wormhole programs (pure decode)
+│   ├── chains/                         # DB-backed chain registry (Phase A, loader done, not wired)
+│   │   ├── mod.rs                      # RawChainRef, ChainRef, Snapshot, resolve (only active rows resolve)
+│   │   └── db.rs                       # load_snapshot from Postgres
 │   ├── enrichment/                     # (planned, Phase A) counterpart and status providers, WormholeScan first
 │   ├── ingestion/                      # Solana WS listener + backfill
 │   │   ├── solana.rs
@@ -233,6 +260,8 @@ bridgeIndexer/
 │   └── util/
 │       └── explorer.rs                 # explorer URLs per chain
 ├── tests/
+│   ├── chain_registry_db.rs            # testcontainers Postgres: seed, resolve, status rules
+│   ├── common/                         # shared test helpers (container setup)
 │   ├── decode_unit.rs                  # pure decode tests (Phase 0)
 │   ├── fixtures_decode.rs              # decoders over captured fixtures (Phase 0)
 │   ├── persistence_idempotency.rs      # testcontainers Postgres
@@ -376,8 +405,10 @@ Config notes:
 * `HELIUS_LIVE_URL` (optional, falls back to `HELIUS_URL`) is the endpoint for the
   live pipeline. `LIVE_IDLE_GRACE_SECS` and `LIVE_BACKFILL` are also read. None of
   the three is in `.env.example` yet.
-* `SOLANA_TOKEN_BRIDGE_PROGRAM` is a single address. Phase A replaces it with a
-  configured list of program IDs, one `logsSubscribe` each.
+* `SOLANA_TOKEN_BRIDGE_PROGRAM` is a single address and is still the only program
+  setting `config.rs` reads. `protocols::registry` already has a parser for
+  `SOLANA_BRIDGE_PROGRAMS` (a `protocol:program_id` CSV), but nothing reads that
+  variable yet. A4 wires it and retires the single-address setting.
 
 ## Testing
 
@@ -394,6 +425,12 @@ cargo test
   (via `testcontainers`, needs Docker) and asserts that redelivering the same
   transaction — the scenario `XAUTOCLAIM` recovery guarantees will happen —
   never produces a duplicate row.
+* Unit tests inside `src/protocols/*` and `src/chains/mod.rs`: routing on inner calls,
+  override parsing, compose merging, "only active rows resolve". No network, no Docker.
+* `tests/chain_registry_db.rs` — real Postgres container (needs Docker): the migration
+  seeds the ten chains, one chain resolves to one key from every namespace, unknown IDs
+  are unresolved, `pending_review` mappings resolve only once activated, the database
+  rejects unknown status values, and a failed refresh keeps the previous snapshot.
 
 ***
 
@@ -438,13 +475,13 @@ only real adapter. Phases B and later add one protocol each.
 
 ### Phase A — protocol-agnostic core, Wormhole only
 
-* \[ ] A1. Adapter trait and registry: each adapter declares its program IDs and classifies/decodes a Solana tx into a bridge event, or rejects it with a reason. Decode is pure (no network, no state). Modelled on the existing `chain_adapters` registry
-* \[ ] A2. Generalised domain model and schema: `protocol`, optional `via`, `direction`, source and destination chain references, a protocol-specific message identity with a unique key per protocol, statuses `Detected`/`Pending`/`Completed` plus `Failed`/`Refunded` where needed. Split `bridge_transfers` (protocol-agnostic) from per-protocol detail tables (`wormhole_messages` first). Migration of existing rows
-* \[ ] A3. DB-backed chain registry: canonical `chains` table plus a `(protocol, protocol_chain_id) -> chain` mapping table, seeded with the current 10 chains, replacing the `ChainId` enum and `from_wormhole_id`. Unknown IDs are stored as `unresolved(protocol, id)`, never dropped and never a crash. The registry carries the status and provenance needed for the later LLM-proposal upgrade, which is not built in this phase
+* \[ ] A1. Adapter trait and registry: each adapter declares its program IDs and classifies/decodes a Solana tx into a bridge event, or rejects it with a reason. Decode is pure (no network, no state). Modelled on the existing `chain_adapters` registry... Partly done (#3): `BridgeAdapter`, `ProtocolRegistry`, pure `SolanaTx`, unit-tested. Remaining: the Wormhole adapter and wiring it into the worker
+* \[ ] A2. Generalised domain model and schema: `protocol`, optional `via`, `direction`, source and destination chain references, a protocol-specific message identity with a unique key per protocol, statuses `Detected`/`Pending`/`Completed` plus `Failed`/`Refunded` where needed. Split `bridge_transfers` (protocol-agnostic) from per-protocol detail tables (`wormhole_messages` first). Migration of existing rows... Types done (#3): `MessageId`, `DetectedTransfer`, `RawAmount`. No `bridge_transfers` migration yet
+* \[ ] A3. DB-backed chain registry: canonical `chains` table plus a `(protocol, protocol_chain_id) -> chain` mapping table, seeded with the current 10 chains, replacing the `ChainId` enum and `from_wormhole_id`. Unknown IDs are stored as `unresolved(protocol, id)`, never dropped and never a crash. The registry carries the status and provenance needed for the later LLM-proposal upgrade, which is not built in this phase... Partly done (#4): tables, seed, `load_snapshot`, DB tests. Remaining: move callers off `ChainId` and `from_wormhole_id`, a snapshot refresh task, persisting `unresolved` on transfers
 * \[ ] A4. All Wormhole programs on Solana, not only the Token Bridge (Token Bridge, NTT and others, each after its program ID and layouts are verified against official docs or source). One `logsSubscribe` per program ID, since `mentions` accepts a single address, with a checkpoint per program. `SOLANA_TOKEN_BRIDGE_PROGRAM` is replaced by a configured list
 * \[ ] A5. Chain-first detection: a transfer is persisted as `Detected` from Helius data alone. WormholeScan becomes an enrichment provider that fills the destination tx and final status afterwards and no longer gates persistence (today `analyse_tx` returns `VaaNotAvailable` and the worker dead-letters)
-* \[ ] A6. Composition: one transfer per message identity, the outer protocol or router recorded as `via`, and a test that an outer and an underlying adapter seeing the same tx produce one row
-* \[ ] A7. Direction: Solana-outbound sends and Solana-inbound redeems both indexed
+* \[ ] A6. Composition: one transfer per message identity, the outer protocol or router recorded as `via`, and a test that an outer and an underlying adapter seeing the same tx produce one row... Partly done (#3): `compose()` with unit tests. The end-to-end outer+underlying test waits for a second adapter
+* \[ ] A7. Direction: Solana-outbound sends and Solana-inbound redeems both indexed... Type only (`Direction`). Decoding both directions comes with the Wormhole adapter
 * \[ ] A8. Ingestion is always on, in this phase and every later one, and no longer tied to `/stream` clients, so the database is a complete record of what the programs emitted. Helius usage is kept in check by a configurable ingestion budget (limiter, dedupe of repeated signatures, backfill pacing)
 * \[ ] A9. Fixtures captured from real txs (outbound, inbound, admin/attest rejected, unsupported variant) and golden tests per adapter
 * \[ ] A10. API versioning: `/api/v2` serves the generalised model (protocol, direction, via, chain references, all transfers of a tx). `/api/v1` keeps its current Wormhole-shaped response through a compatibility mapper until it is retired. Amounts are stored as `NUMERIC` so volume can be aggregated
