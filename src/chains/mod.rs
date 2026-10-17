@@ -1,4 +1,5 @@
-//! DB-backed chain registry (the DB loader arrives with the migration).
+//! DB-backed chain registry. The tables come from the `chain_registry` migration and
+//! [`db`] loads them into an in-memory [`Snapshot`].
 //!
 //! Adapters stay pure by emitting a [`RawChainRef`] in the protocol's own chain-ID
 //! namespace. Resolution is an in-memory lookup against a [`Snapshot`].
@@ -6,6 +7,8 @@
 //! Only `active` rows resolve, in both tables. That single rule keeps an unverified
 //! proposal (`pending_review`, for example from the later LLM upgrade) from ever
 //! labelling a real transfer.
+
+pub mod db;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
