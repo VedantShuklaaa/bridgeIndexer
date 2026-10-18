@@ -23,6 +23,9 @@ pub struct SolanaTx {
     pub signature: String,
     pub slot: u64,
     pub block_time: Option<i64>,
+    /// True when the transaction failed on chain (`meta.err` is set). A failed tx
+    /// reverts its effects, so adapters must never index it as a transfer.
+    pub failed: bool,
     /// Fee payer and first signer.
     pub signer: Option<String>,
     pub account_keys: Vec<String>,
@@ -109,6 +112,7 @@ impl SolanaTx {
             signature: signature.to_string(),
             slot,
             block_time: raw.get("blockTime").and_then(Value::as_i64),
+            failed: raw.pointer("/meta/err").is_some_and(|e| !e.is_null()),
             signer,
             account_keys,
             instructions,
@@ -242,6 +246,16 @@ mod tests {
         assert_eq!(outer.data, bs58::decode("3Bxs").into_vec().unwrap());
         let tok = tx.instructions_of("Tok").next().unwrap();
         assert!(tok.data.is_empty() && tok.parsed.is_some());
+    }
+
+    #[test]
+    fn failed_follows_meta_err() {
+        let ok = SolanaTx::from_helius(&sample(), "sig").unwrap();
+        assert!(!ok.failed);
+
+        let mut raw = sample();
+        raw["meta"]["err"] = json!({ "InstructionError": [0, "Custom"] });
+        assert!(SolanaTx::from_helius(&raw, "sig").unwrap().failed);
     }
 
     #[test]

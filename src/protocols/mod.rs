@@ -7,6 +7,7 @@ pub mod amount;
 pub mod compose;
 pub mod registry;
 pub mod solana_tx;
+pub mod wormhole;
 
 use crate::chains::RawChainRef;
 use amount::RawAmount;

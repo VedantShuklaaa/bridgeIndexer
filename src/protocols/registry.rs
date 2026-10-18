@@ -119,6 +119,7 @@ mod tests {
             signature: "s".into(),
             slot: 1,
             block_time: None,
+            failed: false,
             signer: None,
             account_keys: vec![],
             instructions: programs
