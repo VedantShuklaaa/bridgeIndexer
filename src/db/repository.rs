@@ -1,5 +1,7 @@
+use crate::chains::NS_WORMHOLE;
 use crate::domain::bridge_transfer::BridgeTransfer;
 use crate::domain::transaction::NormalisedTransaction;
+use crate::protocols::{Direction, MessageId, amount::RawAmount};
 use anyhow::Result;
 use sqlx::{PgPool, Postgres, Transaction};
 
@@ -53,22 +55,37 @@ async fn persist_bridge_transfer(
     bridge: &BridgeTransfer,
     analysis: &serde_json::Value,
 ) -> anyhow::Result<()> {
-    sqlx::query(
+    let message = MessageId::Wormhole {
+        emitter_chain: bridge.message_id.emitter_chain,
+        emitter_address: bridge.message_id.emitter_address.clone(),
+        sequence: bridge.message_id.sequence,
+    };
+    // An amount that is not a plain integer is stored as NULL. The analysis JSON keeps it.
+    let amount = bridge
+        .amount
+        .as_deref()
+        .and_then(RawAmount::parse)
+        .map(|a| a.to_string());
+
+    let transfer_id: i64 = sqlx::query_scalar(
         r#"
         INSERT INTO bridge_transfers (
-            transaction_id, source_tx_hash, source_chain, source_wallet,
-            source_explorer_url, emitter_chain, emitter_address, sequence,
-            destination_chain, destination_wallet, destination_tx_hash,
-            destination_explorer_url, token, token_symbol, amount,
-            amount_formatted, status, analysis
+            transaction_id, protocol, message_key, direction, observed_tx_hash,
+            source_tx_hash, source_ref_protocol, source_ref_id, source_chain_id,
+            source_wallet, source_explorer_url,
+            destination_ref_protocol, destination_ref_id, destination_chain_id,
+            destination_wallet, destination_tx_hash, destination_explorer_url,
+            token, token_symbol, amount, amount_formatted, status, analysis
         )
         VALUES (
             $1, $2, $3, $4, $5,
-            $6, $7, $8::numeric,
-            $9, $10, $11, $12,
-            $13, $14, $15, $16, $17, $18
+            $5, $6, $7, resolve_chain($6, $7),
+            $8, $9,
+            $10, $11, resolve_chain($10, $11),
+            $12, $13, $14,
+            $15, $16, $17::numeric, $18, $19, $20
         )
-        ON CONFLICT (emitter_chain, emitter_address, sequence)
+        ON CONFLICT (protocol, message_key)
         DO UPDATE SET
             destination_tx_hash = COALESCE(EXCLUDED.destination_tx_hash, bridge_transfers.destination_tx_hash),
             destination_wallet = COALESCE(EXCLUDED.destination_wallet, bridge_transfers.destination_wallet),
@@ -77,30 +94,47 @@ async fn persist_bridge_transfer(
             amount_formatted = COALESCE(EXCLUDED.amount_formatted, bridge_transfers.amount_formatted),
             status = CASE WHEN bridge_transfers.status = 'Completed'
                           THEN 'Completed' ELSE EXCLUDED.status END,
-            -- only replace the cached response if it describes the same source tx
-            analysis = CASE WHEN bridge_transfers.source_tx_hash = EXCLUDED.source_tx_hash
+            -- only replace the cached response if it describes the same observed tx
+            analysis = CASE WHEN bridge_transfers.observed_tx_hash = EXCLUDED.observed_tx_hash
                             THEN EXCLUDED.analysis ELSE bridge_transfers.analysis END,
             updated_at = NOW()
+        RETURNING id
         "#,
     )
     .bind(transaction_id)
+    .bind(message.protocol().as_str())
+    .bind(message.key())
+    .bind(Direction::Outbound.as_str())
     .bind(&bridge.source_tx_hash)
-    .bind(bridge.source_chain.wormhole_id() as i16)
+    .bind(NS_WORMHOLE)
+    .bind(bridge.source_chain.wormhole_id().to_string())
     .bind(&bridge.source_wallet)
     .bind(&bridge.source_explorer_url)
-    .bind(bridge.message_id.emitter_chain as i16)
-    .bind(&bridge.message_id.emitter_address)
-    .bind(bridge.message_id.sequence.to_string())
-    .bind(bridge.destination_chain.wormhole_id() as i16)
+    .bind(NS_WORMHOLE)
+    .bind(bridge.destination_chain.wormhole_id().to_string())
     .bind(&bridge.destination_wallet)
     .bind(&bridge.destination_tx_hash)
     .bind(&bridge.destination_explorer_url)
     .bind(&bridge.token)
     .bind(&bridge.token_symbol)
-    .bind(&bridge.amount)
+    .bind(amount)
     .bind(&bridge.amount_formatted)
     .bind(format!("{:?}", bridge.status))
     .bind(analysis)
+    .fetch_one(&mut **db_tx)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO wormhole_messages (transfer_id, emitter_chain, emitter_address, sequence)
+        VALUES ($1, $2, $3, $4::numeric)
+        ON CONFLICT (transfer_id) DO NOTHING
+        "#,
+    )
+    .bind(transfer_id)
+    .bind(i32::from(bridge.message_id.emitter_chain))
+    .bind(&bridge.message_id.emitter_address)
+    .bind(bridge.message_id.sequence.to_string())
     .execute(&mut **db_tx)
     .await?;
 
@@ -135,9 +169,11 @@ pub async fn get_cached_analysis(pool: &PgPool, hash: &str) -> Result<Option<ser
     Ok(sqlx::query_scalar(
         r#"
         SELECT analysis FROM bridge_transfers
-        WHERE source_tx_hash = $1
+        WHERE observed_tx_hash = $1
           AND analysis IS NOT NULL
           AND (status = 'Completed' OR updated_at > NOW() - INTERVAL '30 seconds')
+        ORDER BY event_index
+        LIMIT 1
         "#,
     )
     .bind(hash)
@@ -168,8 +204,10 @@ pub async fn get_analysis_any_age(
                    FALSE
                ) AS fresh
         FROM bridge_transfers
-        WHERE source_tx_hash = $1
+        WHERE observed_tx_hash = $1
           AND analysis IS NOT NULL
+        ORDER BY event_index
+        LIMIT 1
         "#,
     )
     .bind(hash)
