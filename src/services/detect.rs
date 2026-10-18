@@ -129,19 +129,44 @@ pub fn apply_wormholescan(transfer: &mut BridgeTransfer, wh_raw: &Value) -> Enri
 
     transfer.status = BridgeStatus::Pending;
 
-    let destination_tx = wh_raw
-        .get("globalTx")
-        .and_then(|g| g.get("destinationTx"))
-        .and_then(|d| d.get("txHash"))
-        .and_then(Value::as_str)
-        .map(String::from);
-    if let Some(hash) = destination_tx {
-        transfer.destination_explorer_url =
-            explorer_tx_url(transfer.destination_chain.wormhole_id(), &hash);
-        transfer.destination_tx_hash = Some(hash);
-        transfer.status = BridgeStatus::Completed;
+    if let Some(hash) = destination_tx_from_operation(wh_raw) {
+        apply_destination_tx(transfer, &hash);
     }
     Enrichment::Applied
+}
+
+/// Destination tx inside a WormholeScan `/operations` item. Paths are tried in order;
+/// the first non-empty string wins.
+pub fn destination_tx_from_operation(raw: &Value) -> Option<String> {
+    const PATHS: [&[&str]; 3] = [
+        &["targetChain", "transaction", "txHash"],
+        &["globalTx", "destinationTx", "txHash"],
+        &["destinationTx", "txHash"],
+    ];
+    PATHS.iter().find_map(|path| {
+        let mut cur = raw;
+        for key in *path {
+            cur = cur.get(*key)?;
+        }
+        cur.as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    })
+}
+
+/// Completes a `Pending` transfer once its destination tx is known. Never touches
+/// `Detected` (no matched VAA) and never rewrites a `Completed` transfer.
+pub fn apply_destination_tx(transfer: &mut BridgeTransfer, hash: &str) -> bool {
+    let hash = hash.trim();
+    if hash.is_empty() || !matches!(transfer.status, BridgeStatus::Pending) {
+        return false;
+    }
+    transfer.destination_explorer_url =
+        explorer_tx_url(transfer.destination_chain.wormhole_id(), hash);
+    transfer.destination_tx_hash = Some(hash.to_string());
+    transfer.status = BridgeStatus::Completed;
+    true
 }
 
 #[cfg(test)]
@@ -289,5 +314,79 @@ mod tests {
             assert!(matches!(t.status, BridgeStatus::Detected));
             assert!(t.destination_tx_hash.is_none());
         }
+    }
+
+    #[test]
+    fn destination_tx_is_read_from_target_chain() {
+        let raw = json!({"targetChain": {"transaction": {"txHash": "0xtarget"}}});
+        assert_eq!(
+            destination_tx_from_operation(&raw).as_deref(),
+            Some("0xtarget")
+        );
+    }
+
+    #[test]
+    fn target_chain_wins_over_legacy_paths() {
+        let raw = json!({
+            "targetChain": {"transaction": {"txHash": "0xtarget"}},
+            "globalTx": {"destinationTx": {"txHash": "0xlegacy"}},
+        });
+        assert_eq!(
+            destination_tx_from_operation(&raw).as_deref(),
+            Some("0xtarget")
+        );
+    }
+
+    #[test]
+    fn empty_or_absent_destination_tx_is_none() {
+        for raw in [
+            json!({}),
+            json!({"targetChain": {}}),
+            json!({"targetChain": {"transaction": {"txHash": ""}}}),
+        ] {
+            assert_eq!(destination_tx_from_operation(&raw), None);
+        }
+    }
+
+    #[test]
+    fn an_operation_with_target_chain_completes_the_transfer() {
+        let raw = json!({
+            "vaa": {"raw": vaa_b64(1, [9; 32], 42)},
+            "targetChain": {"transaction": {"txHash": "0xdest"}},
+        });
+        let mut t = transfer();
+        assert_eq!(apply_wormholescan(&mut t, &raw), Enrichment::Applied);
+        assert!(matches!(t.status, BridgeStatus::Completed));
+        assert_eq!(t.destination_tx_hash.as_deref(), Some("0xdest"));
+    }
+
+    #[test]
+    fn apply_destination_tx_completes_only_a_pending_transfer() {
+        let mut detected_only = transfer();
+        assert!(!apply_destination_tx(&mut detected_only, "0xdest"));
+        assert!(matches!(detected_only.status, BridgeStatus::Detected));
+
+        let mut pending = transfer();
+        pending.status = BridgeStatus::Pending;
+        assert!(apply_destination_tx(&mut pending, "0xdest"));
+        assert!(matches!(pending.status, BridgeStatus::Completed));
+        assert_eq!(pending.destination_tx_hash.as_deref(), Some("0xdest"));
+    }
+
+    #[test]
+    fn a_completed_transfer_is_never_rewritten() {
+        let mut t = transfer();
+        t.status = BridgeStatus::Pending;
+        assert!(apply_destination_tx(&mut t, "0xfirst"));
+        assert!(!apply_destination_tx(&mut t, "0xsecond"));
+        assert_eq!(t.destination_tx_hash.as_deref(), Some("0xfirst"));
+    }
+
+    #[test]
+    fn a_blank_hash_changes_nothing() {
+        let mut t = transfer();
+        t.status = BridgeStatus::Pending;
+        assert!(!apply_destination_tx(&mut t, "  "));
+        assert!(matches!(t.status, BridgeStatus::Pending));
     }
 }
