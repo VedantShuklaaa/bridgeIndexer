@@ -4,7 +4,10 @@ use crate::domain::bridge_transfer::BridgeMessageId;
 use crate::domain::transaction::NormalisedTransaction;
 use crate::error::AppError;
 use crate::normaliser;
+use crate::protocols::SolanaTx;
 use crate::services::correlator;
+use crate::services::detect::{self, Enrichment};
+use crate::services::token_metadata::resolve_token_metadata;
 use crate::state::AppState;
 use crate::vaa::decode::{decode_destination_address, decode_vaa};
 use serde_json::Value;
@@ -41,9 +44,60 @@ pub async fn analyse_tx(
         },
     );
 
-    let mut tx = source_result?;
+    let (mut tx, solana_tx) = source_result?;
     tx.bridge_transfer = None;
 
+    // Chain first: if an adapter decodes a transfer from the Solana tx alone, it is
+    // stored as `Detected` whatever WormholeScan says. WormholeScan only enriches.
+    if let Some(solana_tx) = &solana_tx {
+        let detected = detect::detect(&state.protocols, solana_tx);
+        if let Some(first) = detected.first() {
+            if detected.len() > 1 {
+                tracing::warn!(
+                    signature = %hash,
+                    count = detected.len(),
+                    "several transfers in one tx, only the first is stored until the v2 model"
+                );
+            }
+
+            // Best effort: a slow or failing metadata lookup never blocks detection.
+            let metadata = match detect::token_lookup(first) {
+                Some((token_chain, address)) => tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    resolve_token_metadata(&state.registry, token_chain, &address, None),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok),
+                None => None,
+            };
+
+            let mut transfer = detect::to_bridge_transfer(first, metadata)?;
+            match &wormhole_result {
+                Ok(wh_raw) => match detect::apply_wormholescan(&mut transfer, wh_raw) {
+                    Enrichment::Applied => {
+                        tx.bridge_event = normaliser::wormhole::normalise(wh_raw.clone()).ok();
+                    }
+                    outcome => {
+                        tracing::debug!(signature = %hash, ?outcome, "wormholescan not applied")
+                    }
+                },
+                Err(error) => {
+                    tracing::debug!(signature = %hash, %error, "wormholescan unavailable, keeping on-chain data")
+                }
+            }
+            tx.bridge_transfer = Some(transfer);
+
+            tracing::info!(
+                total_ms = t_total.elapsed().as_millis() as u64,
+                "analyse_tx total (chain-first)"
+            );
+            return Ok(tx);
+        }
+    }
+
+    // No adapter recognised the tx (inbound redeem, another Wormhole program, ...):
+    // keep the WormholeScan-driven path until those adapters exist.
     match wormhole_result {
         Ok(wh_raw) => {
             let bridge_event = normaliser::wormhole::normalise(wh_raw.clone())?;
@@ -165,18 +219,23 @@ fn extract_wormholescan_field(raw: &Value, field: &str) -> Option<String> {
         .map(String::from)
 }
 
+/// The normalised tx, plus the pure `SolanaTx` view adapters read (`None` if the raw
+/// response could not be viewed, in which case only the WormholeScan path can run).
 async fn fetch_source_transaction(
     state: &AppState,
     chain: &str,
     hash: &str,
-) -> Result<NormalisedTransaction, AppError> {
+) -> Result<(NormalisedTransaction, Option<SolanaTx>), AppError> {
     match chain {
         "solana" => {
             let raw = call_upstream(&state.helius_limiter, || {
                 helius::get_transaction(&state.http_client, &state.config.helius_url, hash)
             })
             .await?;
-            normaliser::solana::normalise(raw, hash)
+            let solana_tx = SolanaTx::from_helius(&raw, hash)
+                .inspect_err(|error| tracing::warn!(signature = %hash, %error, "unreadable tx"))
+                .ok();
+            Ok((normaliser::solana::normalise(raw, hash)?, solana_tx))
         }
         other => Err(AppError::Normalisation(format!(
             "unsupported chain: {other}"

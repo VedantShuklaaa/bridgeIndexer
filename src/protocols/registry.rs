@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::wormhole::WormholeAdapter;
 use super::{BridgeAdapter, Classification, Protocol, SolanaTx};
 
 /// Routes a transaction to every adapter whose program appears anywhere in it,
@@ -72,6 +73,12 @@ impl ProtocolRegistry {
             .map(|i| (self.adapters[i].protocol(), self.adapters[i].classify(tx)))
             .collect()
     }
+}
+
+pub fn default_registry() -> ProtocolRegistry {
+    let mut registry = ProtocolRegistry::new();
+    registry.register(Arc::new(WormholeAdapter));
+    registry
 }
 
 /// Parses `SOLANA_BRIDGE_PROGRAMS`: a CSV of `protocol:program_id`.
@@ -207,5 +214,13 @@ mod tests {
         assert!(parse_program_overrides("AAA").is_err());
         assert!(parse_program_overrides("nope:AAA").is_err());
         assert!(parse_program_overrides("wormhole:").is_err());
+    }
+
+    #[test]
+    fn the_default_registry_covers_the_wormhole_token_bridge() {
+        assert_eq!(
+            default_registry().program_ids(),
+            vec![crate::protocols::wormhole::TOKEN_BRIDGE.to_string()]
+        );
     }
 }

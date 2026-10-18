@@ -16,11 +16,11 @@ WormholeScan. The [Roadmap](#roadmap) tracks the move.
 
 | Area | State |
 | --- | --- |
-| Wormhole Token Bridge (WTT) | Outbound decoded from Solana data alone (`protocols::wormhole`). Indexing is still gated on WormholeScan until the adapter is wired (A5). Inbound redeems: A1b |
-| Detection | **Gated on WormholeScan**: a transaction with no WormholeScan operation or VAA yet is retried, then dead-lettered instead of being persisted as `Detected`. Fix is Phase A |
+| Wormhole Token Bridge (WTT) | Outbound is indexed chain-first (`Detected` from Solana data alone, WormholeScan enriches). Inbound redeems: A1b |
+| Detection | **Chain-first for Wormhole outbound (A5).** A transfer decoded from Solana data is persisted as `Detected` with WormholeScan fully unavailable. WormholeScan only enriches. Transactions no adapter recognises (inbound redeems, other Wormhole programs) still go through the WormholeScan-gated path until their adapters land |
 | Domain model and schema | **Generalised (A2).** `bridge_transfers` is identified by `(protocol, message_key)` with `direction`, `via`, raw chain references plus an optional resolved chain, and `NUMERIC(78,0)` amounts. Wormhole fields live in `wormhole_messages`. The pipeline still writes only Wormhole sends out of Solana (A5 wires the adapter) |
 | Chains | Registry tables, loader and the SQL `resolve_chain` function exist. Transfers store the raw `(protocol, id)` and the resolved `chains.id`, or NULL when unknown. The pipeline still uses the hardcoded `ChainId` enum. Moving callers off it is the rest of A3 |
-| Protocol core | `BridgeAdapter` trait, program-ID registry, `compose`, pure `SolanaTx` merged. The **Wormhole Token Bridge adapter decodes outbound transfers** (unit-tested on synthetic txs; golden tests wait for captured fixtures, A9). Inbound redeems are `Unsupported` until A1b. **Not wired into the pipeline yet** |
+| Protocol core | `BridgeAdapter`, `ProtocolRegistry`, `compose`, pure `SolanaTx` and the Wormhole Token Bridge outbound adapter are **wired into `analyse_tx`** through `AppState.protocols`. Inbound redeems (A1b) and the other Wormhole programs (A4) are not decoded yet |golden tests wait for captured fixtures, A9). Inbound redeems are `Unsupported` until A1b. **Not wired into the pipeline yet** |
 | Read path (`/analyse`) | Working, cache-hit throughput measured (see [Results](#results)) |
 | Destination tx resolution | **Broken**: transfers stay `Pending` even when WormholeScan shows them finalized. Fix is Phase 1 |
 | WebSocket ingestion | **Lossy**: misses transactions, no measurement yet. It also runs only while a `/stream` client is connected, so the database is not a complete record. Fix is Phase A (always-on) and Phase 4 (recall) |
@@ -33,7 +33,9 @@ WormholeScan. The [Roadmap](#roadmap) tracks the move.
    Solana data (Helius), never from an explorer. WormholeScan and any other
    protocol API are enrichment only (destination tx, final status). A
    transaction is persisted as `Detected` from on-chain data alone, even when
-   no enrichment exists yet.
+   no enrichment exists yet. Enrichment is cross-checked: a WormholeScan VAA is applied only when its emitter
+   chain, emitter address and sequence match the message decoded on chain, otherwise
+   it is ignored.
 2. **Protocol-agnostic core, per-protocol adapters.** Each adapter declares its
    program IDs, classifies and decodes a Solana transaction into a bridge event
    (or rejects it: many transactions that touch a bridge program are admin or
@@ -116,6 +118,13 @@ Implemented so far (no pipeline wiring yet):
   index finds those rows when a mapping is activated later. An amount that is not a plain
   integer becomes NULL (the full value stays in `analysis`). There is no down migration:
   snapshot the database before deploying.
+* `services::detect` turns adapter output into the API's `BridgeTransfer` with status
+  `Detected`, then `apply_wormholescan` raises it: `Pending` when a matching VAA exists,
+  `Completed` when the destination tx is known. No VAA, a failed WormholeScan call or a
+  VAA for another message leaves the transfer `Detected`. Token symbol and decimals are
+  a best-effort lookup with a 2 s timeout. The upsert never moves a status backwards
+  (`Completed` stays, `Pending` is not overwritten by `Detected`), and the cached
+  analysis follows the same rule.
 
 ## Architecture
 
@@ -266,6 +275,7 @@ bridgeIndexer/
 │   │   ├── analyzer.rs                 # analyse_tx (split into fetch/decode/enrich in Phase 1)
 │   │   ├── correlator.rs
 │   │   ├── token_metadata.rs
+│   │   ├── detect.rs                   # chain-first detection and WormholeScan enrichment (pure)
 │   │   └── read_through.rs             # caches, single-flight, stale-while-revalidate
 │   ├── db/
 │   │   ├── connection.rs
@@ -385,6 +395,9 @@ which has to stay under the configured provider quotas.
 * **Stale data beats a slow answer.** Pending transfers past their freshness
   window are served from Postgres while a background task refreshes them
   through the same limiters.
+* **Enrichment never gates persistence.** A transfer decoded from Solana data is stored
+  as `Detected` even if WormholeScan is down, rate-limited or has no VAA yet, and a status
+  never moves backwards.
 
 ## API
 
@@ -462,6 +475,10 @@ cargo test
   seeds the ten chains, one chain resolves to one key from every namespace, unknown IDs
   are unresolved, `pending_review` mappings resolve only once activated, the database
   rejects unknown status values, and a failed refresh keeps the previous snapshot.
+* Unit tests in `src/services/detect.rs`: transfer mapping, missing metadata, foreign
+  chain namespaces, and enrichment (no VAA, matching VAA, destination tx, VAA for another
+  message). `tests/bridge_transfers_schema.rs` also checks that a later analysis without
+  enrichment does not downgrade a stored status.
 
 ***
 
@@ -510,7 +527,7 @@ only real adapter. Phases B and later add one protocol each.
 * \[x] A2. Generalised domain model and schema: `protocol`, optional `via`, `direction`, source and destination chain references, a protocol-specific message identity with a unique key per protocol, `Detected`/`Pending`/`Completed` plus `Failed`/`Refunded`, `NUMERIC` amounts. `bridge_transfers` (protocol-agnostic) is split from `wormhole_messages`. Existing rows are migrated in place and tested on staged legacy data
 * \[ ] A3. DB-backed chain registry: canonical `chains` table plus a `(protocol, protocol_chain_id) -> chain` mapping table, seeded with the current 10 chains, replacing the `ChainId` enum and `from_wormhole_id`. Unknown IDs are stored as `unresolved(protocol, id)`, never dropped and never a crash. The registry carries the status and provenance needed for the later LLM-proposal upgrade, which is not built in this phase... Done: tables, seed, `load_snapshot`, DB tests (#4), SQL `resolve_chain`, and unresolved IDs persisted on transfers (A2). Remaining: move callers off `ChainId` and `from_wormhole_id`, wire the snapshot refresh task
 * \[ ] A4. All Wormhole programs on Solana, not only the Token Bridge (Token Bridge, NTT and others, each after its program ID and layouts are verified against official docs or source). One `logsSubscribe` per program ID, since `mentions` accepts a single address, with a checkpoint per program. `SOLANA_TOKEN_BRIDGE_PROGRAM` is replaced by a configured list
-* \[ ] A5. Chain-first detection: a transfer is persisted as `Detected` from Helius data alone. WormholeScan becomes an enrichment provider that fills the destination tx and final status afterwards and no longer gates persistence (today `analyse_tx` returns `VaaNotAvailable` and the worker dead-letters)
+* \[ ] A5. Chain-first detection: a transfer is persisted as `Detected` from Helius data alone. WormholeScan is an enrichment that fills the status and no longer gates persistence. Done for Wormhole outbound in `analyse_tx` (`services::detect`), cross-checked against the on-chain message ID. Remaining (A5b): the destination tx fix and moving the WormholeScan lookups into an `enrichment/` provider with a background re-enrichment pass for `Detected` rows. Several transfers per tx are decoded but only the first is stored until the v2 model
 * \[ ] A6. Composition: one transfer per message identity, the outer protocol or router recorded as `via`, and a test that an outer and an underlying adapter seeing the same tx produce one row... Partly done (#3): `compose()` with unit tests. The end-to-end outer+underlying test waits for a second adapter
 * \[ ] A7. Direction: Solana-outbound sends and Solana-inbound redeems both indexed. Outbound decode done for the Token Bridge. Inbound comes with A1b
 * \[ ] A8. Ingestion is always on, in this phase and every later one, and no longer tied to `/stream` clients, so the database is a complete record of what the programs emitted. Helius usage is kept in check by a configurable ingestion budget (limiter, dedupe of repeated signatures, backfill pacing)
@@ -550,7 +567,7 @@ Provider lanes, replay and the decode bench stay in this phase. Items 1a, 1b and
 1d are delivered by Phase A (1a by A1, 1b by A5, 1d by A9).
 
 * \[ ] 1a. Split `analyse_tx` into fetch (IO), decode (pure, no network or state), enrich (IO). Delivered by A1
-* \[ ] 1b. Destination tx resolution: operation payload paths first, then the `global-tx` lookup through the WormholeScan limiter. Delivered by A5, as the WormholeScan enrichment provider
+* \[ ] 1b. Destination tx resolution: operation payload paths first, then the `global-tx` lookup through the WormholeScan limiter. Delivered by A5b, as the WormholeScan enrichment provider
 * \[ ] 1c. Provider lanes: `Lane::Api` and `Lane::Ingest`, each with its own Helius URL (`HELIUS_API_URL`, `HELIUS_STREAM_URL`) and its own limiter. Fall back to `HELIUS_URL` when unset. Today the code has one extra endpoint, `HELIUS_LIVE_URL`, and `AppState::for_live` for the live pipeline. This item replaces it
 * \[ ] 1d. Golden tests per fixture, status matrix test (known tx → `Completed`, none + registered chain → `Pending`, unregistered → `Detected`). Delivered by A9, with the matrix redefined for on-chain-first statuses
 * \[ ] 1e. `src/bin/replay.rs`: take the last N signatures, run the pipeline, compare our status with WormholeScan's `global-tx`

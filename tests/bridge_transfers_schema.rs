@@ -6,7 +6,7 @@ mod common;
 
 use bridge::chains::{ChainRegistry, RawChainRef};
 use bridge::db::repository::persist_transaction;
-use bridge::domain::bridge_transfer::ChainId;
+use bridge::domain::bridge_transfer::{BridgeStatus, ChainId};
 use sqlx::PgPool;
 
 /// The A2 migration. Everything older is the schema existing rows were written under.
@@ -399,4 +399,43 @@ async fn activating_a_mapping_resolves_the_rows_stored_as_unresolved() {
     .await
     .unwrap();
     assert_eq!(resolved, Some(base));
+}
+
+#[tokio::test]
+async fn a_later_analysis_without_enrichment_does_not_downgrade_the_status() {
+    let db = common::test_db().await;
+    let pool = &db.pool;
+
+    // Pending: WormholeScan had the VAA.
+    let pending = common::sample_tx("sig-down", 1, ChainId::Ethereum, Some("1"));
+    persist_transaction(pool, &pending).await.unwrap();
+
+    // Re-analysed while WormholeScan was unavailable: on-chain data only, Detected.
+    let mut detected = pending.clone();
+    detected.bridge_transfer.as_mut().unwrap().status = BridgeStatus::Detected;
+    persist_transaction(pool, &detected).await.unwrap();
+
+    let (status, analysis): (String, serde_json::Value) = sqlx::query_as(
+        "SELECT status, analysis FROM bridge_transfers WHERE observed_tx_hash = 'sig-down'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "Pending");
+    assert_eq!(
+        analysis["bridge_transfer"]["status"], "Pending",
+        "the cached response must not describe an older status than the row"
+    );
+
+    // Detected can still be raised.
+    let mut completed = pending.clone();
+    completed.bridge_transfer.as_mut().unwrap().status = BridgeStatus::Completed;
+    persist_transaction(pool, &completed).await.unwrap();
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM bridge_transfers WHERE observed_tx_hash = 'sig-down'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "Completed");
 }
