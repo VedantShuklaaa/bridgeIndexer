@@ -1,5 +1,6 @@
 use crate::chain_adapters::registry::AdapterRegistry;
 use crate::config::AppConfig;
+use crate::protocols::registry::{ProtocolRegistry, default_registry};
 use crate::services::read_through::ReadThrough;
 use governor::{
     Quota, RateLimiter,
@@ -21,6 +22,7 @@ pub struct AppState {
     pub http_client: Client,
     pub config: AppConfig,
     pub registry: Arc<AdapterRegistry>,
+    pub protocols: Arc<ProtocolRegistry>,
     pub tx_broadcast: broadcast::Sender<String>,
     /// Number of connected `/stream` clients. Live ingestion only runs while this is above zero.
     pub live_clients: Arc<watch::Sender<usize>>,
@@ -45,6 +47,7 @@ impl AppState {
             http_client,
             config,
             registry: Arc::new(registry),
+            protocols: Arc::new(default_registry()),
             tx_broadcast,
             live_clients: Arc::new(live_clients),
             read_through,

@@ -93,9 +93,11 @@ async fn persist_bridge_transfer(
             token_symbol = COALESCE(EXCLUDED.token_symbol, bridge_transfers.token_symbol),
             amount_formatted = COALESCE(EXCLUDED.amount_formatted, bridge_transfers.amount_formatted),
             status = CASE WHEN bridge_transfers.status = 'Completed'
-                          THEN 'Completed' ELSE EXCLUDED.status END,
+                            OR (bridge_transfers.status = 'Pending' AND EXCLUDED.status = 'Detected')
+                          THEN bridge_transfers.status ELSE EXCLUDED.status END,
             -- only replace the cached response if it describes the same observed tx
             analysis = CASE WHEN bridge_transfers.observed_tx_hash = EXCLUDED.observed_tx_hash
+                             AND NOT (bridge_transfers.status = 'Pending' AND EXCLUDED.status = 'Detected')
                             THEN EXCLUDED.analysis ELSE bridge_transfers.analysis END,
             updated_at = NOW()
         RETURNING id
