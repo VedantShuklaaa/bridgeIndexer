@@ -18,8 +18,8 @@ WormholeScan. The [Roadmap](#roadmap) tracks the move.
 | --- | --- |
 | Wormhole Token Bridge (WTT) | Outbound decoded from Solana data alone (`protocols::wormhole`). Indexing is still gated on WormholeScan until the adapter is wired (A5). Inbound redeems: A1b |
 | Detection | **Gated on WormholeScan**: a transaction with no WormholeScan operation or VAA yet is retried, then dead-lettered instead of being persisted as `Detected`. Fix is Phase A |
-| Domain model and schema | Types exist (`protocols::{Protocol, MessageId, Direction, DetectedTransfer, Reject}`, `RawAmount`), but the `bridge_transfers` table is still **Wormhole-shaped**: `emitter_*` and `sequence` are `NOT NULL` and `UNIQUE`, so no other protocol can be stored. The migration lands in A2 |
-| Chains | **Registry tables and loader exist** (`chains`, `protocol_chain_ids`, seeded with 10 chains, loaded by `chains::db`). The pipeline still uses the hardcoded `ChainId` enum. Wiring is the rest of A3 |
+| Domain model and schema | **Generalised (A2).** `bridge_transfers` is identified by `(protocol, message_key)` with `direction`, `via`, raw chain references plus an optional resolved chain, and `NUMERIC(78,0)` amounts. Wormhole fields live in `wormhole_messages`. The pipeline still writes only Wormhole sends out of Solana (A5 wires the adapter) |
+| Chains | Registry tables, loader and the SQL `resolve_chain` function exist. Transfers store the raw `(protocol, id)` and the resolved `chains.id`, or NULL when unknown. The pipeline still uses the hardcoded `ChainId` enum. Moving callers off it is the rest of A3 |
 | Protocol core | `BridgeAdapter` trait, program-ID registry, `compose`, pure `SolanaTx` merged. The **Wormhole Token Bridge adapter decodes outbound transfers** (unit-tested on synthetic txs; golden tests wait for captured fixtures, A9). Inbound redeems are `Unsupported` until A1b. **Not wired into the pipeline yet** |
 | Read path (`/analyse`) | Working, cache-hit throughput measured (see [Results](#results)) |
 | Destination tx resolution | **Broken**: transfers stay `Pending` even when WormholeScan shows them finalized. Fix is Phase 1 |
@@ -64,7 +64,9 @@ WormholeScan. The [Roadmap](#roadmap) tracks the move.
   `Detected`, `Pending`, `Completed`, plus `Failed`/`Refunded` where a protocol
   needs them.
 * Storage is split into a protocol-agnostic `bridge_transfers` table and one
-  detail table per protocol (for example `wormhole_messages`).
+  detail table per protocol (`wormhole_messages` today). A transfer's identity is
+  `UNIQUE (protocol, message_key)`. `observed_tx_hash` is the Solana tx it was decoded
+  from and `event_index` its position there, so one tx can hold several transfers.
 * Chains live in a DB-backed registry: a canonical `chains` table plus a
   `(protocol, protocol_chain_id) -> chain` mapping table, because every protocol
   numbers chains differently (Wormhole chain IDs, CCTP domains, LayerZero
@@ -106,6 +108,14 @@ Implemented so far (no pipeline wiring yet):
   reason, never guessed. The amount is the VAA amount (at most 8 decimals).
   Program IDs are from Wormhole's contract address reference, instruction indexes
   and layouts from `solana/modules/token_bridge` and `solana/bridge`.
+* The A2 migration (`20261018120000_generalise_bridge_transfers.sql`) rewrites existing
+  rows in place: every legacy row becomes `protocol = 'wormhole'`, `direction = 'Outbound'`,
+  with the same message key `MessageId::key()` builds. Chains are stored as the protocol's
+  raw reference (`*_ref_protocol`, `*_ref_id`) plus `*_chain_id`, which `resolve_chain()`
+  fills when the registry knows the chain. An unknown ID stays unresolved, and a partial
+  index finds those rows when a mapping is activated later. An amount that is not a plain
+  integer becomes NULL (the full value stays in `analysis`). There is no down migration:
+  snapshot the database before deploying.
 
 ## Architecture
 
@@ -199,8 +209,9 @@ bridgeIndexer/
 │   ├── 20260912071405_create_bridge_transfers.sql
 │   ├── 20260912162718_create_indexer_state.sql
 │   ├── 20260912232059_fix_indexer_state_key_name.sql
-│   └── 20261002150000_analysis_and_read_indexes.sql
+│   ├── 20261002150000_analysis_and_read_indexes.sql
 │   ├── 20261017090000_chain_registry.sql
+│   └── 20261018120000_generalise_bridge_transfers.sql
 ├── scripts/
 │   └── capture_fixtures.sh             # save Helius + WormholeScan fixtures (Phase 0)
 ├── src/
@@ -276,6 +287,7 @@ bridgeIndexer/
 │   ├── fixtures_decode.rs              # decoders over captured fixtures (Phase 0)
 │   ├── persistence_idempotency.rs      # testcontainers Postgres
 │   └── fixtures/                       # helius_<name>.json, wormhole_<name>.json (none captured yet)
+│   ├── bridge_transfers_schema.rs      # A2 schema and migration of existing rows (needs Docker)
 ├── benches/                            # (planned) criterion: pure decode (Phase 1)
 ├── .env.example                        # (Phase 0)
 ├── .dockerignore
@@ -354,9 +366,8 @@ which has to stay under the configured provider quotas.
 
 * **At-least-once processing, exactly-once persistence.** Redis Streams
   guarantees at-least-once delivery; Postgres upserts on `hash` and
-  `(emitter_chain, emitter_address, sequence)` absorb redelivery, so a crash
-  mid-batch can never double-write. (After Phase A the transfer key is
-  `(protocol, message_key)`, so the same guarantee holds for every protocol.)
+  `(protocol, message_key)` absorb redelivery, so a crash mid-batch can never
+  double-write, for every protocol.
 * **Dead-letter queue.** Transactions that fail analysis or persistence after
   retries move to `bridge:transactions:failed` instead of blocking the stream
   or being silently dropped.
@@ -419,6 +430,7 @@ Config notes:
   setting `config.rs` reads. `protocols::registry` already has a parser for
   `SOLANA_BRIDGE_PROGRAMS` (a `protocol:program_id` CSV), but nothing reads that
   variable yet. A4 wires it and retires the single-address setting.
+* The database is Postgres 18. Tests and CI run against 18, not older.
 
 ## Testing
 
@@ -431,10 +443,16 @@ cargo test
 * `tests/fixtures_decode.rs` — runs the pure decoders over real captured
   provider responses in `tests/fixtures/`. Capture new ones with
   `scripts/capture_fixtures.sh`.
-* `tests/persistence_idempotency.rs` — spins up a real Postgres container
-  (via `testcontainers`, needs Docker) and asserts that redelivering the same
-  transaction — the scenario `XAUTOCLAIM` recovery guarantees will happen —
-  never produces a duplicate row.
+* `tests/persistence_idempotency.rs` — real Postgres 18 container (via `testcontainers`,
+  needs Docker): redelivering the same transaction, the scenario `XAUTOCLAIM` recovery
+  guarantees will happen, never produces a duplicate row in `transactions`,
+  `bridge_transfers` or `wormhole_messages`.
+* `tests/bridge_transfers_schema.rs` — the A2 schema on Postgres 18: legacy rows are
+  staged under the old schema and migrated (known and unknown chains, `u128::MAX`,
+  non-integer amounts, analysis kept), new writes land in the protocol-agnostic shape,
+  several transfers share one observed tx, the database rejects bad `direction` and
+  `status`, and SQL `resolve_chain` agrees with the Rust registry. Set
+  `TEST_DATABASE_URL` to use a server you already run instead of Docker.
 * Unit tests inside `src/protocols/*` and `src/chains/mod.rs`: routing on inner calls,
   override parsing, compose merging, "only active rows resolve", and the Wormhole
   adapter (outbound decode, with-payload, router-made calls, several transfers per tx,
@@ -489,8 +507,8 @@ only real adapter. Phases B and later add one protocol each.
 ### Phase A — protocol-agnostic core, Wormhole only
 
 * \[ ] A1. Adapter trait and registry: each adapter declares its program IDs and classifies/decodes a Solana tx into a bridge event, or rejects it with a reason. Decode is pure (no network, no state). Modelled on the existing `chain_adapters` registry. Done: `BridgeAdapter`, `ProtocolRegistry`, pure `SolanaTx` (#3), Wormhole Token Bridge outbound decode. Remaining: A1b inbound redeems (needs the posted VAA account read, so an account preload on `SolanaTx`), and wiring into the worker
-* \[ ] A2. Generalised domain model and schema: `protocol`, optional `via`, `direction`, source and destination chain references, a protocol-specific message identity with a unique key per protocol, statuses `Detected`/`Pending`/`Completed` plus `Failed`/`Refunded` where needed. Split `bridge_transfers` (protocol-agnostic) from per-protocol detail tables (`wormhole_messages` first). Migration of existing rows... Types done (#3): `MessageId`, `DetectedTransfer`, `RawAmount`. No `bridge_transfers` migration yet
-* \[ ] A3. DB-backed chain registry: canonical `chains` table plus a `(protocol, protocol_chain_id) -> chain` mapping table, seeded with the current 10 chains, replacing the `ChainId` enum and `from_wormhole_id`. Unknown IDs are stored as `unresolved(protocol, id)`, never dropped and never a crash. The registry carries the status and provenance needed for the later LLM-proposal upgrade, which is not built in this phase... Partly done (#4): tables, seed, `load_snapshot`, DB tests. Remaining: move callers off `ChainId` and `from_wormhole_id`, a snapshot refresh task, persisting `unresolved` on transfers
+* \[x] A2. Generalised domain model and schema: `protocol`, optional `via`, `direction`, source and destination chain references, a protocol-specific message identity with a unique key per protocol, `Detected`/`Pending`/`Completed` plus `Failed`/`Refunded`, `NUMERIC` amounts. `bridge_transfers` (protocol-agnostic) is split from `wormhole_messages`. Existing rows are migrated in place and tested on staged legacy data
+* \[ ] A3. DB-backed chain registry: canonical `chains` table plus a `(protocol, protocol_chain_id) -> chain` mapping table, seeded with the current 10 chains, replacing the `ChainId` enum and `from_wormhole_id`. Unknown IDs are stored as `unresolved(protocol, id)`, never dropped and never a crash. The registry carries the status and provenance needed for the later LLM-proposal upgrade, which is not built in this phase... Done: tables, seed, `load_snapshot`, DB tests (#4), SQL `resolve_chain`, and unresolved IDs persisted on transfers (A2). Remaining: move callers off `ChainId` and `from_wormhole_id`, wire the snapshot refresh task
 * \[ ] A4. All Wormhole programs on Solana, not only the Token Bridge (Token Bridge, NTT and others, each after its program ID and layouts are verified against official docs or source). One `logsSubscribe` per program ID, since `mentions` accepts a single address, with a checkpoint per program. `SOLANA_TOKEN_BRIDGE_PROGRAM` is replaced by a configured list
 * \[ ] A5. Chain-first detection: a transfer is persisted as `Detected` from Helius data alone. WormholeScan becomes an enrichment provider that fills the destination tx and final status afterwards and no longer gates persistence (today `analyse_tx` returns `VaaNotAvailable` and the worker dead-letters)
 * \[ ] A6. Composition: one transfer per message identity, the outer protocol or router recorded as `via`, and a test that an outer and an underlying adapter seeing the same tx produce one row... Partly done (#3): `compose()` with unit tests. The end-to-end outer+underlying test waits for a second adapter
@@ -500,7 +518,7 @@ only real adapter. Phases B and later add one protocol each.
 * \[ ] A10. API versioning: `/api/v2` serves the generalised model (protocol, direction, via, chain references, all transfers of a tx). `/api/v1` keeps its current Wormhole-shaped response through a compatibility mapper until it is retired. Amounts are stored as `NUMERIC` so volume can be aggregated
 
 Benchmarks: classification precision on the fixture set; pure classify ns/op (criterion).
-Exit: Wormhole transfers are persisted as `Detected` with WormholeScan fully unavailable; every non-transfer fixture is rejected with a reason; the migration is idempotent and tested on a copy of existing rows.
+Exit: Wormhole transfers are persisted as `Detected` with WormholeScan fully unavailable; every non-transfer fixture is rejected with a reason; the migration is tested on staged existing rows (done in A2).
 
 ### Phase B and later — one protocol per phase
 
