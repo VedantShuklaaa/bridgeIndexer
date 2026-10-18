@@ -55,13 +55,9 @@ impl ChainAdapter for WormholeScanAdapter {
         }
 
         let payload: Value = resp.json().await?;
-        let tx_hash = payload
-            .get("destinationTx")
-            .and_then(|d| d.get("txHash"))
-            .and_then(Value::as_str);
-
-        Ok(tx_hash.map(|h| DestinationTxInfo {
-            tx_hash: h.to_string(),
-        }))
+        Ok(
+            crate::clients::wormhole::destination_tx_from_global_tx(&payload)
+                .map(|tx_hash| DestinationTxInfo { tx_hash }),
+        )
     }
 }

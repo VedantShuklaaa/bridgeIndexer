@@ -1,6 +1,6 @@
 use crate::clients::limiter::call_upstream;
 use crate::clients::{helius, wormhole};
-use crate::domain::bridge_transfer::BridgeMessageId;
+use crate::domain::bridge_transfer::{BridgeMessageId, BridgeStatus};
 use crate::domain::transaction::NormalisedTransaction;
 use crate::error::AppError;
 use crate::normaliser;
@@ -77,6 +77,14 @@ pub async fn analyse_tx(
                 Ok(wh_raw) => match detect::apply_wormholescan(&mut transfer, wh_raw) {
                     Enrichment::Applied => {
                         tx.bridge_event = normaliser::wormhole::normalise(wh_raw.clone()).ok();
+                        // VAA matched but /operations carried no destination tx:
+                        // ask global-tx, keyed by the on-chain message id.
+                        if matches!(transfer.status, BridgeStatus::Pending)
+                            && let Some(hash) =
+                                global_tx_destination(state, &transfer.message_id).await
+                        {
+                            detect::apply_destination_tx(&mut transfer, &hash);
+                        }
                     }
                     outcome => {
                         tracing::debug!(signature = %hash, ?outcome, "wormholescan not applied")
@@ -166,12 +174,11 @@ pub async fn analyse_tx(
                 .flatten()
                 .or_else(|| extract_wormholescan_field(&wh_raw, "toAddress"));
 
-            let known_destination_tx: Option<String> = wh_raw
-                .get("globalTx")
-                .and_then(|g| g.get("destinationTx"))
-                .and_then(|d| d.get("txHash"))
-                .and_then(|h| h.as_str())
-                .map(String::from);
+            let known_destination_tx: Option<String> =
+                match detect::destination_tx_from_operation(&wh_raw) {
+                    Some(hash) => Some(hash),
+                    None => global_tx_destination(state, &message_id).await,
+                };
 
             let t_corr = std::time::Instant::now();
             let correlated = correlator::correlate(
@@ -217,6 +224,18 @@ fn extract_wormholescan_field(raw: &Value, field: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(String::from)
+}
+
+/// Best-effort `global-tx` lookup through the WormholeScan limiter. A failure is
+/// logged and treated as "not known yet", it never fails the analysis.
+async fn global_tx_destination(state: &AppState, id: &BridgeMessageId) -> Option<String> {
+    call_upstream(&state.wormhole_limiter, || {
+        wormhole::get_destination_tx(&state.http_client, &state.config.wormhole_url, id)
+    })
+    .await
+    .inspect_err(|error| tracing::debug!(%error, "global-tx lookup failed"))
+    .ok()
+    .flatten()
 }
 
 /// The normalised tx, plus the pure `SolanaTx` view adapters read (`None` if the raw
