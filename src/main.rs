@@ -1,6 +1,7 @@
 use bridge::chain_adapters::setup::build_registry;
 use bridge::config::AppConfig;
 use bridge::db;
+use bridge::enrichment::reenrich;
 use bridge::ingestion::on_demand::run_on_demand;
 use bridge::ingestion::solana::SolanaIngester;
 use bridge::redis::consumer::RedisConsumer;
@@ -121,6 +122,18 @@ async fn main() -> anyhow::Result<()> {
                 .run_recovery()
                 .await
             }
+        });
+    }
+
+    if config.reenrich.enabled {
+        let reenrich_state = state.clone();
+        let reenrich_shutdown = shutdown.clone();
+
+        spawn_supervised("reenrichment", shutdown.clone(), move || {
+            let reenrich_state = reenrich_state.clone();
+            let reenrich_shutdown = reenrich_shutdown.clone();
+
+            async move { reenrich::run(reenrich_state, reenrich_shutdown).await }
         });
     }
 

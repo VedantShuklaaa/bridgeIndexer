@@ -1,0 +1,278 @@
+//! Background re-enrichment. A transfer is almost always `Detected` or `Pending` when it
+//! is first seen, because the VAA or the destination tx does not exist yet. Without this
+//! pass only a user calling `/analyse` moves it forward, so rows nobody asks about would
+//! stay stale. Each pass picks open rows that are old enough, asks the enrichment
+//! provider again and persists the result.
+//!
+//! `updated_at` doubles as the last-attempt marker: every answered attempt is persisted,
+//! which bumps it, so a row is not asked again before `retry_secs` have passed. An
+//! attempt where the provider was unreachable persists nothing and the row stays first
+//! in line. The upsert never moves a status backwards.
+
+use super::{EnrichInput, EnrichOutcome, Enriched, Prefetch};
+use crate::config::ReenrichConfig;
+use crate::db::repository::{list_open_transfers, persist_transaction};
+use crate::domain::bridge_transfer::{BridgeStatus, BridgeTransfer};
+use crate::domain::transaction::NormalisedTransaction;
+use crate::state::AppState;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+
+/// Stop a pass early after this many provider outages in a row: it is down or
+/// rate-limited, and asking for more rows only burns the limiter.
+const MAX_UNAVAILABLE_STREAK: u32 = 3;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PassStats {
+    pub advanced: u32,
+    pub unchanged: u32,
+    pub unavailable: u32,
+    pub failed: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Step {
+    Advanced,
+    Unchanged,
+    Unavailable,
+}
+
+fn rank(status: &BridgeStatus) -> u8 {
+    match status {
+        BridgeStatus::Detected => 0,
+        BridgeStatus::Pending => 1,
+        BridgeStatus::Completed => 2,
+    }
+}
+
+/// Puts the enriched transfer (and event) back into the transaction. Returns what the
+/// attempt achieved. Pure, so the persistence decision is testable without a database.
+fn settle(
+    tx: &mut NormalisedTransaction,
+    transfer: BridgeTransfer,
+    status_before: u8,
+    enriched: Enriched,
+) -> Step {
+    let step = if enriched.outcome == EnrichOutcome::Unavailable {
+        Step::Unavailable
+    } else if rank(&transfer.status) > status_before {
+        Step::Advanced
+    } else {
+        Step::Unchanged
+    };
+    if step != Step::Unavailable
+        && let Some(event) = enriched.bridge_event
+    {
+        tx.bridge_event = Some(event);
+    }
+    tx.bridge_transfer = Some(transfer);
+    step
+}
+
+async fn reenrich_one(
+    state: &AppState,
+    observed_tx_hash: &str,
+    analysis: serde_json::Value,
+) -> anyhow::Result<Step> {
+    let mut tx: NormalisedTransaction = serde_json::from_value(analysis)?;
+    let Some(mut transfer) = tx.bridge_transfer.take() else {
+        return Ok(Step::Unchanged);
+    };
+
+    let status_before = rank(&transfer.status);
+    let enriched = state
+        .enrichment
+        .enrich(
+            EnrichInput {
+                source_tx_hash: observed_tx_hash,
+                prefetch: Prefetch::None,
+            },
+            &mut transfer,
+        )
+        .await;
+
+    let step = settle(&mut tx, transfer, status_before, enriched);
+    if step != Step::Unavailable {
+        persist_transaction(&state.db, &tx).await?;
+    }
+    Ok(step)
+}
+
+/// One pass over the open rows that are due.
+pub async fn run_pass(
+    state: &AppState,
+    cfg: &ReenrichConfig,
+    shutdown: &CancellationToken,
+) -> anyhow::Result<PassStats> {
+    let rows = list_open_transfers(
+        &state.db,
+        cfg.min_age_secs,
+        cfg.max_age_secs,
+        cfg.retry_secs,
+        cfg.batch,
+    )
+    .await?;
+
+    let mut stats = PassStats::default();
+    let mut unavailable_streak = 0;
+
+    for row in rows {
+        if shutdown.is_cancelled() {
+            break;
+        }
+        match reenrich_one(state, &row.observed_tx_hash, row.analysis).await {
+            Ok(Step::Advanced) => {
+                stats.advanced += 1;
+                unavailable_streak = 0;
+            }
+            Ok(Step::Unchanged) => {
+                stats.unchanged += 1;
+                unavailable_streak = 0;
+            }
+            Ok(Step::Unavailable) => {
+                stats.unavailable += 1;
+                unavailable_streak += 1;
+                if unavailable_streak >= MAX_UNAVAILABLE_STREAK {
+                    tracing::warn!(
+                        provider = state.enrichment.name(),
+                        "provider unavailable, ending the pass early"
+                    );
+                    break;
+                }
+            }
+            Err(error) => {
+                stats.failed += 1;
+                tracing::warn!(signature = %row.observed_tx_hash, %error, "re-enrichment failed");
+            }
+        }
+    }
+    Ok(stats)
+}
+
+/// Runs a pass every `interval_secs` until shutdown. A database error ends one pass,
+/// not the worker.
+pub async fn run(state: AppState, shutdown: CancellationToken) -> anyhow::Result<()> {
+    let cfg = state.config.reenrich.clone();
+    tracing::info!(?cfg, "re-enrichment worker started");
+
+    let mut ticker = tokio::time::interval(Duration::from_secs(cfg.interval_secs));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return Ok(()),
+            _ = ticker.tick() => {}
+        }
+
+        match run_pass(&state, &cfg, &shutdown).await {
+            Ok(stats) if stats != PassStats::default() => {
+                tracing::info!(
+                    advanced = stats.advanced,
+                    unchanged = stats.unchanged,
+                    unavailable = stats.unavailable,
+                    failed = stats.failed,
+                    "re-enrichment pass"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => tracing::error!(%error, "re-enrichment pass failed"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::bridge_transfer::{BridgeMessageId, ChainId};
+    use crate::domain::transaction::{Chain, TxStatus};
+
+    fn tx() -> NormalisedTransaction {
+        NormalisedTransaction {
+            hash: "sig".into(),
+            chain: Chain::Solana,
+            status: TxStatus::Success,
+            slot: 1,
+            timestamp: None,
+            fee_lamports: 0,
+            signer: None,
+            bridge_event: None,
+            bridge_transfer: None,
+        }
+    }
+
+    fn transfer(status: BridgeStatus) -> BridgeTransfer {
+        BridgeTransfer {
+            source_chain: ChainId::Solana,
+            source_tx_hash: "sig".into(),
+            source_wallet: None,
+            source_explorer_url: None,
+            destination_chain: ChainId::Ethereum,
+            destination_wallet: None,
+            destination_tx_hash: None,
+            destination_explorer_url: None,
+            token: None,
+            token_symbol: None,
+            amount: None,
+            amount_formatted: None,
+            message_id: BridgeMessageId {
+                emitter_chain: 1,
+                emitter_address: "09".repeat(32),
+                sequence: 42,
+            },
+            status,
+        }
+    }
+
+    #[test]
+    fn a_status_that_rose_is_advanced_and_stored() {
+        let mut t = tx();
+        let step = settle(
+            &mut t,
+            transfer(BridgeStatus::Completed),
+            rank(&BridgeStatus::Pending),
+            Enriched::of(EnrichOutcome::Applied),
+        );
+        assert_eq!(step, Step::Advanced);
+        assert!(matches!(
+            t.bridge_transfer.unwrap().status,
+            BridgeStatus::Completed
+        ));
+    }
+
+    #[test]
+    fn an_answered_attempt_without_progress_is_unchanged_but_still_persisted() {
+        for outcome in [
+            EnrichOutcome::NoVaa,
+            EnrichOutcome::Mismatch,
+            EnrichOutcome::Applied,
+        ] {
+            let mut t = tx();
+            let step = settle(
+                &mut t,
+                transfer(BridgeStatus::Pending),
+                rank(&BridgeStatus::Pending),
+                Enriched::of(outcome),
+            );
+            assert_eq!(step, Step::Unchanged);
+            assert!(t.bridge_transfer.is_some());
+        }
+    }
+
+    #[test]
+    fn an_unreachable_provider_is_not_an_answer() {
+        let mut t = tx();
+        let step = settle(
+            &mut t,
+            transfer(BridgeStatus::Detected),
+            rank(&BridgeStatus::Detected),
+            Enriched::of(EnrichOutcome::Unavailable),
+        );
+        assert_eq!(step, Step::Unavailable);
+    }
+
+    #[test]
+    fn ranks_follow_the_status_order() {
+        assert!(rank(&BridgeStatus::Detected) < rank(&BridgeStatus::Pending));
+        assert!(rank(&BridgeStatus::Pending) < rank(&BridgeStatus::Completed));
+    }
+}

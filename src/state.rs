@@ -1,5 +1,7 @@
 use crate::chain_adapters::registry::AdapterRegistry;
 use crate::config::AppConfig;
+use crate::enrichment::EnrichmentProvider;
+use crate::enrichment::wormholescan::WormholeScanProvider;
 use crate::protocols::registry::{ProtocolRegistry, default_registry};
 use crate::services::read_through::ReadThrough;
 use governor::{
@@ -29,6 +31,7 @@ pub struct AppState {
     pub read_through: Arc<ReadThrough>,
     pub helius_limiter: Arc<Limiter>,
     pub wormhole_limiter: Arc<Limiter>,
+    pub enrichment: Arc<dyn EnrichmentProvider>,
 }
 
 impl AppState {
@@ -41,6 +44,14 @@ impl AppState {
         let (tx_broadcast, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (live_clients, _) = watch::channel(0usize);
         let read_through = Arc::new(ReadThrough::new(16));
+        let wormhole_limiter: Arc<Limiter> = Arc::new(RateLimiter::direct(Quota::per_second(
+            NonZeroU32::new(20).unwrap(),
+        )));
+        let enrichment = Arc::new(WormholeScanProvider::new(
+            http_client.clone(),
+            config.wormhole_url.clone(),
+            wormhole_limiter.clone(),
+        ));
 
         Ok(Self {
             db,
@@ -54,9 +65,8 @@ impl AppState {
             helius_limiter: Arc::new(RateLimiter::direct(Quota::per_second(
                 NonZeroU32::new(40).unwrap(),
             ))),
-            wormhole_limiter: Arc::new(RateLimiter::direct(Quota::per_second(
-                NonZeroU32::new(20).unwrap(),
-            ))),
+            wormhole_limiter,
+            enrichment,
         })
     }
 

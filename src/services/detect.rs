@@ -127,7 +127,10 @@ pub fn apply_wormholescan(transfer: &mut BridgeTransfer, wh_raw: &Value) -> Enri
         return Enrichment::Mismatch;
     }
 
-    transfer.status = BridgeStatus::Pending;
+    // Only raise: a transfer that is already `Pending` or `Completed` keeps its status.
+    if matches!(transfer.status, BridgeStatus::Detected) {
+        transfer.status = BridgeStatus::Pending;
+    }
 
     if let Some(hash) = destination_tx_from_operation(wh_raw) {
         apply_destination_tx(transfer, &hash);
@@ -388,5 +391,14 @@ mod tests {
         t.status = BridgeStatus::Pending;
         assert!(!apply_destination_tx(&mut t, "  "));
         assert!(matches!(t.status, BridgeStatus::Pending));
+    }
+
+    #[test]
+    fn a_matching_vaa_never_lowers_a_higher_status() {
+        let raw = json!({"vaa": {"raw": vaa_b64(1, [9; 32], 42)}});
+        let mut t = transfer();
+        t.status = BridgeStatus::Completed;
+        assert_eq!(apply_wormholescan(&mut t, &raw), Enrichment::Applied);
+        assert!(matches!(t.status, BridgeStatus::Completed));
     }
 }
