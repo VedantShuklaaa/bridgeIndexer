@@ -374,7 +374,7 @@ which has to stay under the configured provider quotas.
 | Freshness window for non-Completed rows | `FRESH_SECS` in `services/read_through.rs` | 60 s |
 | Max background refreshes | `MAX_BACKGROUND_REFRESHES` in `services/read_through.rs` | 8 |
 | Cache TTLs and capacities | `ReadThrough::new` | see table above |
-| Provider quotas | `AppState::new` (`helius_limiter`, `wormhole_limiter`) | 40/s and 20/s, set these just under your plan limits |
+| Provider quotas | `HELIUS_API_RPS`, `HELIUS_LIVE_RPS` in `state.rs`, `wormhole_limiter` in `AppState::new` | Helius 6/s (API) + 4/s (live) to fit the free plan's 10/s on one shared key, WormholeScan 20/s. Raise them when you upgrade or split keys (Phase 2) |
 
 ## Reliability properties
 
@@ -711,7 +711,7 @@ transactions, 1.2 KiB responses.
 What these do and don't mean:
 
 * Cache-hit throughput is a lower bound: at 200 connections the load generator was CPU-bound, so the server's ceiling hasn't been measured.
-* Uncached transactions are limited by the providers. With the default quotas (40/s Helius, 20/s WormholeScan) that is roughly 20 new lookups per second; overflow gets a 503 after 2 s.
+* Uncached transactions are limited by the providers. With the default quotas (6/s Helius for the API, 20/s WormholeScan) that is roughly 6 new lookups per second on the free plan; overflow gets a 503 after 2 s.
 * There is a cluster of 33–45 ms requests that hasn't been explained yet.
 * The cache lives in one process, so several instances would each refresh their own copies.
 

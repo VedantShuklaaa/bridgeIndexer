@@ -16,6 +16,12 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 
 const BROADCAST_CAPACITY: usize = 1024;
+
+/// Helius free plan: 10 requests/sec per key. The API and the live pipeline share one key
+/// until Phase 2 gives each its own, so the two quotas must add up to the plan limit.
+const HELIUS_API_RPS: u32 = 6;
+const HELIUS_LIVE_RPS: u32 = 4;
+
 pub type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
 #[derive(Clone)]
@@ -63,7 +69,7 @@ impl AppState {
             live_clients: Arc::new(live_clients),
             read_through,
             helius_limiter: Arc::new(RateLimiter::direct(Quota::per_second(
-                NonZeroU32::new(40).unwrap(),
+                NonZeroU32::new(HELIUS_API_RPS).unwrap(),
             ))),
             wormhole_limiter,
             enrichment,
@@ -79,7 +85,7 @@ impl AppState {
             config,
             registry: Arc::new(registry),
             helius_limiter: Arc::new(RateLimiter::direct(Quota::per_second(
-                NonZeroU32::new(40).unwrap(),
+                NonZeroU32::new(HELIUS_LIVE_RPS).unwrap(),
             ))),
             ..self.clone()
         }
