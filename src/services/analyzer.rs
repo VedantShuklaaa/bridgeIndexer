@@ -1,12 +1,13 @@
 use crate::clients::limiter::call_upstream;
 use crate::clients::{helius, wormhole};
-use crate::domain::bridge_transfer::{BridgeMessageId, BridgeStatus};
+use crate::domain::bridge_transfer::BridgeMessageId;
 use crate::domain::transaction::NormalisedTransaction;
+use crate::enrichment::{EnrichInput, EnrichOutcome, Prefetch};
 use crate::error::AppError;
 use crate::normaliser;
 use crate::protocols::SolanaTx;
 use crate::services::correlator;
-use crate::services::detect::{self, Enrichment};
+use crate::services::detect;
 use crate::services::token_metadata::resolve_token_metadata;
 use crate::state::AppState;
 use crate::vaa::decode::{decode_destination_address, decode_vaa};
@@ -73,28 +74,19 @@ pub async fn analyse_tx(
             };
 
             let mut transfer = detect::to_bridge_transfer(first, metadata)?;
-            match &wormhole_result {
-                Ok(wh_raw) => match detect::apply_wormholescan(&mut transfer, wh_raw) {
-                    Enrichment::Applied => {
-                        tx.bridge_event = normaliser::wormhole::normalise(wh_raw.clone()).ok();
-                        // VAA matched but /operations carried no destination tx:
-                        // ask global-tx, keyed by the on-chain message id.
-                        if matches!(transfer.status, BridgeStatus::Pending)
-                            && let Some(hash) =
-                                global_tx_destination(state, &transfer.message_id).await
-                        {
-                            detect::apply_destination_tx(&mut transfer, &hash);
-                        }
-                    }
-                    outcome => {
-                        tracing::debug!(signature = %hash, ?outcome, "wormholescan not applied")
-                    }
-                },
-                Err(error) => {
-                    tracing::debug!(signature = %hash, %error, "wormholescan unavailable, keeping on-chain data")
-                }
+            let enriched = state
+                .enrichment
+                .enrich(
+                    EnrichInput {
+                        source_tx_hash: hash,
+                        prefetch: Prefetch::Done(wormhole_result.as_ref()),
+                    },
+                    &mut transfer,
+                )
+                .await;
+            if enriched.outcome == EnrichOutcome::Applied {
+                tx.bridge_event = enriched.bridge_event;
             }
-            tx.bridge_transfer = Some(transfer);
 
             tracing::info!(
                 total_ms = t_total.elapsed().as_millis() as u64,
@@ -177,7 +169,7 @@ pub async fn analyse_tx(
             let known_destination_tx: Option<String> =
                 match detect::destination_tx_from_operation(&wh_raw) {
                     Some(hash) => Some(hash),
-                    None => global_tx_destination(state, &message_id).await,
+                    None => state.enrichment.destination_tx(&message_id).await,
                 };
 
             let t_corr = std::time::Instant::now();
@@ -224,18 +216,6 @@ fn extract_wormholescan_field(raw: &Value, field: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(String::from)
-}
-
-/// Best-effort `global-tx` lookup through the WormholeScan limiter. A failure is
-/// logged and treated as "not known yet", it never fails the analysis.
-async fn global_tx_destination(state: &AppState, id: &BridgeMessageId) -> Option<String> {
-    call_upstream(&state.wormhole_limiter, || {
-        wormhole::get_destination_tx(&state.http_client, &state.config.wormhole_url, id)
-    })
-    .await
-    .inspect_err(|error| tracing::debug!(%error, "global-tx lookup failed"))
-    .ok()
-    .flatten()
 }
 
 /// The normalised tx, plus the pure `SolanaTx` view adapters read (`None` if the raw

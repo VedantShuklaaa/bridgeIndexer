@@ -183,6 +183,52 @@ pub async fn get_cached_analysis(pool: &PgPool, hash: &str) -> Result<Option<ser
     .await?)
 }
 
+/// An open (`Detected` or `Pending`) transfer due for another enrichment attempt.
+pub struct OpenTransfer {
+    pub observed_tx_hash: String,
+    pub analysis: serde_json::Value,
+}
+
+/// Open transfers that are old enough to leave to enrichment (`min_age_secs` since they
+/// were created), young enough to still be worth asking about (`max_age_secs`) and not
+/// attempted in the last `retry_secs`. Least recently attempted first. Served by
+/// `idx_bt_open`.
+pub async fn list_open_transfers(
+    pool: &PgPool,
+    min_age_secs: i64,
+    max_age_secs: i64,
+    retry_secs: i64,
+    limit: i64,
+) -> Result<Vec<OpenTransfer>> {
+    let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        r#"
+        SELECT observed_tx_hash, analysis
+        FROM bridge_transfers
+        WHERE status IN ('Detected', 'Pending')
+          AND analysis IS NOT NULL
+          AND created_at < NOW() - ($1::double precision * INTERVAL '1 second')
+          AND created_at > NOW() - ($2::double precision * INTERVAL '1 second')
+          AND updated_at < NOW() - ($3::double precision * INTERVAL '1 second')
+        ORDER BY updated_at ASC
+        LIMIT $4
+        "#,
+    )
+    .bind(min_age_secs)
+    .bind(max_age_secs)
+    .bind(retry_secs)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(observed_tx_hash, analysis)| OpenTransfer {
+            observed_tx_hash,
+            analysis,
+        })
+        .collect())
+}
+
 /// A stored analysis plus whether it is still fresh.
 pub struct CachedAnalysis {
     pub analysis: serde_json::Value,

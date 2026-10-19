@@ -4,6 +4,7 @@ pub mod clients;
 pub mod config;
 pub mod db;
 pub mod domain;
+pub mod enrichment;
 pub mod error;
 pub mod handler;
 pub mod ingestion;

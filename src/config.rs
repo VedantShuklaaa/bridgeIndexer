@@ -1,3 +1,19 @@
+/// Background re-enrichment of `Detected` and `Pending` transfers.
+#[derive(Clone, Debug)]
+pub struct ReenrichConfig {
+    pub enabled: bool,
+    /// Seconds between passes.
+    pub interval_secs: u64,
+    /// Rows handled per pass.
+    pub batch: i64,
+    /// A row is left to the normal pipeline until it is this old.
+    pub min_age_secs: i64,
+    /// A row is not asked again before this long after its last attempt.
+    pub retry_secs: i64,
+    /// Rows older than this are given up on (stale-while-revalidate can still refresh them).
+    pub max_age_secs: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub database_url: String,
@@ -16,6 +32,7 @@ pub struct AppConfig {
     pub live_idle_grace_secs: u64,
     /// Replay missed signatures from the checkpoint each time ingestion starts.
     pub live_backfill: bool,
+    pub reenrich: ReenrichConfig,
 }
 
 impl AppConfig {
@@ -35,6 +52,13 @@ impl AppConfig {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect()
+        }
+
+        fn number<T: std::str::FromStr>(key: &str, default: T) -> T {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
         }
 
         let helius_url = required("HELIUS_URL")?;
@@ -59,6 +83,16 @@ impl AppConfig {
             live_backfill: std::env::var("LIVE_BACKFILL")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            reenrich: ReenrichConfig {
+                enabled: std::env::var("REENRICH_ENABLED")
+                    .map(|v| v != "0")
+                    .unwrap_or(true),
+                interval_secs: number("REENRICH_INTERVAL_SECS", 30u64).max(1),
+                batch: number("REENRICH_BATCH", 50i64).max(1),
+                min_age_secs: number("REENRICH_MIN_AGE_SECS", 60i64).max(0),
+                retry_secs: number("REENRICH_RETRY_SECS", 120i64).max(0),
+                max_age_secs: number("REENRICH_MAX_AGE_SECS", 7 * 24 * 3600i64).max(1),
+            },
         })
     }
 }
