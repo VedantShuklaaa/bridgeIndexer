@@ -73,7 +73,8 @@ pub async fn analyse_tx(
                 None => None,
             };
 
-            let mut transfer = detect::to_bridge_transfer(first, metadata)?;
+            let mut transfer =
+                detect::to_bridge_transfer(first, metadata, &state.chains.snapshot())?;
             let enriched = state
                 .enrichment
                 .enrich(
@@ -188,6 +189,7 @@ pub async fn analyse_tx(
                     destination_wallet,
                     known_destination_tx,
                 },
+                &state.chains.snapshot(),
             )
             .await?;
             tracing::info!(

@@ -1,4 +1,5 @@
 use bridge::chain_adapters::setup::build_registry;
+use bridge::chains::{ChainRegistry, db::run_refresh_loop};
 use bridge::config::AppConfig;
 use bridge::db;
 use bridge::enrichment::reenrich;
@@ -59,8 +60,16 @@ async fn main() -> anyhow::Result<()> {
     let http_client = Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
+
     let registry = build_registry(&config, &http_client);
-    let state = AppState::new(db.clone(), config.clone(), http_client.clone(), registry)?;
+    let chains = ChainRegistry::load(&db).await?;
+    let state = AppState::new(
+        db.clone(),
+        config.clone(),
+        http_client.clone(),
+        registry,
+        chains.clone(),
+    )?;
 
     // The live pipeline (backfill + consumer workers) gets its own Helius endpoint, registry
     // and rate limiter, so it can't use up the GET API's quota.
@@ -81,6 +90,13 @@ async fn main() -> anyhow::Result<()> {
             shutdown.cancel();
         });
     }
+
+    tokio::spawn(run_refresh_loop(
+        chains,
+        db.clone(),
+        Duration::from_secs(config.chain_registry_refresh_secs),
+        shutdown.clone(),
+    ));
 
     for worker_id in 1..=5 {
         let worker_name = format!("worker-{worker_id}");

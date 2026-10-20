@@ -33,6 +33,8 @@ pub struct AppConfig {
     /// Replay missed signatures from the checkpoint each time ingestion starts.
     pub live_backfill: bool,
     pub reenrich: ReenrichConfig,
+    /// How often the in-memory chain registry reloads from Postgres.
+    pub chain_registry_refresh_secs: u64,
 }
 
 impl AppConfig {
@@ -83,6 +85,7 @@ impl AppConfig {
             live_backfill: std::env::var("LIVE_BACKFILL")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
+            chain_registry_refresh_secs: number("CHAIN_REGISTRY_REFRESH_SECS", 60u64).max(5),
             reenrich: ReenrichConfig {
                 enabled: std::env::var("REENRICH_ENABLED")
                     .map(|v| v != "0")

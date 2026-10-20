@@ -149,6 +149,10 @@ impl Snapshot {
             .as_ref()
             .map(|t| t.replace("{hash}", tx_hash))
     }
+
+    pub fn explorer_tx_url_for(&self, raw: &RawChainRef, tx_hash: &str) -> Option<String> {
+        self.explorer_tx_url(self.resolve(raw).key()?, tx_hash)
+    }
 }
 
 /// Shared handle. Readers take a cheap `Arc` clone of the current snapshot; a
@@ -277,6 +281,23 @@ mod tests {
         assert_eq!(
             handle.resolve(&RawChainRef::wormhole(4)),
             ChainRef::Resolved(ChainKey(4))
+        );
+    }
+
+    #[test]
+    fn explorer_url_for_follows_the_resolved_chain() {
+        let snap = Snapshot::build(
+            vec![chain(1, "solana", RegistryStatus::Active)],
+            vec![mapping(NS_WORMHOLE, "1", 1, RegistryStatus::Active)],
+        );
+        assert_eq!(
+            snap.explorer_tx_url_for(&RawChainRef::wormhole(1), "abc")
+                .as_deref(),
+            Some("https://solana.example/tx/abc")
+        );
+        assert_eq!(
+            snap.explorer_tx_url_for(&RawChainRef::wormhole(9), "abc"),
+            None
         );
     }
 }

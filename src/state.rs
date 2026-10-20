@@ -1,4 +1,5 @@
 use crate::chain_adapters::registry::AdapterRegistry;
+use crate::chains::ChainRegistry;
 use crate::config::AppConfig;
 use crate::enrichment::EnrichmentProvider;
 use crate::enrichment::wormholescan::WormholeScanProvider;
@@ -30,6 +31,7 @@ pub struct AppState {
     pub http_client: Client,
     pub config: AppConfig,
     pub registry: Arc<AdapterRegistry>,
+    pub chains: ChainRegistry,
     pub protocols: Arc<ProtocolRegistry>,
     pub tx_broadcast: broadcast::Sender<String>,
     /// Number of connected `/stream` clients. Live ingestion only runs while this is above zero.
@@ -46,6 +48,7 @@ impl AppState {
         config: AppConfig,
         http_client: Client,
         registry: AdapterRegistry,
+        chains: ChainRegistry,
     ) -> anyhow::Result<Self> {
         let (tx_broadcast, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (live_clients, _) = watch::channel(0usize);
@@ -57,6 +60,7 @@ impl AppState {
             http_client.clone(),
             config.wormhole_url.clone(),
             wormhole_limiter.clone(),
+            chains.clone(),
         ));
 
         Ok(Self {
@@ -64,6 +68,7 @@ impl AppState {
             http_client,
             config,
             registry: Arc::new(registry),
+            chains,
             protocols: Arc::new(default_registry()),
             tx_broadcast,
             live_clients: Arc::new(live_clients),

@@ -15,5 +15,4 @@ pub mod routes;
 pub mod services;
 pub mod shutdown;
 pub mod state;
-pub mod util;
 pub mod vaa;
