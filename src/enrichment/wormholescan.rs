@@ -1,4 +1,5 @@
 use super::{EnrichInput, EnrichOutcome, Enriched, EnrichmentProvider, Prefetch};
+use crate::chains::ChainRegistry;
 use crate::clients::limiter::{Limiter, call_upstream};
 use crate::clients::wormhole;
 use crate::domain::bridge_transfer::{BridgeMessageId, BridgeStatus, BridgeTransfer};
@@ -15,14 +16,21 @@ pub struct WormholeScanProvider {
     client: Client,
     base_url: String,
     limiter: Arc<Limiter>,
+    chains: ChainRegistry,
 }
 
 impl WormholeScanProvider {
-    pub fn new(client: Client, base_url: String, limiter: Arc<Limiter>) -> Self {
+    pub fn new(
+        client: Client,
+        base_url: String,
+        limiter: Arc<Limiter>,
+        chains: ChainRegistry,
+    ) -> Self {
         Self {
             client,
             base_url,
             limiter,
+            chains,
         }
     }
 }
@@ -72,14 +80,15 @@ impl EnrichmentProvider for WormholeScanProvider {
             }
         };
 
-        match detect::apply_wormholescan(transfer, operation) {
+        let chains = self.chains.snapshot();
+        match detect::apply_wormholescan(transfer, operation, &chains) {
             Enrichment::Applied => {
                 // VAA matched but /operations carried no destination tx: ask global-tx,
                 // keyed by the on-chain message id.
                 if matches!(transfer.status, BridgeStatus::Pending)
                     && let Some(hash) = self.destination_tx(&transfer.message_id).await
                 {
-                    detect::apply_destination_tx(transfer, &hash);
+                    detect::apply_destination_tx(transfer, &hash, &chains);
                 }
                 Enriched {
                     outcome: EnrichOutcome::Applied,
@@ -122,6 +131,7 @@ mod tests {
             Arc::new(RateLimiter::direct(Quota::per_second(
                 NonZeroU32::new(100).unwrap(),
             ))),
+            ChainRegistry::default(),
         )
     }
 

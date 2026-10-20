@@ -3,7 +3,7 @@
 //! data is layered on top afterwards. Enrichment can raise the status but never gates
 //! persistence, and it is only applied when the VAA matches the message decoded on chain.
 
-use crate::chains::{NS_WORMHOLE, RawChainRef};
+use crate::chains::{NS_WORMHOLE, RawChainRef, Snapshot};
 use crate::domain::bridge_transfer::{BridgeMessageId, BridgeStatus, BridgeTransfer, ChainId};
 use crate::error::AppError;
 use crate::protocols::{
@@ -11,7 +11,6 @@ use crate::protocols::{
     registry::ProtocolRegistry,
 };
 use crate::services::token_metadata::TokenMetadata;
-use crate::util::explorer::explorer_tx_url;
 use crate::vaa::decode::{decode_vaa, format_amount};
 use serde_json::Value;
 
@@ -58,6 +57,7 @@ fn wormhole_id(chain: &RawChainRef) -> Result<u16, AppError> {
 pub fn to_bridge_transfer(
     d: &DetectedTransfer,
     metadata: Option<TokenMetadata>,
+    chains: &Snapshot,
 ) -> Result<BridgeTransfer, AppError> {
     let MessageId::Wormhole {
         emitter_chain,
@@ -75,7 +75,7 @@ pub fn to_bridge_transfer(
         source_chain: ChainId::from_wormhole_id(source_id),
         source_tx_hash: d.observed_tx.clone(),
         source_wallet: d.source_wallet.clone(),
-        source_explorer_url: explorer_tx_url(source_id, &d.observed_tx),
+        source_explorer_url: chains.explorer_tx_url_for(&d.source, &d.observed_tx),
         destination_chain: ChainId::from_wormhole_id(destination_id),
         destination_wallet: d.destination_wallet.clone(),
         destination_tx_hash: None,
@@ -107,7 +107,11 @@ pub enum Enrichment {
 ///
 /// `Pending` means WormholeScan has the VAA, `Completed` means it also knows the
 /// destination tx. Anything that does not match the on-chain message changes nothing.
-pub fn apply_wormholescan(transfer: &mut BridgeTransfer, wh_raw: &Value) -> Enrichment {
+pub fn apply_wormholescan(
+    transfer: &mut BridgeTransfer,
+    wh_raw: &Value,
+    chains: &Snapshot,
+) -> Enrichment {
     let Some(vaa) = wh_raw
         .get("vaa")
         .and_then(|v| v.get("raw"))
@@ -133,7 +137,7 @@ pub fn apply_wormholescan(transfer: &mut BridgeTransfer, wh_raw: &Value) -> Enri
     }
 
     if let Some(hash) = destination_tx_from_operation(wh_raw) {
-        apply_destination_tx(transfer, &hash);
+        apply_destination_tx(transfer, &hash, chains);
     }
     Enrichment::Applied
 }
@@ -160,13 +164,16 @@ pub fn destination_tx_from_operation(raw: &Value) -> Option<String> {
 
 /// Completes a `Pending` transfer once its destination tx is known. Never touches
 /// `Detected` (no matched VAA) and never rewrites a `Completed` transfer.
-pub fn apply_destination_tx(transfer: &mut BridgeTransfer, hash: &str) -> bool {
+pub fn apply_destination_tx(transfer: &mut BridgeTransfer, hash: &str, chains: &Snapshot) -> bool {
     let hash = hash.trim();
     if hash.is_empty() || !matches!(transfer.status, BridgeStatus::Pending) {
         return false;
     }
-    transfer.destination_explorer_url =
-        explorer_tx_url(transfer.destination_chain.wormhole_id(), hash);
+    transfer.destination_explorer_url = chains.explorer_tx_url_for(
+        &RawChainRef::wormhole(transfer.destination_chain.wormhole_id()),
+        hash,
+    );
+
     transfer.destination_tx_hash = Some(hash.to_string());
     transfer.status = BridgeStatus::Completed;
     true
@@ -216,7 +223,7 @@ mod tests {
     }
 
     fn transfer() -> BridgeTransfer {
-        to_bridge_transfer(&detected(), None).unwrap()
+        to_bridge_transfer(&detected(), None, &snap()).unwrap()
     }
 
     #[test]
@@ -227,6 +234,7 @@ mod tests {
                 symbol: Some("USDC".into()),
                 decimals: Some(6),
             }),
+            &snap(),
         )
         .unwrap();
 
@@ -256,7 +264,7 @@ mod tests {
     fn a_chain_reference_from_another_namespace_is_an_error_not_a_guess() {
         let mut d = detected();
         d.destination = RawChainRef::new("cctp", 0);
-        assert!(to_bridge_transfer(&d, None).is_err());
+        assert!(to_bridge_transfer(&d, None, &snap()).is_err());
     }
 
     #[test]
@@ -278,7 +286,7 @@ mod tests {
             json!({"vaa": {"raw": "!!not base64"}}),
         ] {
             let mut t = transfer();
-            assert_eq!(apply_wormholescan(&mut t, &raw), Enrichment::NoVaa);
+            assert_eq!(apply_wormholescan(&mut t, &raw, &snap()), Enrichment::NoVaa);
             assert!(matches!(t.status, BridgeStatus::Detected));
         }
     }
@@ -287,7 +295,10 @@ mod tests {
     fn a_matching_vaa_raises_the_status_to_pending() {
         let raw = json!({"vaa": {"raw": vaa_b64(1, [9; 32], 42)}});
         let mut t = transfer();
-        assert_eq!(apply_wormholescan(&mut t, &raw), Enrichment::Applied);
+        assert_eq!(
+            apply_wormholescan(&mut t, &raw, &snap()),
+            Enrichment::Applied
+        );
         assert!(matches!(t.status, BridgeStatus::Pending));
         assert!(t.destination_tx_hash.is_none());
     }
@@ -299,7 +310,10 @@ mod tests {
             "globalTx": {"destinationTx": {"txHash": "0xdest"}},
         });
         let mut t = transfer();
-        assert_eq!(apply_wormholescan(&mut t, &raw), Enrichment::Applied);
+        assert_eq!(
+            apply_wormholescan(&mut t, &raw, &snap()),
+            Enrichment::Applied
+        );
         assert!(matches!(t.status, BridgeStatus::Completed));
         assert_eq!(t.destination_tx_hash.as_deref(), Some("0xdest"));
         assert!(t.destination_explorer_url.is_some());
@@ -313,7 +327,10 @@ mod tests {
                 "globalTx": {"destinationTx": {"txHash": "0xdest"}},
             });
             let mut t = transfer();
-            assert_eq!(apply_wormholescan(&mut t, &raw), Enrichment::Mismatch);
+            assert_eq!(
+                apply_wormholescan(&mut t, &raw, &snap()),
+                Enrichment::Mismatch
+            );
             assert!(matches!(t.status, BridgeStatus::Detected));
             assert!(t.destination_tx_hash.is_none());
         }
@@ -358,7 +375,10 @@ mod tests {
             "targetChain": {"transaction": {"txHash": "0xdest"}},
         });
         let mut t = transfer();
-        assert_eq!(apply_wormholescan(&mut t, &raw), Enrichment::Applied);
+        assert_eq!(
+            apply_wormholescan(&mut t, &raw, &snap()),
+            Enrichment::Applied
+        );
         assert!(matches!(t.status, BridgeStatus::Completed));
         assert_eq!(t.destination_tx_hash.as_deref(), Some("0xdest"));
     }
@@ -366,12 +386,12 @@ mod tests {
     #[test]
     fn apply_destination_tx_completes_only_a_pending_transfer() {
         let mut detected_only = transfer();
-        assert!(!apply_destination_tx(&mut detected_only, "0xdest"));
+        assert!(!apply_destination_tx(&mut detected_only, "0xdest", &snap()));
         assert!(matches!(detected_only.status, BridgeStatus::Detected));
 
         let mut pending = transfer();
         pending.status = BridgeStatus::Pending;
-        assert!(apply_destination_tx(&mut pending, "0xdest"));
+        assert!(apply_destination_tx(&mut pending, "0xdest", &snap()));
         assert!(matches!(pending.status, BridgeStatus::Completed));
         assert_eq!(pending.destination_tx_hash.as_deref(), Some("0xdest"));
     }
@@ -380,8 +400,8 @@ mod tests {
     fn a_completed_transfer_is_never_rewritten() {
         let mut t = transfer();
         t.status = BridgeStatus::Pending;
-        assert!(apply_destination_tx(&mut t, "0xfirst"));
-        assert!(!apply_destination_tx(&mut t, "0xsecond"));
+        assert!(apply_destination_tx(&mut t, "0xfirst", &snap()));
+        assert!(!apply_destination_tx(&mut t, "0xsecond", &snap()));
         assert_eq!(t.destination_tx_hash.as_deref(), Some("0xfirst"));
     }
 
@@ -389,7 +409,7 @@ mod tests {
     fn a_blank_hash_changes_nothing() {
         let mut t = transfer();
         t.status = BridgeStatus::Pending;
-        assert!(!apply_destination_tx(&mut t, "  "));
+        assert!(!apply_destination_tx(&mut t, "  ", &snap()));
         assert!(matches!(t.status, BridgeStatus::Pending));
     }
 
@@ -398,7 +418,61 @@ mod tests {
         let raw = json!({"vaa": {"raw": vaa_b64(1, [9; 32], 42)}});
         let mut t = transfer();
         t.status = BridgeStatus::Completed;
-        assert_eq!(apply_wormholescan(&mut t, &raw), Enrichment::Applied);
+        assert_eq!(
+            apply_wormholescan(&mut t, &raw, &snap()),
+            Enrichment::Applied
+        );
+        assert!(matches!(t.status, BridgeStatus::Completed));
+    }
+
+    use crate::chains::{ChainRow, MappingRow, RegistryStatus};
+
+    fn snap() -> Snapshot {
+        let chain = |id: i16, slug: &str| ChainRow {
+            id,
+            slug: slug.into(),
+            name: slug.into(),
+            kind: "other".into(),
+            explorer_tx_url: Some(format!("https://{slug}.example/tx/{{hash}}")),
+            status: RegistryStatus::Active,
+        };
+        let mapping = |wormhole_id: &str, chain_id: i16| MappingRow {
+            protocol: NS_WORMHOLE.into(),
+            protocol_chain_id: wormhole_id.into(),
+            chain_id,
+            status: RegistryStatus::Active,
+        };
+        Snapshot::build(
+            vec![chain(1, "solana"), chain(2, "ethereum")],
+            vec![mapping("1", 1), mapping("2", 2)],
+        )
+    }
+
+    #[test]
+    fn explorer_urls_come_from_the_registry() {
+        let t = transfer();
+        assert_eq!(
+            t.source_explorer_url.as_deref(),
+            Some("https://solana.example/tx/sig")
+        );
+
+        let mut pending = transfer();
+        pending.status = BridgeStatus::Pending;
+        assert!(apply_destination_tx(&mut pending, "0xdest", &snap()));
+        assert_eq!(
+            pending.destination_explorer_url.as_deref(),
+            Some("https://ethereum.example/tx/0xdest")
+        );
+    }
+
+    #[test]
+    fn a_chain_the_registry_does_not_know_has_no_explorer_url_but_still_works() {
+        let mut d = detected();
+        d.destination = RawChainRef::wormhole(9999);
+        let mut t = to_bridge_transfer(&d, None, &snap()).unwrap();
+        t.status = BridgeStatus::Pending;
+        assert!(apply_destination_tx(&mut t, "0xdest", &snap()));
+        assert!(t.destination_explorer_url.is_none());
         assert!(matches!(t.status, BridgeStatus::Completed));
     }
 }

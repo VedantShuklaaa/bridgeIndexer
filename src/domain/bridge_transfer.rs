@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+/// The chain as `/api/v1` and stored analyses spell it. Frozen: logic never branches on
+/// it, chain resolution and explorer URLs go through `chains::ChainRegistry`. It is retired
+/// with `/api/v1` (A10).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ChainId {
     Solana,

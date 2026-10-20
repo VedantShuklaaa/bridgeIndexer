@@ -19,7 +19,7 @@ WormholeScan. The [Roadmap](#roadmap) tracks the move.
 | Wormhole Token Bridge (WTT) | Outbound is indexed chain-first (`Detected` from Solana data alone, WormholeScan enriches). Inbound redeems: A1b |
 | Detection | **Chain-first for Wormhole outbound (A5).** A transfer decoded from Solana data is persisted as `Detected` with WormholeScan fully unavailable. WormholeScan only enriches. Transactions no adapter recognises (inbound redeems, other Wormhole programs) still go through the WormholeScan-gated path until their adapters land |
 | Domain model and schema | **Generalised (A2).** `bridge_transfers` is identified by `(protocol, message_key)` with `direction`, `via`, raw chain references plus an optional resolved chain, and `NUMERIC(78,0)` amounts. Wormhole fields live in `wormhole_messages`. The pipeline still writes only Wormhole sends out of Solana (A5 wires the adapter) |
-| Chains | Registry tables, loader and the SQL `resolve_chain` function exist. Transfers store the raw `(protocol, id)` and the resolved `chains.id`, or NULL when unknown. The pipeline still uses the hardcoded `ChainId` enum. Moving callers off it is the rest of A3 |
+| Chains | Registry tables, loader and the SQL `resolve_chain` function exist. Transfers store the raw `(protocol, id)` and the resolved `chains.id`, or NULL when unknown. **Wired (A3).** The registry is loaded at startup and refreshed every `CHAIN_REGISTRY_REFRESH_SECS`. Explorer URLs and the `Pending` vs `Detected` decision come from it, so a chain added to the database works without a deploy. `ChainId` only remains as the frozen `/api/v1` response type until A10 |
 | Protocol core | `BridgeAdapter`, `ProtocolRegistry`, `compose`, pure `SolanaTx` and the Wormhole Token Bridge outbound adapter are **wired into `analyse_tx`** through `AppState.protocols`. Inbound redeems (A1b) and the other Wormhole programs (A4) are not decoded yet |golden tests wait for captured fixtures, A9). Inbound redeems are `Unsupported` until A1b. **Not wired into the pipeline yet** |
 | Read path (`/analyse`) | Working, cache-hit throughput measured (see [Results](#results)) |
 | Destination tx resolution | **Fixed (A5b).** Read from the `/operations` payload (`targetChain.transaction.txHash`, legacy paths as fallback), then `/global-tx` through the WormholeScan limiter when the VAA matched but no destination tx is present. `Pending` now means WormholeScan itself has no destination tx |
@@ -247,12 +247,11 @@ bridgeIndexer/
 │   │   ├── helius.rs
 │   │   ├── wormhole.rs
 │   │   └── limiter.rs
-│   ├── chain_adapters/                 # token metadata (destination lookups moved to enrichment/, `find_transaction` is unused and goes with the A3 `ChainId` cleanup)
+│   ├── chain_adapters/                 # token symbol and decimals per chain (destination lookups live in enrichment/)
 │   │   ├── mod.rs                      # ChainAdapter trait
 │   │   ├── registry.rs
 │   │   ├── setup.rs
-│   │   ├── solana.rs
-│   │   └── wormholescan.rs
+│   │   └── solana.rs
 │   ├── protocols/                      # protocol-agnostic core (Phase A, partly done, not wired)
 │   │   ├── mod.rs                      # BridgeAdapter trait, Protocol, MessageId, Direction, DetectedTransfer, Reject
 │   │   ├── registry.rs                 # program ID -> adapters, SOLANA_BRIDGE_PROGRAMS override parser
@@ -261,7 +260,7 @@ bridgeIndexer/
 │   │   ├── amount.rs                   # RawAmount: decimal string for NUMERIC(78,0)
 │   │   └── wormhole/                   # Token Bridge adapter, outbound (A1); NTT and other programs planned
 │   │       └── mod.rs
-│   ├── chains/                         # DB-backed chain registry (Phase A, loader done, not wired)
+│   ├── chains/                         # DB-backed chain registry, loaded at startup and refreshed in the background (A3)
 │   │   ├── mod.rs                      # RawChainRef, ChainRef, Snapshot, resolve (only active rows resolve)
 │   │   └── db.rs                       # load_snapshot from Postgres
 │   ├── enrichment/                     # counterpart and status providers (Phase A)
@@ -292,8 +291,6 @@ bridgeIndexer/
 │   │   └── v1/
 │   │       ├── mod.rs
 │   │       └── transactions.rs
-│   └── util/
-│       └── explorer.rs                 # explorer URLs per chain
 ├── tests/
 │   ├── chain_registry_db.rs            # testcontainers Postgres: seed, resolve, status rules
 │   ├── common/                         # shared test helpers (container setup)
@@ -453,6 +450,8 @@ Config notes:
   setting `config.rs` reads. `protocols::registry` already has a parser for
   `SOLANA_BRIDGE_PROGRAMS` (a `protocol:program_id` CSV), but nothing reads that
   variable yet. A4 wires it and retires the single-address setting.
+* `CHAIN_REGISTRY_REFRESH_SECS` (optional, default 60, minimum 5) is how often the chain
+  registry reloads from Postgres, so a manual `INSERT` or `UPDATE` takes effect without a restart.
 * Re-enrichment (all optional): `REENRICH_ENABLED` (default on, `0` disables),
   `REENRICH_INTERVAL_SECS` (30), `REENRICH_BATCH` (50), `REENRICH_MIN_AGE_SECS` (60),
   `REENRICH_RETRY_SECS` (120) and `REENRICH_MAX_AGE_SECS` (7 days).
@@ -479,6 +478,9 @@ cargo test
   several transfers share one observed tx, the database rejects bad `direction` and
   `status`, and SQL `resolve_chain` agrees with the Rust registry. Set
   `TEST_DATABASE_URL` to use a server you already run instead of Docker.
+* Unit tests in `src/services/correlator.rs`: `Pending` only for a destination the registry
+  resolves, `Detected` otherwise, `Completed` with an explorer URL from the registry, and no
+  explorer URL (but no failure) for an unknown chain.
 * Unit tests inside `src/protocols/*` and `src/chains/mod.rs`: routing on inner calls,
   override parsing, compose merging, "only active rows resolve", and the Wormhole
   adapter (outbound decode, with-payload, router-made calls, several transfers per tx,
@@ -536,8 +538,8 @@ detection are all Wormhole-shaped, and detection is gated on WormholeScan.
 
 Problem 2 (fixed in A5b): every transfer reported `Pending`. The destination tx was read from
 `globalTx.destinationTx.txHash` on the `/operations` response, which does not
-carry that field, and `WormholeScanAdapter::find_transaction` (which hits
-`/global-tx/...`) was never called.
+carry that field, and the old `WormholeScanAdapter::find_transaction` (which hit
+`/global-tx/...`) was never called. That adapter is gone (A3), the lookup lives in `enrichment/`.
 
 Delivery is one protocol per phase. Phase A builds the core with Wormhole as the
 only real adapter. Phases B and later add one protocol each.
@@ -546,7 +548,7 @@ only real adapter. Phases B and later add one protocol each.
 
 * \[ ] A1. Adapter trait and registry: each adapter declares its program IDs and classifies/decodes a Solana tx into a bridge event, or rejects it with a reason. Decode is pure (no network, no state). Modelled on the existing `chain_adapters` registry. Done: `BridgeAdapter`, `ProtocolRegistry`, pure `SolanaTx` (#3), Wormhole Token Bridge outbound decode. Remaining: A1b inbound redeems (needs the posted VAA account read, so an account preload on `SolanaTx`), and wiring into the worker
 * \[x] A2. Generalised domain model and schema: `protocol`, optional `via`, `direction`, source and destination chain references, a protocol-specific message identity with a unique key per protocol, `Detected`/`Pending`/`Completed` plus `Failed`/`Refunded`, `NUMERIC` amounts. `bridge_transfers` (protocol-agnostic) is split from `wormhole_messages`. Existing rows are migrated in place and tested on staged legacy data
-* \[ ] A3. DB-backed chain registry: canonical `chains` table plus a `(protocol, protocol_chain_id) -> chain` mapping table, seeded with the current 10 chains, replacing the `ChainId` enum and `from_wormhole_id`. Unknown IDs are stored as `unresolved(protocol, id)`, never dropped and never a crash. The registry carries the status and provenance needed for the later LLM-proposal upgrade, which is not built in this phase... Done: tables, seed, `load_snapshot`, DB tests (#4), SQL `resolve_chain`, and unresolved IDs persisted on transfers (A2). Remaining: move callers off `ChainId` and `from_wormhole_id`, wire the snapshot refresh task
+* \[x] A3. DB-backed chain registry: canonical `chains` table plus a `(protocol, protocol_chain_id) -> chain` mapping table, seeded with the current 10 chains, replacing the `ChainId` enum and `from_wormhole_id`. Unknown IDs are stored as `unresolved(protocol, id)`, never dropped and never a crash. The registry carries the status and provenance needed for the later LLM-proposal upgrade, which is not built in this phase... Done: tables, seed, `load_snapshot`, DB tests (#4), SQL `resolve_chain`, and unresolved IDs persisted on transfers (A2). Remaining: move callers off `ChainId` and `from_wormhole_id`, wire the snapshot refresh task
 * \[ ] A4. All Wormhole programs on Solana, not only the Token Bridge (Token Bridge, NTT and others, each after its program ID and layouts are verified against official docs or source). One `logsSubscribe` per program ID, since `mentions` accepts a single address, with a checkpoint per program. `SOLANA_TOKEN_BRIDGE_PROGRAM` is replaced by a configured list
 * \[x] A5. Chain-first detection: a transfer is persisted as `Detected` from Helius data alone. WormholeScan is an enrichment that fills the status and no longer gates persistence. Done for Wormhole outbound in `analyse_tx` (`services::detect`), cross-checked against the on-chain message ID. Done (A5b): the destination tx fix, the WormholeScan lookups behind an `EnrichmentProvider` in `enrichment/`, and a background re-enrichment pass (`enrichment::reenrich`) that moves `Detected` and `Pending` rows forward. Several transfers per tx are decoded but only the first is stored until the v2 model
 * \[ ] A6. Composition: one transfer per message identity, the outer protocol or router recorded as `via`, and a test that an outer and an underlying adapter seeing the same tx produce one row... Partly done (#3): `compose()` with unit tests. The end-to-end outer+underlying test waits for a second adapter

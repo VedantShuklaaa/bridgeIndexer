@@ -2,10 +2,9 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{Value, json};
 
-use crate::domain::bridge_transfer::BridgeMessageId;
 use crate::error::AppError;
 
-use super::{ChainAdapter, DestinationTxInfo};
+use super::ChainAdapter;
 
 pub struct SolanaAdapter {
     client: Client,
@@ -56,13 +55,6 @@ impl SolanaAdapter {
 impl ChainAdapter for SolanaAdapter {
     fn name(&self) -> &'static str {
         self.name
-    }
-
-    async fn find_transaction(
-        &self,
-        _message_id: &BridgeMessageId,
-    ) -> Result<Option<DestinationTxInfo>, AppError> {
-        Ok(None)
     }
 
     async fn token_decimals(&self, token_address: &str) -> Result<Option<u8>, AppError> {
