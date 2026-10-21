@@ -297,7 +297,7 @@ bridgeIndexer/
 │   ├── decode_unit.rs                  # pure decode tests (Phase 0)
 │   ├── fixtures_decode.rs              # decoders over captured fixtures (Phase 0)
 │   ├── persistence_idempotency.rs      # testcontainers Postgres
-│   └── fixtures/                       # helius_<name>.json, wormhole_<name>.json (none captured yet)
+│   └── fixtures/                       # helius_<name>.json, wormhole_<name>.json (captured, see tests/fixtures)
 │   ├── bridge_transfers_schema.rs      # A2 schema and migration of existing rows (needs Docker)
 ├── benches/                            # (planned) criterion: pure decode (Phase 1)
 ├── .env.example                        # (Phase 0)
@@ -524,7 +524,7 @@ record the git SHA and instance type next to every row.
 
 * \[x] GitHub Actions CI: `cargo fmt --check`, `clippy -D warnings`, `cargo test`
 * \[x] Unit tests for VAA decode, address decode, amount formatting
-* \[x] Fixture capture script and fixture-driven decode tests (no fixtures are committed yet, so the fixture tests pass vacuously until some are captured)
+* \[x] Fixture capture script and fixture-driven decode tests 
 * \[x] `.env.example`, README drift fixed
 * \[ ] Tag `v0` (baseline numbers below)
 
@@ -554,7 +554,7 @@ only real adapter. Phases B and later add one protocol each.
 * \[ ] A6. Composition: one transfer per message identity, the outer protocol or router recorded as `via`, and a test that an outer and an underlying adapter seeing the same tx produce one row... Partly done (#3): `compose()` with unit tests. The end-to-end outer+underlying test waits for a second adapter
 * \[ ] A7. Direction: Solana-outbound sends and Solana-inbound redeems both indexed. Outbound decode done for the Token Bridge. Inbound comes with A1b
 * \[ ] A8. Ingestion is always on, in this phase and every later one, and no longer tied to `/stream` clients, so the database is a complete record of what the programs emitted. Helius usage is kept in check by a configurable ingestion budget (limiter, dedupe of repeated signatures, backfill pacing)
-* \[ ] A9. Fixtures captured from real txs (outbound, inbound, admin/attest rejected, unsupported variant) and golden tests per adapter
+* \[ ] A9. Fixtures captured from real txs (outbound, inbound, admin/attest rejected, unsupported variant) and golden tests per adapter. Fixture 4 is a NEAR omni-bridge redeem, not a Token Bridge completeTransfer; capture a real one for A1b.
 * \[ ] A10. API versioning: `/api/v2` serves the generalised model (protocol, direction, via, chain references, all transfers of a tx). `/api/v1` keeps its current Wormhole-shaped response through a compatibility mapper until it is retired. Amounts are stored as `NUMERIC` so volume can be aggregated
 
 Benchmarks: classification precision on the fixture set; pure classify ns/op (criterion).

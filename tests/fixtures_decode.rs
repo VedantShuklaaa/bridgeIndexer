@@ -90,8 +90,18 @@ fn wormhole_fixtures_are_self_consistent() {
         assert_eq!(event.emitter_address, parts[1], "{n}: emitter address");
         assert_eq!(event.sequence.to_string(), parts[2], "{n}: sequence");
 
+        // decode_vaa only understands Token Bridge payloads (ids 1/3 are also
+        // used by other protocols, e.g. the NEAR omni bridge), so skip VAAs
+        // WormholeScan doesn't label as the Token Bridge.
+        let is_token_bridge = raw
+            .pointer("/content/standarizedProperties/appIds")
+            .and_then(Value::as_array)
+            .is_some_and(|ids| ids.iter().any(|i| i == "PORTAL_TOKEN_BRIDGE"));
+
         // the raw VAA header must agree with the operation metadata
-        if let Some(vaa) = raw.pointer("/vaa/raw").and_then(Value::as_str) {
+        if !is_token_bridge {
+            eprintln!("{n}: not a Token Bridge operation, skipping VAA decode");
+        } else if let Some(vaa) = raw.pointer("/vaa/raw").and_then(Value::as_str) {
             let decoded = decode_vaa(vaa).unwrap_or_else(|e| panic!("{n}: decode_vaa: {e}"));
             assert_eq!(
                 decoded.header.emitter_chain.to_string(),
