@@ -296,6 +296,7 @@ bridgeIndexer/
 │   ├── common/                         # shared test helpers (container setup)
 │   ├── decode_unit.rs                  # pure decode tests (Phase 0)
 │   ├── fixtures_decode.rs              # decoders over captured fixtures (Phase 0)
+│   ├── golden_fixtures.rs              # Wormhole adapter over captured fixtures, checked against WormholeScan (A9)
 │   ├── persistence_idempotency.rs      # testcontainers Postgres
 │   └── fixtures/                       # helius_<name>.json, wormhole_<name>.json (captured, see tests/fixtures)
 │   ├── bridge_transfers_schema.rs      # A2 schema and migration of existing rows (needs Docker)
@@ -468,6 +469,9 @@ cargo test
 * `tests/fixtures_decode.rs` — runs the pure decoders over real captured
   provider responses in `tests/fixtures/`. Capture new ones with
   `scripts/capture_fixtures.sh`.
+* `tests/golden_fixtures.rs` — runs the protocol registry over the fixture
+  pairs and compares the decoded transfers with WormholeScan's decoding.
+  Inbound redeems are asserted `Unsupported` until A1b.
 * `tests/persistence_idempotency.rs` — real Postgres 18 container (via `testcontainers`,
   needs Docker): redelivering the same transaction, the scenario `XAUTOCLAIM` recovery
   guarantees will happen, never produces a duplicate row in `transactions`,
@@ -524,7 +528,7 @@ record the git SHA and instance type next to every row.
 
 * \[x] GitHub Actions CI: `cargo fmt --check`, `clippy -D warnings`, `cargo test`
 * \[x] Unit tests for VAA decode, address decode, amount formatting
-* \[x] Fixture capture script and fixture-driven decode tests 
+* \[x] Fixture capture script and fixture-driven decode tests
 * \[x] `.env.example`, README drift fixed
 * \[ ] Tag `v0` (baseline numbers below)
 
@@ -554,7 +558,7 @@ only real adapter. Phases B and later add one protocol each.
 * \[ ] A6. Composition: one transfer per message identity, the outer protocol or router recorded as `via`, and a test that an outer and an underlying adapter seeing the same tx produce one row... Partly done (#3): `compose()` with unit tests. The end-to-end outer+underlying test waits for a second adapter
 * \[ ] A7. Direction: Solana-outbound sends and Solana-inbound redeems both indexed. Outbound decode done for the Token Bridge. Inbound comes with A1b
 * \[ ] A8. Ingestion is always on, in this phase and every later one, and no longer tied to `/stream` clients, so the database is a complete record of what the programs emitted. Helius usage is kept in check by a configurable ingestion budget (limiter, dedupe of repeated signatures, backfill pacing)
-* \[ ] A9. Fixtures captured from real txs (outbound, inbound, admin/attest rejected, unsupported variant) and golden tests per adapter. Fixture 4 is a NEAR omni-bridge redeem, not a Token Bridge completeTransfer; capture a real one for A1b.
+* \[x] A9. Fixtures captured from real txs (outbound, inbound, admin/attest rejected, unsupported variant) and golden tests per adapter.
 * \[ ] A10. API versioning: `/api/v2` serves the generalised model (protocol, direction, via, chain references, all transfers of a tx). `/api/v1` keeps its current Wormhole-shaped response through a compatibility mapper until it is retired. Amounts are stored as `NUMERIC` so volume can be aggregated
 
 Benchmarks: classification precision on the fixture set; pure classify ns/op (criterion).
@@ -592,7 +596,7 @@ Provider lanes, replay and the decode bench stay in this phase. Items 1a, 1b and
 * \[ ] 1a. Split `analyse_tx` into fetch (IO), decode (pure, no network or state), enrich (IO). Delivered by A1
 * \[x] 1b. Destination tx resolution: operation payload paths first, then the `global-tx` lookup through the WormholeScan limiter. Delivered by A5b, as the WormholeScan enrichment provider
 * \[ ] 1c. Provider lanes: `Lane::Api` and `Lane::Ingest`, each with its own Helius URL (`HELIUS_API_URL`, `HELIUS_STREAM_URL`) and its own limiter. Fall back to `HELIUS_URL` when unset. Today the code has one extra endpoint, `HELIUS_LIVE_URL`, and `AppState::for_live` for the live pipeline. This item replaces it
-* \[ ] 1d. Golden tests per fixture, status matrix test (known tx → `Completed`, none + registered chain → `Pending`, unregistered → `Detected`). Delivered by A9, with the matrix redefined for on-chain-first statuses
+* \[ ] 1d. Golden tests per fixture, status matrix test (known tx → `Completed`, none + registered chain → `Pending`, unregistered → `Detected`). Delivered by A9, with the matrix redefined for on-chain-first statuses. Per-fixture golden tests are done (A9); the status matrix test remains.
 * \[ ] 1e. `src/bin/replay.rs`: take the last N signatures, run the pipeline, compare our status with WormholeScan's `global-tx`
 * \[ ] 1f. Criterion bench for the pure classify/decode path
 
