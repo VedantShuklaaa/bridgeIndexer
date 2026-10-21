@@ -2,8 +2,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 use crate::error::AppError;
 
-const TOKEN_TRANSFER_MIN_LEN: usize = 101;
-
 #[derive(Debug, Clone)]
 pub struct VaaHeader {
     pub emitter_chain: u16,
@@ -67,13 +65,8 @@ pub fn decode_vaa(vaa_b64: &str) -> Result<DecodedVaa, AppError> {
     let payload = &body[51..];
     tracing::debug!(payload_id = ?payload.first(), payload_len = payload.len(), "vaa payload");
 
-    // Payload id 1/3 is only a Token Bridge transfer if the body is long
-    // enough. Other protocols (e.g. the NEAR omni bridge) also start with 1,
-    // so a short body means "not a transfer", not a decode error.
     let transfer = match payload.first() {
-        Some(1) | Some(3) if payload.len() >= TOKEN_TRANSFER_MIN_LEN => {
-            Some(decode_token_transfer(payload)?)
-        }
+        Some(1) | Some(3) => Some(decode_token_transfer(payload)?),
         _ => None,
     };
     // ---- end paste ----
@@ -89,7 +82,7 @@ pub fn decode_vaa(vaa_b64: &str) -> Result<DecodedVaa, AppError> {
 }
 
 fn decode_token_transfer(payload: &[u8]) -> Result<TokenTransferPayload, AppError> {
-    if payload.len() < TOKEN_TRANSFER_MIN_LEN {
+    if payload.len() < 101 {
         return Err(AppError::Normalisation("transfer payload too short".into()));
     }
 
