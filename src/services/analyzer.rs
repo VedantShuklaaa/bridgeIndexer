@@ -88,6 +88,7 @@ pub async fn analyse_tx(
             if enriched.outcome == EnrichOutcome::Applied {
                 tx.bridge_event = enriched.bridge_event;
             }
+            tx.bridge_transfer = Some(transfer);
 
             tracing::info!(
                 total_ms = t_total.elapsed().as_millis() as u64,
