@@ -1,0 +1,65 @@
+{
+  "id": "1/ec7372995d5cc8732397fb0ad35c0121e0eaa90d26f828a534cab54391b3a4f5/1433866",
+  "emitterChain": 1,
+  "emitterAddress": {
+    "hex": "ec7372995d5cc8732397fb0ad35c0121e0eaa90d26f828a534cab54391b3a4f5",
+    "native": "Gv1KWf8DT1jKv5pKBmGaTmVszqa56Xn8YGx2Pg7i7qAk"
+  },
+  "sequence": "1433866",
+  "vaa": {
+    "raw": "AQAAAAcNAMFVXtQ6dcXft3favU0dTnkNLoDBCpsR0xcsO60ukuNlb+PqYiVfGtJgr8VS+fe+Esx3dsQNqtYFlPybgoDwMtsBAgfOXNPJoO41LyQF8DFY7iScNcwwq4Sdi41v4xe/610YL5s3aWwt2huRWNMx3y390DWftnaRZ7gg5dKq8AVMW6IAA80vuRZDvX2TtvHXqNr8PMq5IQMpb66ny27b72ErF512c4YP2/Vr2BLYHh9Z9kfJK+SKWw5gg/c0GyH6lssSHvUABIH9XqLY+RDKE5BOaqDgi6CckWF17jFBh8Lqt+ArxYqVWg5icJedw1zDfH2m402NTt/sMwcOLOcLF5wXx/bTyjgBBSLL0lR0kXeJTZQzNvTDpvrgw4ydH8uWwFh9e6hEgVc/N5gzsxNuE5v7bI0if8E6UTy1ODky13W4y+yUt/8spPoBBg2qm6pTRpwb+qmLVrrqr70V4eISFBCiVAHkjBnkDzuPaxMTY8dzjPUrjjFCrrxZ9PfXNrrV0BAnBmtWZONOdL0BCPcNWbgwg8U88Y+wf5zDB8CnXdR1i2rsIX9RZByvfTV6LH2fDI7D2nk7ApWHBaZ785if+G/YSiQwTmR6NB7fURMACZyVya9yzd28rebawr99I8FEPDwyc1wPS7F6Kq2GMuO5fMFGjBMft+HY4CB/j6e2gluGnf/ItVHUt9oi+sagaz4BC5FYvYArsCZo14WXtA66tvftIOcRLPsuEFqMEBgnwK8HJWxxTJwzt7Xv5SbxOILsChknvDTqFpuYn5tYVQ8ZmiIBDIgkfEG8lpK55hROcRsYgPEhQ+CDYtBL4U8PHEIqGI6QTPL4pbwaY3ssqXlo7/uNKBPFMwP7Mp2L54pq1aOzBIgBDX0eTQbuZ6zLHo/92/iJTgkPO2fZUFQUK2vc/ajUc7M2UqOYKB7bqzFJMZHYfbUirbup1l7etMQg3i7mS6hWYYIAD/WS37qgsiS8kVS8LEs2HMDk3pjB2WBwztuHdtPhNLAAcgGgFPgyj2Wztmp01o/IlWUO4o0xrh3zuV/pPl9d12cBEisvJmKIU9wUP8M12iDbfGex1lh3jUZKDu/ucUioH+rLWTy7KWy9l5qBS3nPk4w1Rkw36srBiIyW4vTGsL06VREBath6qwABFHgAAexzcpldXMhzI5f7CtNcASHg6qkNJvgopTTKtUORs6T1AAAAAAAV4QogAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAn7iUEAAAAAAAAAAAAAAAAwCqqObIj/o0KDlxPJ+rZCDx1bMIAAgAAAAAAAAAAAAAAAL9fP2UQKudFpIvVIdELq1vwKp70AAJikPLuYvPEYYUxQ0Ym1Mcjr18PpnBp1JUwq4PlNrc00AEAAAAAAAAAAAAAAAClTcRCUZBXDLXIQa30Rbvs87JJ9QAAAAAAAWdgAQAAAAAAAAAA",
+    "guardianSetIndex": 7,
+    "isDuplicated": false
+  },
+  "content": {
+    "payload": {
+      "amount": "669918468",
+      "callerAppId": "UNKNOWN",
+      "fee": "",
+      "fromAddress": "0x6290f2ee62f3c4618531434626d4c723af5f0fa67069d49530ab83e536b734d0",
+      "parsedPayload": null,
+      "payload": "01000000000000000000000000a54dc4425190570cb5c841adf445bbecf3b249f50000000000016760010000000000000000",
+      "payloadType": 3,
+      "toAddress": "0x000000000000000000000000bf5f3f65102ae745a48bd521d10bab5bf02a9ef4",
+      "toChain": 2,
+      "tokenAddress": "0x000000000000000000000000c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "tokenChain": 2
+    },
+    "standarizedProperties": {
+      "appIds": [
+        "PORTAL_TOKEN_BRIDGE",
+        "UNKNOWN"
+      ],
+      "fromChain": 1,
+      "fromAddress": "7dm9am6Qx7cH64RB99Mzf7ZsLbEfmXM7ihXXCvMiT2X1",
+      "toChain": 2,
+      "toAddress": "0xBF5f3f65102aE745A48BD521d10BaB5BF02A9eF4",
+      "tokenChain": 2,
+      "tokenAddress": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+      "amount": "669918468",
+      "feeAddress": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+      "feeChain": 2,
+      "fee": "",
+      "normalizedDecimals": null
+    },
+    "executorRequest": null
+  },
+  "sourceChain": {
+    "chainId": 1,
+    "timestamp": "2026-10-21T08:41:15Z",
+    "transaction": {
+      "txHash": "5aoqeSKH7gXsoC1WvF32xWa4AspD2jf24imY2m28pMaLyNX1riiHUmmh8vch4GoeRYJ5exiT95Uqy5bYJUtLsnog"
+    },
+    "from": "7dm9am6Qx7cH64RB99Mzf7ZsLbEfmXM7ihXXCvMiT2X1",
+    "status": "confirmed",
+    "fee": "0.000014019",
+    "gasTokenNotional": "106.47",
+    "feeUSD": "0.00149260293",
+    "isSolanaShim": false
+  },
+  "data": {
+    "symbol": "WETH",
+    "tokenAmount": "6.69918468",
+    "usdAmount": "16404.09255037"
+  }
+}
