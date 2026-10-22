@@ -53,6 +53,11 @@ struct ErrorDetail {
 }
 
 impl AppError {
+    /// The stable error code, as the API reports it. Also the error kind in the replay tool.
+    pub fn code(&self) -> &'static str {
+        self.status_and_code().1
+    }
+
     fn status_and_code(&self) -> (StatusCode, &'static str) {
         match self {
             AppError::InvalidTransactionHash(_) => (StatusCode::BAD_REQUEST, "INVALID_TX_HASH"),

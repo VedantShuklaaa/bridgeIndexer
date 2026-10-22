@@ -232,7 +232,7 @@ bridgeIndexer/
 │   ├── error.rs                        # AppError -> HTTP responses
 │   ├── shutdown.rs                     # SIGTERM / Ctrl+C
 │   ├── bin/                            # (planned)
-│   │   ├── replay.rs                   # status agreement vs WormholeScan (Phase 1)
+│   │   ├── replay.rs                   # replay the last N signatures, compare with WormholeScan (1e)
 │   │   └── reconcile.rs                # stream recall vs getSignaturesForAddress (Phase 4)
 │   ├── domain/                         # types only, no IO
 │   │   ├── bridge.rs
@@ -280,6 +280,7 @@ bridgeIndexer/
 │   │   ├── token_metadata.rs
 │   │   ├── detect.rs                   # chain-first detection and WormholeScan enrichment (pure)
 │   │   └── read_through.rs             # caches, single-flight, stale-while-revalidate
+|   |   └── replay.rs                   # pure compare/summary for the replay tool
 │   ├── db/
 │   │   ├── connection.rs
 │   │   └── repository.rs
@@ -435,10 +436,22 @@ default.
 
 Requires Postgres and Redis reachable at the URLs below.
 
-```bash
+````bash
 cp .env.example .env   # fill in RPC URLs and the bridge program address
 cargo run
+
+  ### Replay against WormholeScan
+```bash
+  cargo run --bin replay -- --limit 200
 ```
+
+Replays the last N Token Bridge signatures through the real pipeline and compares
+our status with WormholeScan's `global-tx`. Needs the server's env, reads the chain
+registry from `DATABASE_URL`, writes nothing. Exits 1 when agreement on transfers
+older than `--min-age-secs` (default 900) is below `--min-agreement` (default 99).
+`cargo run` alone still starts the server (`default-run = "bridge"`).
+
+````
 
 Migrations run on startup.
 
@@ -597,7 +610,7 @@ Provider lanes, replay and the decode bench stay in this phase. Items 1a, 1b and
 * \[x] 1b. Destination tx resolution: operation payload paths first, then the `global-tx` lookup through the WormholeScan limiter. Delivered by A5b, as the WormholeScan enrichment provider
 * \[ ] 1c. Provider lanes: `Lane::Api` and `Lane::Ingest`, each with its own Helius URL (`HELIUS_API_URL`, `HELIUS_STREAM_URL`) and its own limiter. Fall back to `HELIUS_URL` when unset. Today the code has one extra endpoint, `HELIUS_LIVE_URL`, and `AppState::for_live` for the live pipeline. This item replaces it
 * \[ ] 1d. Golden tests per fixture, status matrix test (known tx → `Completed`, none + registered chain → `Pending`, unregistered → `Detected`). Delivered by A9, with the matrix redefined for on-chain-first statuses. Per-fixture golden tests are done (A9); the status matrix test remains.
-* \[ ] 1e. `src/bin/replay.rs`: take the last N signatures, run the pipeline, compare our status with WormholeScan's `global-tx`
+* \[x] 1e. `src/bin/replay.rs`: take the last N signatures, run the pipeline, compare our status with WormholeScan's `global-tx`
 * \[ ] 1f. Criterion bench for the pure classify/decode path
 
 Benchmarks: classify/decode ns/op (criterion); replay agreement %, Pending %, errors by kind, cold p50/p99.
