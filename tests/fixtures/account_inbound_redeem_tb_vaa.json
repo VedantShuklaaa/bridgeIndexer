@@ -1,0 +1,17 @@
+{
+  "context": {
+    "slot": 459980998,
+    "apiVersion": "4.3.0-alpha.2"
+  },
+  "value": {
+    "lamports": 1808480,
+    "data": [
+      "dmFhAQEDoNhqo+yIOWt3AATTo774Hyy4LjeNArC90dHodX5umbUt/N5fo9hqAAAAAPSlCgAAAAAAAgAAAAAAAAAAAAAAAAA+4YsiFK/5cADZdM9kfnw0fo+lhYUAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACSycVElwAAAAAAAAAAAAAAABy5Pn4CMSaKmHenFiWKYkg3E7uqQAC4vcUMp9cgIu5ocj5ZMsoT3pF2/rrpkeXfyueT+Z1odEAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "base64"
+    ],
+    "owner": "worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth",
+    "executable": false,
+    "rentEpoch": 18446744073709551615,
+    "space": 228
+  }
+}
