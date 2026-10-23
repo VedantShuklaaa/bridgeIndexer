@@ -58,8 +58,20 @@ impl ProtocolRegistry {
             .unwrap_or_default()
     }
 
-    /// Runs each matching adapter once, in registration order.
-    pub fn classify(&self, tx: &SolanaTx) -> Vec<(Protocol, Classification)> {
+    /// Accounts the matching adapters need preloaded, sorted and deduplicated.
+    pub fn required_accounts(&self, tx: &SolanaTx) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .matching(tx)
+            .into_iter()
+            .flat_map(|i| self.adapters[i].required_accounts(tx))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    /// Indexes of the adapters whose program appears anywhere in the tx.
+    fn matching(&self, tx: &SolanaTx) -> Vec<usize> {
         let mut hit: Vec<usize> = tx
             .program_ids()
             .into_iter()
@@ -69,7 +81,13 @@ impl ProtocolRegistry {
             .collect();
         hit.sort_unstable();
         hit.dedup();
-        hit.into_iter()
+        hit
+    }
+
+    /// Runs each matching adapter once, in registration order.
+    pub fn classify(&self, tx: &SolanaTx) -> Vec<(Protocol, Classification)> {
+        self.matching(tx)
+            .into_iter()
             .map(|i| (self.adapters[i].protocol(), self.adapters[i].classify(tx)))
             .collect()
     }
@@ -107,6 +125,7 @@ mod tests {
     struct Fake {
         protocol: Protocol,
         programs: &'static [&'static str],
+        accounts: &'static [&'static str],
     }
 
     impl BridgeAdapter for Fake {
@@ -115,6 +134,9 @@ mod tests {
         }
         fn default_program_ids(&self) -> &'static [&'static str] {
             self.programs
+        }
+        fn required_accounts(&self, _tx: &SolanaTx) -> Vec<String> {
+            self.accounts.iter().map(|a| a.to_string()).collect()
         }
         fn classify(&self, _tx: &SolanaTx) -> Classification {
             Classification::Rejected(Reject::NotTransfer("fake"))
@@ -129,6 +151,7 @@ mod tests {
             failed: false,
             signer: None,
             account_keys: vec![],
+            accounts: Default::default(),
             instructions: programs
                 .iter()
                 .map(|(p, inner_of)| Instruction {
@@ -148,6 +171,7 @@ mod tests {
         r.register(Arc::new(Fake {
             protocol: Protocol::Wormhole,
             programs: &["WormA", "WormB"],
+            accounts: &["acc2", "acc1"],
         }));
         r
     }
@@ -173,6 +197,19 @@ mod tests {
     }
 
     #[test]
+    fn required_accounts_are_sorted_and_only_asked_of_matching_adapters() {
+        let r = registry();
+        assert_eq!(
+            r.required_accounts(&tx_calling(&[("WormA", None), ("WormB", Some(0))])),
+            vec!["acc1", "acc2"]
+        );
+        assert!(
+            r.required_accounts(&tx_calling(&[("Other", None)]))
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn unrelated_transactions_match_nothing() {
         assert!(
             registry()
@@ -188,6 +225,7 @@ mod tests {
             Arc::new(Fake {
                 protocol: Protocol::Wormhole,
                 programs: &["WormA"],
+                accounts: &[],
             }),
             vec!["Custom".into()],
         );

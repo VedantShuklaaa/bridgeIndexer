@@ -13,9 +13,13 @@
 //! * its second signer account is the emitter, and the core bridge logs
 //!   `Sequence: N` while it runs, which together give the message identity.
 //!
-//! Inbound redeems (`complete_*`) are rejected as `Unsupported`: their
-//! instruction data is empty and the message identity lives in the posted VAA
-//! account, which needs an account read. That is the next step (A1b).
+//! Inbound redeems (`complete_*`) have empty instruction data: the message they
+//! redeem is the posted VAA account (third account of the instruction, owned by the
+//! core bridge). The fetch step preloads it into `SolanaTx::accounts` after asking
+//! [`BridgeAdapter::required_accounts`], and the identity and transfer payload are
+//! decoded from it here. Without the account an inbound redeem is `Unsupported`.
+
+pub mod posted_vaa;
 
 use super::amount::RawAmount;
 use super::{
@@ -38,6 +42,9 @@ const CORE_POST_MESSAGE: u8 = 1;
 /// bridge, message, emitter, sequence, payer, fee collector, clock.
 const CORE_EMITTER_ACCOUNT: usize = 2;
 
+/// Index of the posted VAA among the Token Bridge `complete_*` accounts:
+/// payer, config, vaa, claim, endpoint, ... (the same for all four variants).
+const REDEEM_VAA_ACCOUNT: usize = 2;
 /// Fixed part of a transfer payload: id, amount, token, token chain, to, to chain.
 const PAYLOAD_FIXED: usize = 1 + 32 + 32 + 2 + 32 + 2;
 
@@ -91,7 +98,8 @@ impl BridgeAdapter for WormholeAdapter {
         }
 
         let mut outbound: Vec<usize> = Vec::new();
-        let (mut inbound, mut unknown) = (false, false);
+        let mut inbound: Vec<usize> = Vec::new();
+        let mut unknown = false;
         for &pos in &token_ixs {
             match tx.instructions[pos].data.first().copied().map(kind) {
                 None => {
@@ -100,26 +108,46 @@ impl BridgeAdapter for WormholeAdapter {
                     ));
                 }
                 Some(Kind::Outbound) => outbound.push(pos),
-                Some(Kind::Inbound) => inbound = true,
+                Some(Kind::Inbound) => inbound.push(pos),
                 Some(Kind::Unknown) => unknown = true,
                 Some(Kind::Admin) => {}
             }
         }
 
-        if outbound.is_empty() {
-            return Classification::Rejected(if inbound {
-                Reject::Unsupported("inbound redeem: message identity is in the posted VAA account")
-            } else if unknown {
+        if outbound.is_empty() && inbound.is_empty() {
+            return Classification::Rejected(if unknown {
                 Reject::Unsupported("unknown token bridge instruction")
             } else {
                 Reject::NotTransfer("admin or attestation instruction")
             });
         }
 
-        match decode_outbound(tx, &outbound) {
-            Ok(transfers) => Classification::Transfers(transfers),
-            Err(reject) => Classification::Rejected(reject),
+        let mut transfers = Vec::new();
+        if !outbound.is_empty() {
+            match decode_outbound(tx, &outbound) {
+                Ok(found) => transfers.extend(found),
+                Err(reject) => return Classification::Rejected(reject),
+            }
         }
+        if !inbound.is_empty() {
+            match decode_inbound(tx, &inbound, transfers.len()) {
+                Ok(found) => transfers.extend(found),
+                Err(reject) => return Classification::Rejected(reject),
+            }
+        }
+        Classification::Transfers(transfers)
+    }
+
+    fn required_accounts(&self, tx: &SolanaTx) -> Vec<String> {
+        if tx.failed {
+            return Vec::new();
+        }
+        let mut keys: Vec<String> = redeems(tx)
+            .filter_map(|ix| ix.accounts.get(REDEEM_VAA_ACCOUNT).cloned())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        keys
     }
 }
 
@@ -247,6 +275,80 @@ fn post_message_payload(data: &[u8]) -> Option<&[u8]> {
     let end = 9usize.checked_add(len)?;
     let payload = data.get(9..end)?;
     (data.len() == end + 1).then_some(payload)
+}
+
+/// Token Bridge redeem instructions (`complete_*`), top-level or inner.
+fn redeems(tx: &SolanaTx) -> impl Iterator<Item = &super::Instruction> {
+    tx.instructions.iter().filter(|ix| {
+        ix.program_id == TOKEN_BRIDGE && ix.data.first().copied().map(kind) == Some(Kind::Inbound)
+    })
+}
+
+/// Redeems into Solana. The identity and transfer come from the posted VAA account the
+/// instruction was given. `first_index` continues the event index after any outbound
+/// transfers decoded from the same tx.
+fn decode_inbound(
+    tx: &SolanaTx,
+    inbound: &[usize],
+    first_index: usize,
+) -> Result<Vec<DetectedTransfer>, Reject> {
+    let mut ordered: Vec<usize> = inbound.to_vec();
+    ordered.sort_by_key(|&pos| exec_key(tx, pos));
+
+    let mut transfers = Vec::with_capacity(ordered.len());
+    for (n, &pos) in ordered.iter().enumerate() {
+        let vaa_key = tx.instructions[pos]
+            .accounts
+            .get(REDEEM_VAA_ACCOUNT)
+            .ok_or(Reject::Malformed("redeem without a VAA account"))?;
+        let account = tx.account(vaa_key).ok_or(Reject::Unsupported(
+            "inbound redeem: posted VAA account was not loaded",
+        ))?;
+        // The Token Bridge only accepts a core bridge account, so this is a
+        // consistency check on what the fetch step returned.
+        if account.owner != CORE_BRIDGE {
+            return Err(Reject::Malformed(
+                "VAA account is not owned by the core bridge",
+            ));
+        }
+        let vaa = posted_vaa::parse(&account.data)
+            .ok_or(Reject::Malformed("VAA account does not parse"))?;
+        let decoded = parse_transfer_payload(vaa.payload)?;
+        if decoded.to_chain != SOLANA {
+            return Err(Reject::Malformed(
+                "redeem payload is not addressed to Solana",
+            ));
+        }
+
+        let to_hex = hex::encode(decoded.to);
+        let token_hex = hex::encode(decoded.token_address);
+
+        transfers.push(DetectedTransfer {
+            message: MessageId::Wormhole {
+                emitter_chain: vaa.emitter_chain,
+                emitter_address: hex::encode(vaa.emitter_address),
+                sequence: vaa.sequence,
+            },
+            direction: Direction::Inbound,
+            observed_tx: tx.signature.clone(),
+            event_index: (first_index + n) as u16,
+            source: RawChainRef::wormhole(vaa.emitter_chain),
+            destination: RawChainRef::wormhole(SOLANA),
+            // The sender is on the origin chain and is not in a plain transfer payload.
+            source_wallet: None,
+            // The recipient's token account, as the VAA carries it.
+            destination_wallet: decode_destination_address(SOLANA, &to_hex),
+            token: decode_destination_address(decoded.token_chain, &token_hex).map(|address| {
+                TokenRef {
+                    chain: RawChainRef::wormhole(decoded.token_chain),
+                    address,
+                }
+            }),
+            amount_raw: Some(decoded.amount),
+            via: None,
+        });
+    }
+    Ok(transfers)
 }
 
 struct TransferFields {
@@ -382,6 +484,7 @@ mod tests {
             failed: false,
             signer: Some(USER.into()),
             account_keys: vec![],
+            accounts: Default::default(),
             instructions,
             logs,
         }
@@ -463,16 +566,136 @@ mod tests {
         );
     }
 
-    #[test]
-    fn inbound_redeem_is_unsupported_for_now() {
-        for index in [2u8, 3, 9, 10] {
-            let t = tx(vec![ix(TOKEN_BRIDGE, &[USER], vec![index], None)], vec![]);
-            let c = WormholeAdapter.classify(&t);
-            assert!(
-                matches!(c, Classification::Rejected(Reject::Unsupported(_))),
-                "index {index}: {c:?}"
+    const VAA_ACCOUNT: &str = "PostedVaa1111111111111111111111111111111111";
+
+    fn posted_vaa_bytes(sequence: u64, chain: u16, payload: &[u8]) -> Vec<u8> {
+        let mut d = b"vaa".to_vec();
+        d.extend_from_slice(&[1, 1]);
+        d.extend_from_slice(&1u32.to_le_bytes());
+        d.extend_from_slice(&[7; 32]);
+        d.extend_from_slice(&2u32.to_le_bytes());
+        d.extend_from_slice(&3u32.to_le_bytes());
+        d.extend_from_slice(&sequence.to_le_bytes());
+        d.extend_from_slice(&chain.to_le_bytes());
+        d.extend_from_slice(&[0xEE; 32]);
+        d.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        d.extend_from_slice(payload);
+        d
+    }
+
+    /// A top-level `complete_*` redeem; the VAA account is its third account.
+    fn redeem(index: u8, loaded: Option<(&str, Vec<u8>)>) -> SolanaTx {
+        let mut t = tx(
+            vec![ix(
+                TOKEN_BRIDGE,
+                &[USER, "config", VAA_ACCOUNT, "claim"],
+                vec![index],
+                None,
+            )],
+            vec![],
+        );
+        if let Some((owner, data)) = loaded {
+            t.accounts.insert(
+                VAA_ACCOUNT.into(),
+                crate::protocols::AccountData {
+                    owner: owner.into(),
+                    data,
+                },
             );
         }
+        t
+    }
+
+    #[test]
+    fn decodes_an_inbound_redeem_from_the_posted_vaa() {
+        for index in [2u8, 3, 9, 10] {
+            let payload = transfer_payload(1, 1_641_561_313_809, 1, &[0; 32]);
+            let t = only_transfer(WormholeAdapter.classify(&redeem(
+                index,
+                Some((CORE_BRIDGE, posted_vaa_bytes(697_687, 2, &payload))),
+            )));
+
+            assert_eq!(t.direction, Direction::Inbound, "index {index}");
+            assert_eq!(t.observed_tx, "sig");
+            assert_eq!(t.source, RawChainRef::wormhole(2));
+            assert_eq!(t.destination, RawChainRef::wormhole(1));
+            assert_eq!(t.source_wallet, None);
+            assert_eq!(
+                t.destination_wallet.as_deref(),
+                Some(bs58::encode([0xCD; 32]).into_string().as_str())
+            );
+            assert_eq!(t.amount_raw.unwrap().as_str(), "1641561313809");
+            assert_eq!(
+                t.message,
+                MessageId::Wormhole {
+                    emitter_chain: 2,
+                    emitter_address: "ee".repeat(32),
+                    sequence: 697_687,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_redeem_asks_for_its_vaa_account_only() {
+        assert_eq!(
+            WormholeAdapter.required_accounts(&redeem(3, None)),
+            vec![VAA_ACCOUNT.to_string()]
+        );
+        // sends and admin calls need no account
+        let send = simple_transfer(transfer_payload(1, 1, 2, &[0; 32]), 1);
+        assert!(WormholeAdapter.required_accounts(&send).is_empty());
+        let mut failed = redeem(3, None);
+        failed.failed = true;
+        assert!(WormholeAdapter.required_accounts(&failed).is_empty());
+    }
+
+    #[test]
+    fn a_redeem_without_its_account_loaded_is_unsupported() {
+        let c = WormholeAdapter.classify(&redeem(3, None));
+        assert!(
+            matches!(c, Classification::Rejected(Reject::Unsupported(_))),
+            "{c:?}"
+        );
+    }
+
+    #[test]
+    fn a_redeem_with_too_few_accounts_is_malformed() {
+        let t = tx(vec![ix(TOKEN_BRIDGE, &[USER], vec![2], None)], vec![]);
+        assert!(matches!(
+            WormholeAdapter.classify(&t),
+            Classification::Rejected(Reject::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn a_redeem_rejects_an_account_the_core_bridge_does_not_own() {
+        let payload = transfer_payload(1, 1, 1, &[0; 32]);
+        let c =
+            WormholeAdapter.classify(&redeem(3, Some((USER, posted_vaa_bytes(1, 2, &payload)))));
+        assert!(
+            matches!(c, Classification::Rejected(Reject::Malformed(_))),
+            "{c:?}"
+        );
+    }
+
+    #[test]
+    fn a_redeem_rejects_garbage_and_payloads_for_other_chains() {
+        let garbage = redeem(3, Some((CORE_BRIDGE, vec![1, 2, 3])));
+        assert!(matches!(
+            WormholeAdapter.classify(&garbage),
+            Classification::Rejected(Reject::Malformed(_))
+        ));
+
+        let elsewhere = transfer_payload(1, 1, 2, &[0; 32]); // addressed to Ethereum
+        let c = WormholeAdapter.classify(&redeem(
+            3,
+            Some((CORE_BRIDGE, posted_vaa_bytes(1, 2, &elsewhere))),
+        ));
+        assert!(
+            matches!(c, Classification::Rejected(Reject::Malformed(_))),
+            "{c:?}"
+        );
     }
 
     #[test]

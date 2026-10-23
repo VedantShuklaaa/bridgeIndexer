@@ -12,7 +12,7 @@ pub mod wormhole;
 use crate::chains::RawChainRef;
 use amount::RawAmount;
 use serde::{Deserialize, Serialize};
-pub use solana_tx::{Instruction, SolanaTx};
+pub use solana_tx::{AccountData, Instruction, SolanaTx};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -159,4 +159,10 @@ pub trait BridgeAdapter: Send + Sync {
 
     /// Pure: same input, same output. Must never panic on malformed input.
     fn classify(&self, tx: &SolanaTx) -> Classification;
+
+    /// Accounts the adapter needs read from the chain before `classify`, as pubkeys.
+    /// Pure: derived from the tx alone. Most adapters need none.
+    fn required_accounts(&self, _tx: &SolanaTx) -> Vec<String> {
+        Vec::new()
+    }
 }
