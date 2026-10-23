@@ -7,9 +7,12 @@
 //! WormholeScan is the independent reference: the adapter decodes the raw
 //! instructions, and its output must agree with what WormholeScan reports.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bridge::protocols::registry::default_registry;
 use bridge::protocols::wormhole::TOKEN_BRIDGE;
-use bridge::protocols::{Classification, DetectedTransfer, Direction, Protocol, Reject, SolanaTx};
+use bridge::protocols::{
+    AccountData, Classification, DetectedTransfer, Direction, Protocol, Reject, SolanaTx,
+};
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -19,7 +22,7 @@ use std::path::PathBuf;
 /// and a custom program), so the Token Bridge call is an inner instruction.
 const OUTBOUND: [&str; 3] = ["completed_outbound", "payload3_executor", "payload3_plain"];
 const ROUTED: [&str; 2] = ["payload3_executor", "payload3_plain"];
-/// Redeems into Solana: `Unsupported` until A1b.
+/// Redeems into Solana, decoded from the posted VAA account (A1b).
 const INBOUND: [&str; 2] = ["inbound_redeem", "inbound_redeem_tb"];
 
 struct Fixture {
@@ -171,9 +174,80 @@ fn an_attest_call_is_rejected_as_not_a_transfer() {
     );
 }
 
-/// Flip these to expect transfers when A1b lands.
+/// Loads the captured `getAccountInfo` of the posted VAA a redeem was given, the way
+/// the fetch step would: the registry says which account is needed, the fixture
+/// stands in for the RPC.
+fn with_vaa_account(f: &mut Fixture) {
+    let needed = default_registry().required_accounts(&f.tx);
+    assert_eq!(needed.len(), 1, "{}: accounts a redeem needs", f.name);
+
+    let account = read(&format!("account_{}_vaa.json", f.name));
+    let value = &account["value"];
+    let data = STANDARD
+        .decode(value["data"][0].as_str().expect("account data"))
+        .expect("base64 account data");
+    f.tx.accounts.insert(
+        needed[0].clone(),
+        AccountData {
+            owner: value["owner"].as_str().expect("account owner").to_string(),
+            data,
+        },
+    );
+}
+
 #[test]
-fn inbound_redeems_are_unsupported_until_a1b() {
+fn inbound_redeems_match_wormholescan() {
+    for name in INBOUND {
+        let mut f = fixture(name);
+        with_vaa_account(&mut f);
+        let found = transfers(&f);
+        assert_eq!(found.len(), 1, "{name}: transfers in the tx");
+        let t = &found[0];
+
+        let payload = &f.op["content"]["payload"];
+        let std = &f.op["content"]["standarizedProperties"];
+        let s = |v: &Value| v.as_str().unwrap_or_default().to_string();
+
+        // the redeem decodes to the same message the send was indexed under
+        assert_eq!(t.message.key(), s(&f.op["id"]), "{name}: message key");
+        assert_eq!(t.direction, Direction::Inbound, "{name}: direction");
+        assert_eq!(t.observed_tx, f.tx.signature, "{name}: observed tx");
+        assert_eq!(t.event_index, 0, "{name}: event index");
+        assert_eq!(
+            t.source.id,
+            f.op["emitterChain"].to_string(),
+            "{name}: source chain"
+        );
+        assert_eq!(t.destination.id, "1", "{name}: destination chain");
+        assert_eq!(t.source_wallet, None, "{name}: source wallet");
+
+        assert_eq!(
+            t.amount_raw.as_ref().map(|a| a.to_string()),
+            Some(s(&payload["amount"])),
+            "{name}: amount"
+        );
+        let token = t.token.as_ref().unwrap_or_else(|| panic!("{name}: token"));
+        assert_eq!(
+            token.chain.id,
+            payload["tokenChain"].to_string(),
+            "{name}: token chain"
+        );
+        assert!(
+            token.address.eq_ignore_ascii_case(&s(&std["tokenAddress"])),
+            "{name}: token address {} vs {}",
+            token.address,
+            s(&std["tokenAddress"])
+        );
+        assert_eq!(
+            t.destination_wallet.as_deref(),
+            Some(s(&std["toAddress"]).as_str()),
+            "{name}: destination wallet"
+        );
+    }
+}
+
+#[test]
+fn inbound_redeems_without_their_account_are_unsupported() {
     for name in INBOUND {
         let f = fixture(name);
         assert_eq!(

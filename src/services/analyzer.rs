@@ -5,7 +5,7 @@ use crate::domain::transaction::NormalisedTransaction;
 use crate::enrichment::{EnrichInput, EnrichOutcome, Prefetch};
 use crate::error::AppError;
 use crate::normaliser;
-use crate::protocols::SolanaTx;
+use crate::protocols::{Direction, SolanaTx};
 use crate::services::correlator;
 use crate::services::detect;
 use crate::services::token_metadata::resolve_token_metadata;
@@ -51,7 +51,15 @@ pub async fn analyse_tx(
     // Chain first: if an adapter decodes a transfer from the Solana tx alone, it is
     // stored as `Detected` whatever WormholeScan says. WormholeScan only enriches.
     if let Some(solana_tx) = &solana_tx {
-        let detected = detect::detect(&state.protocols, solana_tx);
+        // Only sends out of Solana are stored here. A redeem into Solana is decoded
+        // (A1b) but keeps the WormholeScan-driven path below until A7 stores inbound
+        // rows: this pipeline's `source_tx_hash` is the Solana tx, which is the
+        // destination side of a redeem.
+        let detected: Vec<_> = detect::detect(&state.protocols, solana_tx)
+            .into_iter()
+            .filter(|t| t.direction == Direction::Outbound)
+            .collect();
+
         if let Some(first) = detected.first() {
             if detected.len() > 1 {
                 tracing::warn!(
@@ -221,6 +229,34 @@ fn extract_wormholescan_field(raw: &Value, field: &str) -> Option<String> {
         .map(String::from)
 }
 
+/// Reads the accounts the adapters asked for into the tx view. Best effort: when the
+/// read fails the adapters see the accounts as missing and reject what needs them
+/// (`Unsupported`), and the WormholeScan path still runs.
+async fn preload_accounts(state: &AppState, tx: &mut SolanaTx) {
+    let keys = state.protocols.required_accounts(tx);
+    if keys.is_empty() {
+        return;
+    }
+    let fetched = call_upstream(&state.helius_limiter, || {
+        helius::get_multiple_accounts(&state.http_client, &state.config.helius_url, &keys)
+    })
+    .await;
+    match fetched {
+        Ok(accounts) => {
+            for (key, account) in keys.into_iter().zip(accounts) {
+                if let Some(account) = account {
+                    tx.accounts.insert(key, account);
+                }
+            }
+        }
+        Err(error) => tracing::warn!(
+            signature = %tx.signature,
+            %error,
+            "could not preload accounts"
+        ),
+    }
+}
+
 /// The normalised tx, plus the pure `SolanaTx` view adapters read (`None` if the raw
 /// response could not be viewed, in which case only the WormholeScan path can run).
 async fn fetch_source_transaction(
@@ -234,9 +270,15 @@ async fn fetch_source_transaction(
                 helius::get_transaction(&state.http_client, &state.config.helius_url, hash)
             })
             .await?;
-            let solana_tx = SolanaTx::from_helius(&raw, hash)
+
+            let mut solana_tx = SolanaTx::from_helius(&raw, hash)
                 .inspect_err(|error| tracing::warn!(signature = %hash, %error, "unreadable tx"))
                 .ok();
+
+            if let Some(view) = solana_tx.as_mut() {
+                preload_accounts(state, view).await;
+            }
+
             Ok((normaliser::solana::normalise(raw, hash)?, solana_tx))
         }
         other => Err(AppError::Normalisation(format!(

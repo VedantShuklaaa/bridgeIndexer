@@ -3,7 +3,7 @@
 
 use crate::error::AppError;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Instruction {
@@ -16,6 +16,16 @@ pub struct Instruction {
     pub parsed: Option<Value>,
     /// Index of the top-level instruction this one ran under, or `None` if top-level.
     pub inner_of: Option<usize>,
+}
+
+/// An account's owner and raw data, read from the chain by the fetch step. Adapters
+/// ask for the accounts they need through [`BridgeAdapter::required_accounts`](super::BridgeAdapter::required_accounts)
+/// and read them here, so decode stays pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountData {
+    /// Program that owns the account.
+    pub owner: String,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +42,9 @@ pub struct SolanaTx {
     /// Top-level instructions first, then inner instructions, each tagged with `inner_of`.
     pub instructions: Vec<Instruction>,
     pub logs: Vec<String>,
+    /// Accounts preloaded for the adapters, by pubkey. Empty until the fetch step
+    /// fills it. An account that does not exist is simply absent.
+    pub accounts: HashMap<String, AccountData>,
 }
 
 impl SolanaTx {
@@ -117,6 +130,7 @@ impl SolanaTx {
             account_keys,
             instructions,
             logs,
+            accounts: HashMap::new(),
         })
     }
 
@@ -135,6 +149,10 @@ impl SolanaTx {
         self.instructions
             .iter()
             .filter(move |i| i.program_id == program_id)
+    }
+
+    pub fn account(&self, pubkey: &str) -> Option<&AccountData> {
+        self.accounts.get(pubkey)
     }
 }
 
