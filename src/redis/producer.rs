@@ -29,11 +29,39 @@ impl RedisProducer {
         Ok(())
     }
 
-    pub async fn publish_transaction(&self, transaction: &CandidateTransaction) -> Result<()> {
+    /// Publishes a candidate to the stream. Returns `false` when the same signature was
+    /// published within `dedupe_ttl_secs` and nothing was added (`0` publishes every time).
+    ///
+    /// The backfill overlaps the live feed and a reconnect replays recent signatures, and
+    /// every repeat costs a Helius fetch. Persistence is idempotent, so this only saves
+    /// upstream calls. If the `XADD` fails the marker is removed again, so a failed publish
+    /// never suppresses its own retry.
+    pub async fn publish_transaction(
+        &self,
+        transaction: &CandidateTransaction,
+        dedupe_ttl_secs: u64,
+    ) -> Result<bool> {
         let mut connection = self.connection.clone();
         let slot = transaction.slot.to_string();
 
-        let _: String = connection
+        let seen_key = format!("bridge:seen:{}:{}", transaction.chain, transaction.tx_hash);
+
+        if dedupe_ttl_secs > 0 {
+            let first_sighting: Option<String> = redis::cmd("SET")
+                .arg(&seen_key)
+                .arg(1)
+                .arg("NX")
+                .arg("EX")
+                .arg(dedupe_ttl_secs)
+                .query_async(&mut connection)
+                .await?;
+
+            if first_sighting.is_none() {
+                return Ok(false);
+            }
+        }
+
+        let added: redis::RedisResult<String> = connection
             .xadd(
                 BRIDGE_TX_STREAM,
                 "*",
@@ -43,8 +71,16 @@ impl RedisProducer {
                     ("slot", slot.as_str()),
                 ],
             )
-            .await?;
+            .await;
 
-        Ok(())
+        if let Err(error) = added {
+            // Forget the signature so the retry after a reconnect is not suppressed.
+            if dedupe_ttl_secs > 0 {
+                let _: redis::RedisResult<i64> = connection.del(&seen_key).await;
+            }
+            return Err(error.into());
+        }
+
+        Ok(true)
     }
 }

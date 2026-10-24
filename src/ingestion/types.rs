@@ -18,7 +18,7 @@ pub struct LogsConfig {
     pub commitment: &'static str,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateTransaction {
     pub chain: String,
     pub tx_hash: String,
