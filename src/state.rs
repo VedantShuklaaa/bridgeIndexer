@@ -14,7 +14,7 @@ use reqwest::Client;
 use sqlx::PgPool;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::broadcast;
 
 const BROADCAST_CAPACITY: usize = 1024;
 
@@ -34,8 +34,6 @@ pub struct AppState {
     pub chains: ChainRegistry,
     pub protocols: Arc<ProtocolRegistry>,
     pub tx_broadcast: broadcast::Sender<String>,
-    /// Number of connected `/stream` clients. Live ingestion only runs while this is above zero.
-    pub live_clients: Arc<watch::Sender<usize>>,
     pub read_through: Arc<ReadThrough>,
     pub helius_limiter: Arc<Limiter>,
     pub wormhole_limiter: Arc<Limiter>,
@@ -51,7 +49,6 @@ impl AppState {
         chains: ChainRegistry,
     ) -> anyhow::Result<Self> {
         let (tx_broadcast, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let (live_clients, _) = watch::channel(0usize);
         let read_through = Arc::new(ReadThrough::new(16));
         let wormhole_limiter: Arc<Limiter> = Arc::new(RateLimiter::direct(Quota::per_second(
             NonZeroU32::new(20).unwrap(),
@@ -71,7 +68,6 @@ impl AppState {
             chains,
             protocols: Arc::new(default_registry()),
             tx_broadcast,
-            live_clients: Arc::new(live_clients),
             read_through,
             helius_limiter: Arc::new(RateLimiter::direct(Quota::per_second(
                 NonZeroU32::new(HELIUS_API_RPS).unwrap(),

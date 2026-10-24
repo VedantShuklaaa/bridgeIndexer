@@ -3,7 +3,6 @@ use bridge::chains::{ChainRegistry, db::run_refresh_loop};
 use bridge::config::AppConfig;
 use bridge::db;
 use bridge::enrichment::reenrich;
-use bridge::ingestion::on_demand::run_on_demand;
 use bridge::ingestion::solana::SolanaIngester;
 use bridge::redis::consumer::RedisConsumer;
 use bridge::redis::producer::RedisProducer;
@@ -153,11 +152,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let ingest_enabled = std::env::var("INGEST_ENABLED")
-        .map(|v| v != "0")
-        .unwrap_or(true);
-
-    if ingest_enabled {
+    if config.ingest.enabled {
         let solana_ingester = Arc::new(SolanaIngester::new(
             config.solana_ws_url.clone(),
             config.solana_token_bridge_program.clone(),
@@ -165,16 +160,22 @@ async fn main() -> anyhow::Result<()> {
             db.clone(),
             http_client.clone(),
             config.helius_live_url.clone(),
-            config.live_backfill,
+            config.ingest.clone(),
         ));
 
-        // Starts only when the first /stream client connects, stops after the last one leaves.
-        tokio::spawn(run_on_demand(
-            solana_ingester,
-            state.live_clients.subscribe(),
-            Duration::from_secs(config.live_idle_grace_secs),
-            shutdown.clone(),
-        ));
+        // Always on: starts with the process and runs whether or not anyone is connected to
+        // /stream, so the database is a complete record. The ingester reconnects on its own;
+        // the supervisor only has to cover a panic.
+        let ingest_shutdown = shutdown.clone();
+
+        spawn_supervised("solana-ingester", shutdown.clone(), move || {
+            let solana_ingester = solana_ingester.clone();
+            let ingest_shutdown = ingest_shutdown.clone();
+
+            async move { solana_ingester.run(ingest_shutdown).await }
+        });
+    } else {
+        tracing::warn!("INGEST_ENABLED=0, Solana ingestion is disabled");
     }
 
     let app = build_router(state);

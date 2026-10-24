@@ -25,7 +25,7 @@ but not stored yet. The [Roadmap](#roadmap) tracks the move.
 | Read path (`/analyse`) | Working, cache-hit throughput measured (see [Results](#results)) |
 | Destination tx resolution | **Fixed (A5b).** Read from the `/operations` payload (`targetChain.transaction.txHash`, legacy paths as fallback), then `/global-tx` through the WormholeScan limiter when the VAA matched but no destination tx is present. `Pending` now means WormholeScan itself has no destination tx |
 | Enrichment | **Provider and background pass (A5b).** WormholeScan sits behind the `EnrichmentProvider` trait in `enrichment/`. A supervised worker re-enriches `Detected` and `Pending` rows on a schedule, so statuses converge without anyone calling `/analyse` |
-| WebSocket ingestion | **Lossy**: misses transactions, no measurement yet. It also runs only while a `/stream` client is connected, so the database is not a complete record. Fix is Phase A (always-on) and Phase 4 (recall) |
+| WebSocket ingestion | **Always on (A8).** The ingester starts with the process, under a supervisor, whether or not anyone is connected to `/stream`. Still **lossy**: misses transactions, no measurement yet. Fix is Phase 4 (recall) |
 | CI | `cargo fmt --check`, `clippy -D warnings` and `cargo test` on every PR and on `main` (Phase 0) |
 | Deploy | Manual (`git clone` + `cargo run` on EC2, Postgres on RDS). Automated in Phase 2 |
 
@@ -163,10 +163,10 @@ same step, broadcast to any connected WebSocket clients — so the live feed and
 the durable record come from a single source of truth, not two separate paths
 that can drift.
 
-Two properties of v0 that Phase A changes: the ingester starts when the first
-`/stream` client connects and stops after the last one leaves, and `analyse_tx`
-needs a WormholeScan operation with a VAA before it will produce anything to
-persist.
+Two properties of v0 that Phase A changes. The first is fixed (A8): the ingester no
+longer waits for a `/stream` client, it runs from startup. The second is not yet
+fully gone: `analyse_tx` still needs a WormholeScan operation with a VAA before it
+will persist anything that does not decode to an outbound transfer.
 
 ### Target architecture (Phase A)
 
@@ -282,9 +282,9 @@ bridgeIndexer/
 │   │   ├── mod.rs                      # EnrichmentProvider trait, EnrichInput, EnrichOutcome
 │   │   ├── wormholescan.rs             # WormholeScan: /operations VAA, then /global-tx destination tx
 │   │   └── reenrich.rs                 # background pass over Detected and Pending rows
-│   ├── ingestion/                      # Solana WS listener + backfill
+│   ├── ingestion/                      # Solana WS listener + backfill, always on (A8)
 │   │   ├── solana.rs
-│   │   ├── on_demand.rs                # runs the ingester only while /stream clients are connected (replaced in Phase A)
+│   │   ├── backfill.rs                 # pure backfill planning: checkpoint cut-off, failed txs, cap (A8)
 │   │   └── types.rs
 │   ├── redis/                          # stream producer, consumer group, recovery
 │   │   ├── producer.rs
@@ -477,8 +477,13 @@ older than `--min-age-secs` (default 900) is below `--min-agreement` (default 99
 ### Config notes
 
 * `HELIUS_LIVE_URL` (optional, falls back to `HELIUS_URL`) is the endpoint for the
-  live pipeline. `LIVE_IDLE_GRACE_SECS` and `LIVE_BACKFILL` are also read. None of
-  the three is in `.env.example` yet.
+  live pipeline.
+* Ingestion is always on (A8), all settings optional: `INGEST_ENABLED` (default on, `0` is a
+  kill switch), `LIVE_BACKFILL` (default **on**, was off), `INGEST_BACKFILL_MAX` (5000),
+  `INGEST_BACKFILL_PACE_MS` (150) and `INGEST_DEDUPE_TTL_SECS` (3600, `0` disables).
+  `LIVE_IDLE_GRACE_SECS` is gone, nothing stops the ingester any more. Backfill is skipped
+  while there is no checkpoint (a fresh database), so a first start never walks the whole
+  history of the program.
 * `SOLANA_TOKEN_BRIDGE_PROGRAM` is a single address and is still the only program
   setting `config.rs` reads. `protocols::registry` already has a parser for
   `SOLANA_BRIDGE_PROGRAMS` (a `protocol:program_id` CSV), but nothing reads that
@@ -507,6 +512,7 @@ cargo test
   (`tests/fixtures/account_<name>_vaa.json`, a `getAccountInfo` response) and checked
   against WormholeScan (message key, chains, amount, token, destination wallet).
   Without the account they are asserted `Unsupported`.
+* Unit tests in `src/ingestion/backfill.rs`: no backfill without a checkpoint, only signatures newer than the checkpoint, stop at the checkpoint slot, failed transactions and entries without a slot or signature skipped, the `INGEST_BACKFILL_MAX` cap, and the empty page. The Redis dedupe has no automated test (no Redis container in the suite yet).
 * `tests/persistence_idempotency.rs` — real Postgres 18 container (via `testcontainers`,
   needs Docker): redelivering the same transaction, the scenario `XAUTOCLAIM` recovery
   guarantees will happen, never produces a duplicate row in `transactions`,
@@ -597,7 +603,7 @@ only real adapter. Phases B and later add one protocol each.
 * \[x] A5. Chain-first detection: a transfer is persisted as `Detected` from Helius data alone. WormholeScan is an enrichment that fills the status and no longer gates persistence. Done for Wormhole outbound in `analyse_tx` (`services::detect`), cross-checked against the on-chain message ID. Done (A5b): the destination tx fix, the WormholeScan lookups behind an `EnrichmentProvider` in `enrichment/`, and a background re-enrichment pass (`enrichment::reenrich`) that moves `Detected` and `Pending` rows forward. Several transfers per tx are decoded but only the first is stored until the v2 model
 * \[ ] A6. Composition: one transfer per message identity, the outer protocol or router recorded as `via`, and a test that an outer and an underlying adapter seeing the same tx produce one row... Partly done (#3): `compose()` with unit tests. The end-to-end outer+underlying test waits for a second adapter
 * \[ ] A7. Direction: Solana-outbound sends and Solana-inbound redeems both indexed. Outbound is indexed. Inbound redeems are decoded (A1b) but `analyse_tx` does not store them yet: a redeem's Solana tx is the destination side, so storing it needs the inbound row semantics (`Completed` at detection, `source_tx_hash` unknown) from the v2 model
-* \[ ] A8. Ingestion is always on, in this phase and every later one, and no longer tied to `/stream` clients, so the database is a complete record of what the programs emitted. Helius usage is kept in check by a configurable ingestion budget (limiter, dedupe of repeated signatures, backfill pacing)
+* \[x] A8. Ingestion is always on, in this phase and every later one, and no longer tied to `/stream` clients, so the database is a complete record of what the programs emitted. Done: the ingester starts with the process under `spawn_supervised`, `on_demand` and the `/stream` client counter are gone, and the Helius spend is bounded by an ingestion budget: backfill on by default but skipped without a checkpoint, capped at `INGEST_BACKFILL_MAX` signatures and paced by `INGEST_BACKFILL_PACE_MS`, and a Redis `SET NX EX` dedupe so a signature seen by both the backfill and the live feed (or twice after a reconnect) is published once. Workers still read through the live Helius limiter (4/s on the free plan), so a burst queues in the Redis stream instead of being dropped. A real per-key budget comes with the provider lanes (1c)
 * \[x] A9. Fixtures captured from real txs (outbound, inbound, admin/attest rejected, unsupported variant) and golden tests per adapter. Inbound fixtures also carry the captured posted VAA account (`account_<name>_vaa.json`), and the golden tests decode redeems from it (A1b)
 * \[ ] A10. API versioning: `/api/v2` serves the generalised model (protocol, direction, via, chain references, all transfers of a tx). `/api/v1` keeps its current Wormhole-shaped response through a compatibility mapper until it is retired. Amounts are stored as `NUMERIC` so volume can be aggregated
 

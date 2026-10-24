@@ -14,6 +14,23 @@ pub struct ReenrichConfig {
     pub max_age_secs: i64,
 }
 
+/// Always-on Solana ingestion (A8).
+#[derive(Clone, Debug)]
+pub struct IngestConfig {
+    /// Kill switch. `INGEST_ENABLED=0` stops the ingester from starting at all.
+    pub enabled: bool,
+    /// Replay the signatures missed since the checkpoint each time a connection starts.
+    pub backfill: bool,
+    /// Most signatures one backfill run will publish. Bounds the Helius spend after a long
+    /// outage; the checkpoint still moves forward, so the next restart does not repeat it.
+    pub backfill_max: usize,
+    /// Pause between backfilled signatures, to stay under the Helius plan's rate cap.
+    pub backfill_pace_ms: u64,
+    /// How long a published signature is remembered so a repeat (backfill overlapping the
+    /// live feed, a reconnect) is not published twice. `0` disables the check.
+    pub dedupe_ttl_secs: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct AppConfig {
     pub database_url: String,
@@ -28,10 +45,7 @@ pub struct AppConfig {
     pub solana_token_bridge_program: String,
     pub solana_ws_url: String,
     pub allowed_origins: Vec<String>,
-    /// How long ingestion keeps running after the last live client leaves.
-    pub live_idle_grace_secs: u64,
-    /// Replay missed signatures from the checkpoint each time ingestion starts.
-    pub live_backfill: bool,
+    pub ingest: IngestConfig,
     pub reenrich: ReenrichConfig,
     /// How often the in-memory chain registry reloads from Postgres.
     pub chain_registry_refresh_secs: u64,
@@ -78,13 +92,17 @@ impl AppConfig {
             solana_token_bridge_program: required("SOLANA_TOKEN_BRIDGE_PROGRAM")?,
             solana_ws_url: required("SOLANA_WS_URL")?,
             allowed_origins: csv_list("ALLOWED_ORIGINS"),
-            live_idle_grace_secs: std::env::var("LIVE_IDLE_GRACE_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(20),
-            live_backfill: std::env::var("LIVE_BACKFILL")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false),
+            ingest: IngestConfig {
+                enabled: std::env::var("INGEST_ENABLED")
+                    .map(|v| v != "0")
+                    .unwrap_or(true),
+                backfill: std::env::var("LIVE_BACKFILL")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(true),
+                backfill_max: number("INGEST_BACKFILL_MAX", 5000usize),
+                backfill_pace_ms: number("INGEST_BACKFILL_PACE_MS", 150u64),
+                dedupe_ttl_secs: number("INGEST_DEDUPE_TTL_SECS", 3600u64),
+            },
             chain_registry_refresh_secs: number("CHAIN_REGISTRY_REFRESH_SECS", 60u64).max(5),
             reenrich: ReenrichConfig {
                 enabled: std::env::var("REENRICH_ENABLED")

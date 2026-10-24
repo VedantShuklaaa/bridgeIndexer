@@ -10,8 +10,12 @@ use tracing::{error, info, warn};
 
 use crate::{
     clients::helius::get_signatures_for_address,
+    config::IngestConfig,
     db::repository::{get_last_ingested_slot, set_last_ingested_slot},
-    ingestion::types::{CandidateTransaction, LogsConfig, LogsFilter, SolanaRpcRequest},
+    ingestion::{
+        backfill::{plan_page, should_backfill},
+        types::{CandidateTransaction, LogsConfig, LogsFilter, SolanaRpcRequest},
+    },
     redis::producer::RedisProducer,
 };
 
@@ -22,7 +26,7 @@ pub struct SolanaIngester {
     db: PgPool,
     client: reqwest::Client,
     helius_url: String,
-    backfill_enabled: bool,
+    config: IngestConfig,
 }
 
 impl SolanaIngester {
@@ -33,7 +37,7 @@ impl SolanaIngester {
         db: PgPool,
         client: reqwest::Client,
         helius_url: String,
-        backfill_enabled: bool,
+        config: IngestConfig,
     ) -> Self {
         Self {
             ws_url,
@@ -42,7 +46,7 @@ impl SolanaIngester {
             db,
             client,
             helius_url,
-            backfill_enabled,
+            config,
         }
     }
 
@@ -99,7 +103,7 @@ impl SolanaIngester {
             "Subscribed to Solana bridge logs"
         );
 
-        if self.backfill_enabled
+        if self.config.backfill
             && let Err(error) = self.backfill_missed_transactions(stop).await
         {
             warn!(%error, "Solana transaction backfill failed, continuing with live ingestion");
@@ -143,10 +147,21 @@ impl SolanaIngester {
     async fn backfill_missed_transactions(&self, stop: &CancellationToken) -> Result<()> {
         let last_ingested_slot = get_last_ingested_slot(&self.db, "solana").await?;
 
-        info!(last_ingested_slot, "Starting Solana transaction backfill");
+        if !should_backfill(last_ingested_slot) {
+            info!("No ingestion checkpoint yet, skipping backfill");
+            return Ok(());
+        }
 
+        info!(
+            last_ingested_slot,
+            max = self.config.backfill_max,
+            "Starting Solana transaction backfill"
+        );
+
+        let pace = Duration::from_millis(self.config.backfill_pace_ms);
         let mut before: Option<String> = None;
-        let mut recovered = 0usize;
+        let mut published = 0usize;
+        let mut skipped = 0usize;
 
         loop {
             if stop.is_cancelled() {
@@ -165,53 +180,43 @@ impl SolanaIngester {
                 break;
             }
 
-            let mut reached_checkpoint = false;
+            let remaining = self.config.backfill_max.saturating_sub(published);
+            let page = plan_page(&signatures, last_ingested_slot, remaining);
 
-            for signature_info in &signatures {
-                let slot = match signature_info.get("slot").and_then(Value::as_u64) {
-                    Some(slot) => slot,
-                    None => continue,
-                };
-
-                if slot <= last_ingested_slot {
-                    reached_checkpoint = true;
-                    break;
+            for candidate in &page.candidates {
+                if stop.is_cancelled() {
+                    return Ok(());
                 }
 
-                let err = signature_info.get("err");
-
-                if err.is_some_and(|value| !value.is_null()) {
-                    continue;
-                }
-
-                let signature = match signature_info.get("signature").and_then(Value::as_str) {
-                    Some(signature) => signature,
-                    None => continue,
-                };
-
-                let candidate = CandidateTransaction {
-                    chain: "solana".to_string(),
-                    tx_hash: signature.to_string(),
-                    slot,
-                };
-
-                self.redis
-                    .publish_transaction(&candidate)
+                let fresh = self
+                    .redis
+                    .publish_transaction(candidate, self.config.dedupe_ttl_secs)
                     .await
                     .context("failed to publish backfilled transaction")?;
 
-                tokio::time::sleep(Duration::from_millis(150)).await; // stay under Helius's free-tier rate cap
+                if !fresh {
+                    skipped += 1;
+                    continue;
+                }
 
-                recovered += 1;
+                published += 1;
 
                 info!(
                     tx_hash = %candidate.tx_hash,
                     slot = candidate.slot,
                     "Published backfilled transaction"
                 );
+
+                tokio::time::sleep(pace).await;
             }
 
-            if reached_checkpoint {
+            if page.done {
+                if published >= self.config.backfill_max {
+                    warn!(
+                        max = self.config.backfill_max,
+                        "Backfill stopped at INGEST_BACKFILL_MAX, older signatures were not replayed"
+                    );
+                }
                 break;
             }
 
@@ -222,8 +227,8 @@ impl SolanaIngester {
         }
 
         info!(
-            recovered,
-            last_ingested_slot, "Solana transaction backfill completed"
+            published,
+            skipped, last_ingested_slot, "Solana transaction backfill completed"
         );
 
         Ok(())
@@ -301,10 +306,15 @@ impl SolanaIngester {
             "Detected Solana transaction involving bridge program"
         );
 
-        self.redis
-            .publish_transaction(&candidate)
+        let fresh = self
+            .redis
+            .publish_transaction(&candidate, self.config.dedupe_ttl_secs)
             .await
             .context("failed to publish transaction to Redis")?;
+
+        if !fresh {
+            info!(tx_hash = %candidate.tx_hash, "Signature already published recently, skipping");
+        }
 
         set_last_ingested_slot(&self.db, "solana", candidate.slot)
             .await
