@@ -8,7 +8,7 @@
 //! instructions, and its output must agree with what WormholeScan reports.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use bridge::chains::Snapshot;
+use bridge::chains::{ChainRow, MappingRow, NS_WORMHOLE, RawChainRef, RegistryStatus, Snapshot};
 use bridge::domain::bridge_transfer::{BridgeStatus, ChainId};
 use bridge::protocols::registry::default_registry;
 use bridge::protocols::wormhole::TOKEN_BRIDGE;
@@ -16,7 +16,7 @@ use bridge::protocols::{
     AccountData, Classification, DetectedTransfer, Direction, Protocol, Reject, SolanaTx,
 };
 use bridge::services::detect::{self, Enrichment};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::fs;
 use std::path::PathBuf;
 
@@ -311,5 +311,240 @@ fn inbound_redeems_become_completed_inbound_transfers() {
             Some(f.tx.signature.as_str()),
             "{name}: destination tx kept"
         );
+    }
+}
+
+// Status matrix (1d), redefined for chain-first detection.
+//
+// The status no longer starts from WormholeScan's answer. An adapter decodes the
+// transfer from the Solana tx alone, so every outbound send starts `Detected` and
+// enrichment can only raise it. Registry membership decides whether a chain
+// reference resolves and whether an explorer URL exists, never the status, so each
+// outbound row runs against both an unregistered and a registered destination.
+//
+// `Detected`  chain data only: no VAA, a VAA for another message, or a destination
+//             tx with no VAA behind it (the chain is the source of truth)
+// `Pending`   the matched VAA exists, its destination tx does not yet
+// `Completed` the matched VAA and its destination tx are both known
+//
+// A Solana-inbound redeem is `Completed` at detection: the observed tx is the
+// destination side and a decoded redeem has succeeded.
+
+/// What WormholeScan returns for the observed Solana tx.
+#[derive(Debug, Clone, Copy)]
+enum Operation {
+    /// WormholeScan does not know the tx (an empty response).
+    Nothing,
+    /// It names a destination tx but carries no VAA. Must not advance the transfer.
+    DestinationTxWithoutVaa,
+    /// A VAA for a different message (same emitter, another sequence). Ignored.
+    OtherMessage,
+    /// The VAA of this very message, with no destination tx.
+    MatchingVaa,
+    /// The captured `/operations` item for this fixture.
+    Captured,
+}
+
+fn operation_for(f: &Fixture, kind: Operation) -> Value {
+    match kind {
+        Operation::Nothing => json!({}),
+        Operation::DestinationTxWithoutVaa => json!({
+            "targetChain": {"transaction": {"txHash": "0xmust-not-complete"}}
+        }),
+        Operation::OtherMessage => {
+            // A real VAA captured for another transfer: same emitter, other sequence.
+            let other = if f.name == OUTBOUND[0] {
+                OUTBOUND[1]
+            } else {
+                OUTBOUND[0]
+            };
+            json!({
+                "vaa": {"raw": fixture(other).op["vaa"]["raw"].clone()},
+                "targetChain": {"transaction": {"txHash": "0xmust-not-complete"}}
+            })
+        }
+        Operation::MatchingVaa => json!({"vaa": {"raw": f.op["vaa"]["raw"].clone()}}),
+        Operation::Captured => f.op.clone(),
+    }
+}
+
+fn status_name(status: &BridgeStatus) -> &'static str {
+    match status {
+        BridgeStatus::Detected => "Detected",
+        BridgeStatus::Pending => "Pending",
+        BridgeStatus::Completed => "Completed",
+    }
+}
+
+/// A registry that knows Solana and `destination`, with active rows in both tables.
+fn registry_with(destination: &RawChainRef) -> Snapshot {
+    let chain = |id: i16, slug: &str| ChainRow {
+        id,
+        slug: slug.into(),
+        name: slug.into(),
+        kind: "other".into(),
+        explorer_tx_url: Some(format!("https://{slug}.example/tx/{{hash}}")),
+        status: RegistryStatus::Active,
+    };
+    let mapping = |protocol: &str, id: &str, chain_id: i16| MappingRow {
+        protocol: protocol.into(),
+        protocol_chain_id: id.into(),
+        chain_id,
+        status: RegistryStatus::Active,
+    };
+    Snapshot::build(
+        vec![chain(1, "solana"), chain(2, "destination")],
+        vec![
+            mapping(NS_WORMHOLE, "1", 1),
+            mapping(&destination.protocol, &destination.id, 2),
+        ],
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StatusCase {
+    fixture: &'static str,
+    operation: Operation,
+    expected: &'static str,
+}
+
+const OUTBOUND_MATRIX: [StatusCase; 7] = [
+    StatusCase {
+        fixture: "completed_outbound",
+        operation: Operation::Nothing,
+        expected: "Detected",
+    },
+    StatusCase {
+        fixture: "completed_outbound",
+        operation: Operation::DestinationTxWithoutVaa,
+        expected: "Detected",
+    },
+    StatusCase {
+        fixture: "completed_outbound",
+        operation: Operation::OtherMessage,
+        expected: "Detected",
+    },
+    StatusCase {
+        fixture: "completed_outbound",
+        operation: Operation::MatchingVaa,
+        expected: "Pending",
+    },
+    StatusCase {
+        fixture: "completed_outbound",
+        operation: Operation::Captured,
+        expected: "Completed",
+    },
+    StatusCase {
+        fixture: "payload3_executor",
+        operation: Operation::Captured,
+        expected: "Completed",
+    },
+    StatusCase {
+        fixture: "payload3_plain",
+        operation: Operation::Captured,
+        expected: "Pending",
+    },
+];
+
+#[test]
+fn status_matrix_for_chain_first_detection() {
+    for case in OUTBOUND_MATRIX {
+        let f = fixture(case.fixture);
+        let found = transfers(&f);
+        assert_eq!(found.len(), 1, "{}: transfers in the tx", case.fixture);
+        let decoded = &found[0];
+        assert_eq!(
+            decoded.direction,
+            Direction::Outbound,
+            "{}: direction",
+            case.fixture
+        );
+
+        for registry in ["unregistered", "registered"] {
+            let snapshot = match registry {
+                "registered" => registry_with(&decoded.destination),
+                _ => Snapshot::default(),
+            };
+            let mut t = detect::to_bridge_transfer(decoded, None, &snapshot)
+                .unwrap_or_else(|e| panic!("{}: {e}", case.fixture));
+
+            // The chain alone is enough to persist the transfer.
+            assert_eq!(
+                status_name(&t.status),
+                "Detected",
+                "{}: before enrichment",
+                case.fixture
+            );
+
+            detect::apply_wormholescan(&mut t, &operation_for(&f, case.operation), &snapshot);
+
+            assert_eq!(
+                status_name(&t.status),
+                case.expected,
+                "{} / {:?} / {registry} destination: status",
+                case.fixture,
+                case.operation
+            );
+            assert_eq!(
+                t.destination_tx_hash.is_some(),
+                case.expected == "Completed",
+                "{} / {:?} / {registry} destination: destination tx",
+                case.fixture,
+                case.operation
+            );
+        }
+    }
+}
+
+#[test]
+fn status_matrix_for_inbound_redeems() {
+    for name in INBOUND {
+        let mut f = fixture(name);
+        with_vaa_account(&mut f);
+        let found = transfers(&f);
+        let decoded = &found[0];
+        assert_eq!(decoded.direction, Direction::Inbound, "{name}: direction");
+
+        for registry in ["unregistered", "registered"] {
+            let snapshot = match registry {
+                "registered" => registry_with(&decoded.destination),
+                _ => Snapshot::default(),
+            };
+            let mut t = detect::to_bridge_transfer(decoded, None, &snapshot)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+
+            // The redeem itself is the destination tx, and it succeeded.
+            assert_eq!(
+                status_name(&t.status),
+                "Completed",
+                "{name} / {registry} destination: at detection"
+            );
+            assert_eq!(t.source_tx_hash, None, "{name}: origin tx unknown");
+
+            // A matched operation fills the origin tx and keeps the status.
+            detect::apply_wormholescan(&mut t, &f.op, &snapshot);
+            assert_eq!(
+                status_name(&t.status),
+                "Completed",
+                "{name}: after a matched operation"
+            );
+            assert!(t.source_tx_hash.is_some(), "{name}: origin tx filled");
+        }
+
+        // A VAA for another message changes neither the status nor the origin tx.
+        let mut t = detect::to_bridge_transfer(decoded, None, &Snapshot::default())
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let other = if name == INBOUND[0] {
+            INBOUND[1]
+        } else {
+            INBOUND[0]
+        };
+        detect::apply_wormholescan(&mut t, &fixture(other).op, &Snapshot::default());
+        assert_eq!(
+            status_name(&t.status),
+            "Completed",
+            "{name}: another message is ignored"
+        );
+        assert_eq!(t.source_tx_hash, None, "{name}: origin tx still unknown");
     }
 }
