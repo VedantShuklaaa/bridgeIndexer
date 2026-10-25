@@ -1,5 +1,6 @@
 use crate::clients::limiter::call_upstream;
 use crate::clients::{helius, wormhole};
+use crate::domain::analysis::{Analysis, DecodedTransfer};
 use crate::domain::bridge_transfer::BridgeMessageId;
 use crate::domain::transaction::{NormalisedTransaction, TxStatus};
 use crate::enrichment::{EnrichInput, EnrichOutcome, Prefetch};
@@ -13,11 +14,7 @@ use crate::state::AppState;
 use crate::vaa::decode::{decode_destination_address, decode_vaa};
 use serde_json::Value;
 
-pub async fn analyse_tx(
-    state: &AppState,
-    chain: &str,
-    hash: &str,
-) -> Result<NormalisedTransaction, AppError> {
+pub async fn analyse_tx(state: &AppState, chain: &str, hash: &str) -> Result<Analysis, AppError> {
     if hash.trim().is_empty() {
         return Err(AppError::InvalidTransactionHash(hash.to_string()));
     }
@@ -55,49 +52,60 @@ pub async fn analyse_tx(
         // observed Solana tx is the destination side, see `detect::to_bridge_transfer`.
         let detected = detect::detect(&state.protocols, solana_tx);
 
-        if let Some(first) = detected.first() {
+        if !detected.is_empty() {
             if detected.len() > 1 {
-                tracing::warn!(
+                tracing::info!(
                     signature = %hash,
                     count = detected.len(),
-                    "several transfers in one tx, only the first is stored until the v2 model"
+                    "several transfers in one tx"
                 );
             }
 
-            // Best effort: a slow or failing metadata lookup never blocks detection.
-            let metadata = match detect::token_lookup(first) {
-                Some((token_chain, address)) => tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    resolve_token_metadata(&state.registry, token_chain, &address, None),
-                )
-                .await
-                .ok()
-                .and_then(Result::ok),
-                None => None,
-            };
+            let snapshot = state.chains.snapshot();
+            let mut decoded = Vec::with_capacity(detected.len());
+            for (position, transfer) in detected.iter().enumerate() {
+                // Best effort: a slow or failing metadata lookup never blocks detection.
+                let metadata = match detect::token_lookup(transfer) {
+                    Some((token_chain, address)) => tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        resolve_token_metadata(&state.registry, token_chain, &address, None),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok),
+                    None => None,
+                };
 
-            let mut transfer =
-                detect::to_bridge_transfer(first, metadata, &state.chains.snapshot())?;
-            let enriched = state
-                .enrichment
-                .enrich(
-                    EnrichInput {
-                        source_tx_hash: hash,
-                        prefetch: Prefetch::Done(wormhole_result.as_ref()),
-                    },
-                    &mut transfer,
-                )
-                .await;
-            if enriched.outcome == EnrichOutcome::Applied {
-                tx.bridge_event = enriched.bridge_event;
+                let mut bridge = detect::to_bridge_transfer(transfer, metadata, &snapshot)?;
+                let enriched = state
+                    .enrichment
+                    .enrich(
+                        EnrichInput {
+                            source_tx_hash: hash,
+                            prefetch: Prefetch::Done(wormhole_result.as_ref()),
+                        },
+                        &mut bridge,
+                    )
+                    .await;
+                // The v1 body carries the first transfer and its WormholeScan event.
+                if position == 0 && enriched.outcome == EnrichOutcome::Applied {
+                    tx.bridge_event = enriched.bridge_event;
+                }
+                decoded.push(DecodedTransfer {
+                    detected: transfer.clone(),
+                    bridge,
+                });
             }
-            tx.bridge_transfer = Some(transfer);
+            tx.bridge_transfer = decoded.first().map(|decoded| decoded.bridge.clone());
 
             tracing::info!(
                 total_ms = t_total.elapsed().as_millis() as u64,
                 "analyse_tx total (chain-first)"
             );
-            return Ok(tx);
+            return Ok(Analysis {
+                tx,
+                transfers: decoded,
+            });
         }
     }
 
@@ -218,7 +226,10 @@ pub async fn analyse_tx(
         total_ms = t_total.elapsed().as_millis() as u64,
         "analyse_tx total"
     );
-    Ok(tx)
+    Ok(Analysis {
+        tx,
+        transfers: Vec::new(),
+    })
 }
 
 fn extract_wormholescan_field(raw: &Value, field: &str) -> Option<String> {

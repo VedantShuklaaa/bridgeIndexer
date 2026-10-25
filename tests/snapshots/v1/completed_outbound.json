@@ -1,0 +1,36 @@
+{
+  "hash": "z4n35SQx2J6jetynz7MvHnL5Bej5SCk8wq22uGpsmDJdMfWV6ydtXJZrinSefpjM57n73L76e3YvdVqNgE5hxQt",
+  "chain": "Solana",
+  "status": "Success",
+  "slot": 459518492,
+  "timestamp": 1792561816,
+  "fee_lamports": 50000,
+  "signer": "AQFnRFkK8Jrxi91h2HCxQrdtdayWPSHKvAURR85ZeLWG",
+  "bridge_event": {
+    "sequence": 1433835,
+    "emitter_chain": "1",
+    "emitter_address": "ec7372995d5cc8732397fb0ad35c0121e0eaa90d26f828a534cab54391b3a4f5",
+    "target_chain": "5",
+    "amount": null
+  },
+  "bridge_transfer": {
+    "source_chain": "Solana",
+    "source_tx_hash": "z4n35SQx2J6jetynz7MvHnL5Bej5SCk8wq22uGpsmDJdMfWV6ydtXJZrinSefpjM57n73L76e3YvdVqNgE5hxQt",
+    "source_wallet": "AQFnRFkK8Jrxi91h2HCxQrdtdayWPSHKvAURR85ZeLWG",
+    "source_explorer_url": "https://solana.example/tx/z4n35SQx2J6jetynz7MvHnL5Bej5SCk8wq22uGpsmDJdMfWV6ydtXJZrinSefpjM57n73L76e3YvdVqNgE5hxQt",
+    "destination_chain": "Polygon",
+    "destination_wallet": "0x49719d256a5ea16bfa579ea16e95bea9fa41a452",
+    "destination_tx_hash": "0xe52021237f7e0e10b5a258701896914cbb9f7303c0af8701f3e838fcddb6ada8",
+    "destination_explorer_url": "https://polygon.example/tx/0xe52021237f7e0e10b5a258701896914cbb9f7303c0af8701f3e838fcddb6ada8",
+    "token": "0xe1c91d68ceeb3776f6f51d2f1167901cad6ad45c",
+    "token_symbol": null,
+    "amount": "21244835425508",
+    "amount_formatted": "212448.35425508",
+    "message_id": {
+      "emitter_chain": 1,
+      "emitter_address": "ec7372995d5cc8732397fb0ad35c0121e0eaa90d26f828a534cab54391b3a4f5",
+      "sequence": 1433835
+    },
+    "status": "Completed"
+  }
+}

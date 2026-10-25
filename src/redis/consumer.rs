@@ -1,7 +1,8 @@
-use crate::db::repository::persist_transaction;
+use crate::db::repository::persist_analysis;
+use crate::domain::analysis::Analysis;
 use crate::error::AppError;
+use crate::services::analyzer::analyse_tx;
 use crate::state::AppState;
-use crate::{domain::transaction::NormalisedTransaction, services::analyzer::analyse_tx};
 use anyhow::{Context, Result};
 use redis::Value;
 use std::time::{Duration, Instant};
@@ -145,11 +146,7 @@ impl RedisConsumer {
     /// A fresh Solana transfer has no Wormhole VAA until the guardians have seen it
     /// finalised, which takes well over the few seconds the other transient errors
     /// get, so a missing VAA is retried on its own, longer schedule.
-    async fn analyse_with_retry(
-        &self,
-        chain: &str,
-        tx_hash: &str,
-    ) -> Result<NormalisedTransaction, AppError> {
+    async fn analyse_with_retry(&self, chain: &str, tx_hash: &str) -> Result<Analysis, AppError> {
         const MAX_TRANSIENT_ATTEMPTS: u32 = 5;
         const VAA_RETRY_INTERVAL: Duration = Duration::from_secs(5);
         const VAA_MAX_WAIT: Duration = Duration::from_secs(90);
@@ -194,11 +191,11 @@ impl RedisConsumer {
         }
     }
 
-    async fn persist_with_retry(&self, transaction: &NormalisedTransaction) -> Result<()> {
+    async fn persist_with_retry(&self, analysed: &Analysis) -> Result<()> {
         const MAX_ATTEMPTS: u32 = 3;
 
         for attempt in 1..=MAX_ATTEMPTS {
-            match persist_transaction(&self.state.db, transaction).await {
+            match persist_analysis(&self.state.db, &analysed.tx, &analysed.transfers).await {
                 Ok(()) => return Ok(()),
 
                 Err(error) if attempt < MAX_ATTEMPTS => {
@@ -452,7 +449,7 @@ impl RedisConsumer {
                     "Transaction persisted successfully"
                 );
 
-                match serde_json::to_string(&analysed) {
+                match serde_json::to_string(&analysed.tx) {
                     Ok(payload) => {
                         let _ = self.state.tx_broadcast.send(payload);
                     }

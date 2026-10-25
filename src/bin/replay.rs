@@ -149,7 +149,7 @@ async fn replay_one(state: &AppState, sig: &Sig, min_age_secs: i64, now: i64) ->
     };
 
     let tx = match result {
-        Ok(tx) => tx,
+        Ok(analysed) => analysed.tx,
         Err(e) => {
             let kind = e.code().to_string();
             return report(Outcome::Error(kind.clone()), Some(format!("{kind}: {e}")));

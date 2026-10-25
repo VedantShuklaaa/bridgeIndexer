@@ -1,0 +1,36 @@
+{
+  "hash": "5aoqeSKH7gXsoC1WvF32xWa4AspD2jf24imY2m28pMaLyNX1riiHUmmh8vch4GoeRYJ5exiT95Uqy5bYJUtLsnog",
+  "chain": "Solana",
+  "status": "Success",
+  "slot": 459566028,
+  "timestamp": 1792572075,
+  "fee_lamports": 14019,
+  "signer": "7dm9am6Qx7cH64RB99Mzf7ZsLbEfmXM7ihXXCvMiT2X1",
+  "bridge_event": {
+    "sequence": 1433866,
+    "emitter_chain": "1",
+    "emitter_address": "ec7372995d5cc8732397fb0ad35c0121e0eaa90d26f828a534cab54391b3a4f5",
+    "target_chain": "2",
+    "amount": "669918468"
+  },
+  "bridge_transfer": {
+    "source_chain": "Solana",
+    "source_tx_hash": "5aoqeSKH7gXsoC1WvF32xWa4AspD2jf24imY2m28pMaLyNX1riiHUmmh8vch4GoeRYJ5exiT95Uqy5bYJUtLsnog",
+    "source_wallet": "7dm9am6Qx7cH64RB99Mzf7ZsLbEfmXM7ihXXCvMiT2X1",
+    "source_explorer_url": "https://solana.example/tx/5aoqeSKH7gXsoC1WvF32xWa4AspD2jf24imY2m28pMaLyNX1riiHUmmh8vch4GoeRYJ5exiT95Uqy5bYJUtLsnog",
+    "destination_chain": "Ethereum",
+    "destination_wallet": "0xbf5f3f65102ae745a48bd521d10bab5bf02a9ef4",
+    "destination_tx_hash": null,
+    "destination_explorer_url": null,
+    "token": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+    "token_symbol": null,
+    "amount": "669918468",
+    "amount_formatted": "6.69918468",
+    "message_id": {
+      "emitter_chain": 1,
+      "emitter_address": "ec7372995d5cc8732397fb0ad35c0121e0eaa90d26f828a534cab54391b3a4f5",
+      "sequence": 1433866
+    },
+    "status": "Pending"
+  }
+}

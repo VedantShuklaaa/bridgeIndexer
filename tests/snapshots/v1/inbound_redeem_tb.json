@@ -1,0 +1,36 @@
+{
+  "hash": "eY4rTSrvsNSTijunz14WxYvewstNLQLbammM6V5FYJwqZj215fxK5CivXeCpzu3kdTbrGysena3M7ukdPnZfMMZ",
+  "chain": "Solana",
+  "status": "Success",
+  "slot": 459614226,
+  "timestamp": 1792582496,
+  "fee_lamports": 125000,
+  "signer": "ELoHs26hBmvXeNxnb1daKEaUs3XugfEHreQ1zNioNJJy",
+  "bridge_event": {
+    "sequence": 697844,
+    "emitter_chain": "2",
+    "emitter_address": "0000000000000000000000003ee18b2214aff97000d974cf647e7c347e8fa585",
+    "target_chain": "1",
+    "amount": "2521801495132"
+  },
+  "bridge_transfer": {
+    "source_chain": "Ethereum",
+    "source_tx_hash": "0x41d568574e2ace3feecf840107e2b1124cdcd150852df0e3d9522010b046101b",
+    "source_wallet": null,
+    "source_explorer_url": "https://ethereum.example/tx/0x41d568574e2ace3feecf840107e2b1124cdcd150852df0e3d9522010b046101b",
+    "destination_chain": "Solana",
+    "destination_wallet": "GGyf8uikjffMNXgY4eVT4pVhwsuNFGprTx6QuVNoBQgp",
+    "destination_tx_hash": "eY4rTSrvsNSTijunz14WxYvewstNLQLbammM6V5FYJwqZj215fxK5CivXeCpzu3kdTbrGysena3M7ukdPnZfMMZ",
+    "destination_explorer_url": "https://solana.example/tx/eY4rTSrvsNSTijunz14WxYvewstNLQLbammM6V5FYJwqZj215fxK5CivXeCpzu3kdTbrGysena3M7ukdPnZfMMZ",
+    "token": "0x72e4f9f808c49a2a61de9c5896298920dc4eeea9",
+    "token_symbol": null,
+    "amount": "2521801495132",
+    "amount_formatted": "25218.01495132",
+    "message_id": {
+      "emitter_chain": 2,
+      "emitter_address": "0000000000000000000000003ee18b2214aff97000d974cf647e7c347e8fa585",
+      "sequence": 697844
+    },
+    "status": "Completed"
+  }
+}
