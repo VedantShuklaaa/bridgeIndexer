@@ -1,4 +1,5 @@
-use crate::chains::NS_WORMHOLE;
+use crate::chains::{NS_WORMHOLE, RawChainRef};
+use crate::domain::analysis::DecodedTransfer;
 use crate::domain::bridge_transfer::BridgeTransfer;
 use crate::domain::transaction::NormalisedTransaction;
 use crate::protocols::{MessageId, amount::RawAmount};
@@ -7,9 +8,80 @@ use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 
 pub async fn persist_transaction(pool: &PgPool, tx: &NormalisedTransaction) -> anyhow::Result<()> {
-    let mut db_tx: Transaction<'_, Postgres> = pool.begin().await?;
+    persist_analysis(pool, tx, &[]).await
+}
 
-    let transaction_id: i64 = sqlx::query_scalar(
+/// Writes the transaction and every decoded transfer. `transfers` is empty on the
+/// WormholeScan-driven path and for re-enrichment, where the v1 body already holds the
+/// one transfer to persist.
+pub async fn persist_analysis(
+    pool: &PgPool,
+    tx: &NormalisedTransaction,
+    transfers: &[DecodedTransfer],
+) -> anyhow::Result<()> {
+    let mut db_tx: Transaction<'_, Postgres> = pool.begin().await?;
+    let transaction_id = upsert_transaction(&mut db_tx, tx).await?;
+
+    if transfers.is_empty() {
+        if let Some(bridge) = &tx.bridge_transfer {
+            let analysis = serde_json::to_value(tx)?;
+            write_transfer(&mut db_tx, transaction_id, legacy_row(tx, bridge, analysis)).await?;
+        }
+    } else {
+        for (position, decoded) in transfers.iter().enumerate() {
+            // The cached v1 analysis follows the row it belongs to. Only the first
+            // transfer carries the WormholeScan event `/api/v1` exposes.
+            let mut row_tx = tx.clone();
+            row_tx.bridge_transfer = Some(decoded.bridge.clone());
+            row_tx.bridge_event = if position == 0 {
+                tx.bridge_event.clone()
+            } else {
+                None
+            };
+            let analysis = serde_json::to_value(&row_tx)?;
+
+            let event_index = i16::try_from(decoded.detected.event_index).map_err(|_| {
+                anyhow::anyhow!("event index too large: {}", decoded.detected.event_index)
+            })?;
+            write_transfer(
+                &mut db_tx,
+                transaction_id,
+                TransferRow {
+                    protocol: decoded.detected.message.protocol().as_str().to_string(),
+                    direction: decoded.detected.direction.as_str().to_string(),
+                    message: decoded.detected.message.clone(),
+                    observed_tx_hash: decoded.detected.observed_tx.clone(),
+                    event_index,
+                    via: decoded.detected.via.as_ref().map(|via| via.name.clone()),
+                    via_ref: decoded
+                        .detected
+                        .via
+                        .as_ref()
+                        .and_then(|via| via.reference.clone()),
+                    source: decoded.detected.source.clone(),
+                    destination: decoded.detected.destination.clone(),
+                    token_ref: decoded
+                        .detected
+                        .token
+                        .as_ref()
+                        .map(|token| token.chain.clone()),
+                    bridge: &decoded.bridge,
+                    analysis,
+                },
+            )
+            .await?;
+        }
+    }
+
+    db_tx.commit().await?;
+    Ok(())
+}
+
+async fn upsert_transaction(
+    db_tx: &mut Transaction<'_, Postgres>,
+    tx: &NormalisedTransaction,
+) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar(
         r#"
         INSERT INTO transactions (
             hash,
@@ -37,31 +109,60 @@ pub async fn persist_transaction(pool: &PgPool, tx: &NormalisedTransaction) -> a
     )
     .bind(tx.fee_lamports as i64)
     .bind(&tx.signer)
-    .fetch_one(&mut *db_tx)
-    .await?;
-
-    if let Some(bridge) = &tx.bridge_transfer {
-        let analysis = serde_json::to_value(tx)?;
-        persist_bridge_transfer(&mut db_tx, transaction_id, &tx.hash, bridge, &analysis).await?;
-    }
-
-    db_tx.commit().await?;
-
-    Ok(())
+    .fetch_one(&mut **db_tx)
+    .await?)
 }
 
-async fn persist_bridge_transfer(
+/// One `bridge_transfers` row to write, generalised across protocols.
+struct TransferRow<'a> {
+    protocol: String,
+    direction: String,
+    message: MessageId,
+    observed_tx_hash: String,
+    event_index: i16,
+    via: Option<String>,
+    via_ref: Option<String>,
+    source: RawChainRef,
+    destination: RawChainRef,
+    token_ref: Option<RawChainRef>,
+    bridge: &'a BridgeTransfer,
+    analysis: serde_json::Value,
+}
+
+/// The single transfer the v1 body carries, for the WormholeScan-driven path and
+/// re-enrichment. Raw chain references are the protocol's own (`wormhole`), and the
+/// token chain is unknown to the v1 shape.
+fn legacy_row<'a>(
+    tx: &NormalisedTransaction,
+    bridge: &'a BridgeTransfer,
+    analysis: serde_json::Value,
+) -> TransferRow<'a> {
+    TransferRow {
+        protocol: NS_WORMHOLE.to_string(),
+        direction: bridge.direction().as_str().to_string(),
+        message: MessageId::Wormhole {
+            emitter_chain: bridge.message_id.emitter_chain,
+            emitter_address: bridge.message_id.emitter_address.clone(),
+            sequence: bridge.message_id.sequence,
+        },
+        observed_tx_hash: tx.hash.clone(),
+        event_index: 0,
+        via: None,
+        via_ref: None,
+        source: RawChainRef::wormhole(bridge.source_chain.wormhole_id()),
+        destination: RawChainRef::wormhole(bridge.destination_chain.wormhole_id()),
+        token_ref: None,
+        bridge,
+        analysis,
+    }
+}
+
+async fn write_transfer(
     db_tx: &mut Transaction<'_, Postgres>,
     transaction_id: i64,
-    observed_tx_hash: &str,
-    bridge: &BridgeTransfer,
-    analysis: &serde_json::Value,
+    row: TransferRow<'_>,
 ) -> anyhow::Result<()> {
-    let message = MessageId::Wormhole {
-        emitter_chain: bridge.message_id.emitter_chain,
-        emitter_address: bridge.message_id.emitter_address.clone(),
-        sequence: bridge.message_id.sequence,
-    };
+    let bridge = row.bridge;
     // An amount that is not a plain integer is stored as NULL. The analysis JSON keeps it.
     let amount = bridge
         .amount
@@ -73,19 +174,25 @@ async fn persist_bridge_transfer(
         r#"
         INSERT INTO bridge_transfers (
             transaction_id, protocol, message_key, direction, observed_tx_hash,
-            source_tx_hash, source_ref_protocol, source_ref_id, source_chain_id,
+            event_index, source_tx_hash,
+            source_ref_protocol, source_ref_id, source_chain_id,
             source_wallet, source_explorer_url,
             destination_ref_protocol, destination_ref_id, destination_chain_id,
             destination_wallet, destination_tx_hash, destination_explorer_url,
-            token, token_symbol, amount, amount_formatted, status, analysis
+            token_ref_protocol, token_ref_id, token_chain_id,
+            token, token_symbol, amount, amount_formatted, status, analysis,
+            via, via_ref
         )
         VALUES (
             $1, $2, $3, $4, $5,
-            $21, $6, $7, resolve_chain($6, $7),
-            $8, $9,
-            $10, $11, resolve_chain($10, $11),
-            $12, $13, $14,
-            $15, $16, $17::numeric, $18, $19, $20
+            $6, $7,
+            $8, $9, resolve_chain($8, $9),
+            $10, $11,
+            $12, $13, resolve_chain($12, $13),
+            $14, $15, $16,
+            $17, $18, resolve_chain($17, $18),
+            $19, $20, $21::numeric, $22, $23, $24,
+            $25, $26
         )
         ON CONFLICT (protocol, message_key)
         DO UPDATE SET
@@ -97,6 +204,12 @@ async fn persist_bridge_transfer(
             destination_explorer_url = COALESCE(EXCLUDED.destination_explorer_url, bridge_transfers.destination_explorer_url),
             token_symbol = COALESCE(EXCLUDED.token_symbol, bridge_transfers.token_symbol),
             amount_formatted = COALESCE(EXCLUDED.amount_formatted, bridge_transfers.amount_formatted),
+            -- composition can fill the router and token chain on a later pass
+            via = COALESCE(EXCLUDED.via, bridge_transfers.via),
+            via_ref = COALESCE(EXCLUDED.via_ref, bridge_transfers.via_ref),
+            token_ref_protocol = COALESCE(EXCLUDED.token_ref_protocol, bridge_transfers.token_ref_protocol),
+            token_ref_id = COALESCE(EXCLUDED.token_ref_id, bridge_transfers.token_ref_id),
+            token_chain_id = COALESCE(EXCLUDED.token_chain_id, bridge_transfers.token_chain_id),
             status = CASE WHEN bridge_transfers.status = 'Completed'
                             OR (bridge_transfers.status = 'Pending' AND EXCLUDED.status = 'Detected')
                           THEN bridge_transfers.status ELSE EXCLUDED.status END,
@@ -109,28 +222,40 @@ async fn persist_bridge_transfer(
         "#,
     )
     .bind(transaction_id)
-    .bind(message.protocol().as_str())
-    .bind(message.key())
-    .bind(bridge.direction().as_str())
-    .bind(observed_tx_hash)
-    .bind(NS_WORMHOLE)
-    .bind(bridge.source_chain.wormhole_id().to_string())
+    .bind(&row.protocol)
+    .bind(row.message.key())
+    .bind(&row.direction)
+    .bind(&row.observed_tx_hash)
+    .bind(row.event_index)
+    .bind(&bridge.source_tx_hash)
+    .bind(&row.source.protocol)
+    .bind(&row.source.id)
     .bind(&bridge.source_wallet)
     .bind(&bridge.source_explorer_url)
-    .bind(NS_WORMHOLE)
-    .bind(bridge.destination_chain.wormhole_id().to_string())
+    .bind(&row.destination.protocol)
+    .bind(&row.destination.id)
     .bind(&bridge.destination_wallet)
     .bind(&bridge.destination_tx_hash)
     .bind(&bridge.destination_explorer_url)
+    .bind(row.token_ref.as_ref().map(|r| r.protocol.as_str()))
+    .bind(row.token_ref.as_ref().map(|r| r.id.as_str()))
     .bind(&bridge.token)
     .bind(&bridge.token_symbol)
     .bind(amount)
     .bind(&bridge.amount_formatted)
     .bind(format!("{:?}", bridge.status))
-    .bind(analysis)
-    .bind(&bridge.source_tx_hash)
+    .bind(row.analysis)
+    .bind(row.via)
+    .bind(row.via_ref)
     .fetch_one(&mut **db_tx)
     .await?;
+
+    // One message identity per row today; other protocols will add their own detail.
+    let MessageId::Wormhole {
+        emitter_chain,
+        emitter_address,
+        sequence,
+    } = &row.message;
 
     sqlx::query(
         r#"
@@ -140,9 +265,9 @@ async fn persist_bridge_transfer(
         "#,
     )
     .bind(transfer_id)
-    .bind(i32::from(bridge.message_id.emitter_chain))
-    .bind(&bridge.message_id.emitter_address)
-    .bind(bridge.message_id.sequence.to_string())
+    .bind(i32::from(*emitter_chain))
+    .bind(emitter_address)
+    .bind(sequence.to_string())
     .execute(&mut **db_tx)
     .await?;
 

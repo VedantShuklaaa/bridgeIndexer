@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::db::repository::{
-    get_analysis_any_age, get_transaction_with_transfers, persist_transaction,
+    get_analysis_any_age, get_transaction_with_transfers, persist_analysis,
 };
 use crate::domain::api::TransactionResponse;
 use crate::domain::bridge::BridgeEvent;
@@ -177,11 +177,11 @@ async fn refresh(state: AppState, chain: String, hash: String, _slot: OwnedSemap
     .await;
 
     match fetched {
-        Ok(tx) if tx.bridge_transfer.is_some() => {
-            if let Err(e) = persist_transaction(&state.db, &tx).await {
+        Ok(analysed) if analysed.tx.bridge_transfer.is_some() => {
+            if let Err(e) = persist_analysis(&state.db, &analysed.tx, &analysed.transfers).await {
                 tracing::warn!(error = %e, hash = %hash, "refresh write-back failed");
             }
-            remember(rt, &hash, &tx).await;
+            remember(rt, &hash, &analysed.tx).await;
         }
         Ok(_) => {}
         Err(e) => {
@@ -267,12 +267,14 @@ pub async fn analyse_cached(
         .await;
 
         match &fetched {
-            Ok(tx) => {
-                if tx.bridge_transfer.is_some() {
-                    if let Err(e) = persist_transaction(&state.db, tx).await {
+            Ok(analysed) => {
+                if analysed.tx.bridge_transfer.is_some() {
+                    if let Err(e) =
+                        persist_analysis(&state.db, &analysed.tx, &analysed.transfers).await
+                    {
                         tracing::warn!(error = %e, hash, "write-back failed");
                     }
-                    remember(rt, hash, tx).await; // 3: fill after fetch
+                    remember(rt, hash, &analysed.tx).await; // 3: fill after fetch
                 }
             }
             Err(e) => {
@@ -286,7 +288,9 @@ pub async fn analyse_cached(
                 }
             }
         }
-        fetched
+        // v1 only needs the transaction body here; every decoded transfer has been
+        // written by `persist_analysis` above.
+        fetched.map(|analysed| analysed.tx)
     }
     .await;
 
