@@ -111,6 +111,8 @@ FROM bridge_transfers AS b
 JOIN transactions AS t ON t.id = b.transaction_id
 WHERE t.chain = 1
   AND b.analysis IS NOT NULL
+  AND b.status = 'Completed'
+  AND b.event_index = 0
   AND b.observed_tx_hash ~ '^[1-9A-HJ-NP-Za-km-z]{64,88}$'
 GROUP BY b.observed_tx_hash, t.timestamp, t.created_at
 ORDER BY t.timestamp DESC NULLS LAST, t.created_at DESC, b.observed_tx_hash
