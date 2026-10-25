@@ -5,10 +5,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
-use crate::db::repository::{get_analysis_any_age, persist_transaction};
+use crate::db::repository::{
+    get_analysis_any_age, get_transaction_with_transfers, persist_transaction,
+};
+use crate::domain::api::TransactionResponse;
+use crate::domain::bridge::BridgeEvent;
 use crate::domain::transaction::NormalisedTransaction;
 use crate::error::AppError;
 use crate::services::analyzer::analyse_tx;
+use crate::services::api_v2;
 use crate::state::AppState;
 
 const FRESH_SECS: f64 = 60.0;
@@ -49,11 +54,22 @@ impl Neg {
     }
 }
 
+/// A `/api/v2` response and the legacy `bridge_event` `/api/v1` still exposes. The
+/// event is not part of the generalised model; keeping it here lets the compatibility
+/// mapper reproduce the frozen v1 response exactly.
+#[derive(Clone)]
+pub struct V2Analysis {
+    pub response: TransactionResponse,
+    pub bridge_event: Option<BridgeEvent>,
+}
+
 pub struct ReadThrough {
     inflight: DashMap<String, Arc<Mutex<()>>>,
     upstream_permits: Semaphore,
     completed: Cache<String, NormalisedTransaction>,
     open: Cache<String, NormalisedTransaction>,
+    v2_completed: Cache<String, V2Analysis>,
+    v2_open: Cache<String, V2Analysis>,
     // negative caches
     not_found: Cache<String, Neg>, // tx doesn't exist: longer TTL
     failed: Cache<String, Neg>,    // transient upstream failure: very short TTL
@@ -72,6 +88,14 @@ impl ReadThrough {
                 .time_to_live(Duration::from_secs(600))
                 .build(),
             open: Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(15))
+                .build(),
+            v2_completed: Cache::builder()
+                .max_capacity(50_000)
+                .time_to_live(Duration::from_secs(600))
+                .build(),
+            v2_open: Cache::builder()
                 .max_capacity(10_000)
                 .time_to_live(Duration::from_secs(15))
                 .build(),
@@ -269,4 +293,46 @@ pub async fn analyse_cached(
     // only remove the entry if it's still ours
     rt.inflight.remove_if(&key, |_, v| Arc::ptr_eq(v, &lock));
     result
+}
+
+/// The `/api/v2` read path. It reuses the v1 freshness, single-flight and negative-cache
+/// machinery (so a cold analysis is done once), then serves every stored transfer of the
+/// transaction from Postgres.
+pub async fn analyse_cached_v2(
+    state: &AppState,
+    chain: &str,
+    hash: &str,
+) -> Result<V2Analysis, AppError> {
+    let rt = &state.read_through;
+
+    if let Some(hit) = rt.v2_completed.get(hash).await {
+        return Ok(hit);
+    }
+    if let Some(hit) = rt.v2_open.get(hash).await {
+        return Ok(hit);
+    }
+
+    // Ensures the transaction has been analysed and persisted, with the same caching,
+    // single-flight and upstream protection as v1.
+    let legacy = analyse_cached(state, chain, hash).await?;
+
+    let snapshot = state.chains.snapshot();
+    let response = match get_transaction_with_transfers(&state.db, hash).await {
+        Ok(Some(stored)) => api_v2::assemble(stored, &snapshot)?,
+        // A transaction with no stored transfer rows: the analysis is the only source.
+        Ok(None) => api_v2::from_v1(&legacy, &snapshot),
+        Err(error) => return Err(AppError::Internal(error)),
+    };
+
+    let entry = V2Analysis {
+        response,
+        bridge_event: legacy.bridge_event,
+    };
+    let cache = if entry.response.is_complete() {
+        &rt.v2_completed
+    } else {
+        &rt.v2_open
+    };
+    cache.insert(hash.to_string(), entry.clone()).await;
+    Ok(entry)
 }

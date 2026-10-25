@@ -3,7 +3,8 @@ use crate::domain::bridge_transfer::BridgeTransfer;
 use crate::domain::transaction::NormalisedTransaction;
 use crate::protocols::{MessageId, amount::RawAmount};
 use anyhow::Result;
-use sqlx::{PgPool, Postgres, Transaction};
+use chrono::{DateTime, Utc};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 
 pub async fn persist_transaction(pool: &PgPool, tx: &NormalisedTransaction) -> anyhow::Result<()> {
     let mut db_tx: Transaction<'_, Postgres> = pool.begin().await?;
@@ -269,4 +270,138 @@ pub async fn get_analysis_any_age(
     .await?;
 
     Ok(row.map(|(analysis, fresh)| CachedAnalysis { analysis, fresh }))
+}
+
+/// The transaction row for the generalised read path.
+pub struct StoredTransaction {
+    pub hash: String,
+    /// Wormhole id of the chain the transaction was observed on.
+    pub chain: i16,
+    pub status: String,
+    pub slot: i64,
+    pub timestamp: Option<DateTime<Utc>>,
+    pub fee_lamports: i64,
+    pub signer: Option<String>,
+}
+
+/// One `bridge_transfers` row, with its protocol detail. A row can exist for a protocol
+/// whose detail table is not `wormhole_messages`; the message columns are then `None`.
+pub struct StoredTransfer {
+    pub protocol: String,
+    pub direction: String,
+    pub observed_tx_hash: String,
+    pub event_index: i16,
+    pub via: Option<String>,
+    pub via_ref: Option<String>,
+    pub source_ref_protocol: String,
+    pub source_ref_id: String,
+    pub source_tx_hash: Option<String>,
+    pub source_wallet: Option<String>,
+    pub source_explorer_url: Option<String>,
+    pub destination_ref_protocol: String,
+    pub destination_ref_id: String,
+    pub destination_wallet: Option<String>,
+    pub destination_tx_hash: Option<String>,
+    pub destination_explorer_url: Option<String>,
+    pub token_ref_protocol: Option<String>,
+    pub token_ref_id: Option<String>,
+    pub token: Option<String>,
+    pub token_symbol: Option<String>,
+    pub amount: Option<String>,
+    pub amount_formatted: Option<String>,
+    pub status: String,
+    pub emitter_chain: Option<i32>,
+    pub emitter_address: Option<String>,
+    pub sequence: Option<String>,
+}
+
+pub struct StoredTransactionWithTransfers {
+    pub transaction: StoredTransaction,
+    pub transfers: Vec<StoredTransfer>,
+}
+
+/// The transaction and every transfer decoded from it, ordered by `event_index`.
+/// A transaction with no transfers comes back with an empty `transfers` list.
+pub async fn get_transaction_with_transfers(
+    pool: &PgPool,
+    hash: &str,
+) -> Result<Option<StoredTransactionWithTransfers>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT t.hash, t.chain, t.status AS tx_status, t.slot, t.timestamp,
+               t.fee_lamports, t.signer,
+               b.protocol, b.direction, b.observed_tx_hash, b.event_index,
+               b.via, b.via_ref,
+               b.source_ref_protocol, b.source_ref_id, b.source_tx_hash,
+               b.source_wallet, b.source_explorer_url,
+               b.destination_ref_protocol, b.destination_ref_id, b.destination_wallet,
+               b.destination_tx_hash, b.destination_explorer_url,
+               b.token_ref_protocol, b.token_ref_id, b.token, b.token_symbol,
+               b.amount::text AS amount, b.amount_formatted,
+               b.status AS transfer_status,
+               w.emitter_chain, w.emitter_address, w.sequence::text AS sequence
+        FROM transactions t
+        LEFT JOIN bridge_transfers b ON b.transaction_id = t.id
+        LEFT JOIN wormhole_messages w ON w.transfer_id = b.id
+        WHERE t.hash = $1
+        ORDER BY b.event_index
+        "#,
+    )
+    .bind(hash)
+    .fetch_all(pool)
+    .await?;
+
+    let Some(first) = rows.first() else {
+        return Ok(None);
+    };
+
+    let transaction = StoredTransaction {
+        hash: first.try_get("hash")?,
+        chain: first.try_get("chain")?,
+        status: first.try_get("tx_status")?,
+        slot: first.try_get("slot")?,
+        timestamp: first.try_get("timestamp")?,
+        fee_lamports: first.try_get("fee_lamports")?,
+        signer: first.try_get("signer")?,
+    };
+
+    let mut transfers = Vec::new();
+    for row in &rows {
+        let Some(protocol) = row.try_get::<Option<String>, _>("protocol")? else {
+            continue;
+        };
+        transfers.push(StoredTransfer {
+            protocol,
+            direction: row.try_get("direction")?,
+            observed_tx_hash: row.try_get("observed_tx_hash")?,
+            event_index: row.try_get("event_index")?,
+            via: row.try_get("via")?,
+            via_ref: row.try_get("via_ref")?,
+            source_ref_protocol: row.try_get("source_ref_protocol")?,
+            source_ref_id: row.try_get("source_ref_id")?,
+            source_tx_hash: row.try_get("source_tx_hash")?,
+            source_wallet: row.try_get("source_wallet")?,
+            source_explorer_url: row.try_get("source_explorer_url")?,
+            destination_ref_protocol: row.try_get("destination_ref_protocol")?,
+            destination_ref_id: row.try_get("destination_ref_id")?,
+            destination_wallet: row.try_get("destination_wallet")?,
+            destination_tx_hash: row.try_get("destination_tx_hash")?,
+            destination_explorer_url: row.try_get("destination_explorer_url")?,
+            token_ref_protocol: row.try_get("token_ref_protocol")?,
+            token_ref_id: row.try_get("token_ref_id")?,
+            token: row.try_get("token")?,
+            token_symbol: row.try_get("token_symbol")?,
+            amount: row.try_get("amount")?,
+            amount_formatted: row.try_get("amount_formatted")?,
+            status: row.try_get("transfer_status")?,
+            emitter_chain: row.try_get("emitter_chain")?,
+            emitter_address: row.try_get("emitter_address")?,
+            sequence: row.try_get("sequence")?,
+        });
+    }
+
+    Ok(Some(StoredTransactionWithTransfers {
+        transaction,
+        transfers,
+    }))
 }

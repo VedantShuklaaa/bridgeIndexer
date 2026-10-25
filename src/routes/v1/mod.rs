@@ -1,3 +1,4 @@
+pub mod compat;
 mod transactions;
 
 use crate::state::AppState;

@@ -1,4 +1,5 @@
-mod v1;
+pub mod v1;
+mod v2;
 
 use axum::Router;
 use axum::http::{HeaderValue, Method};
@@ -23,6 +24,7 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .nest("/api/v1", v1::router())
+        .nest("/api/v2", v2::router())
         .layer(cors)
         .with_state(state)
 }
