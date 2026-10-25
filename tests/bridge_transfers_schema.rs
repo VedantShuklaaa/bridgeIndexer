@@ -11,6 +11,8 @@ use sqlx::PgPool;
 
 /// The A2 migration. Everything older is the schema existing rows were written under.
 const A2: i64 = 20261018120000;
+/// The A7 repair of redeems that were stored like sends.
+const A7: i64 = 20261024120000;
 
 async fn sql_resolve(pool: &PgPool, protocol: &str, id: &str) -> Option<i16> {
     sqlx::query_scalar("SELECT resolve_chain($1, $2)")
@@ -438,4 +440,178 @@ async fn a_later_analysis_without_enrichment_does_not_downgrade_the_status() {
     .await
     .unwrap();
     assert_eq!(status, "Completed");
+}
+
+#[tokio::test]
+async fn an_inbound_redeem_is_stored_as_the_destination_side() {
+    let db = common::test_db().await;
+    let pool = &db.pool;
+
+    let tx = common::sample_redeem_tx("sig-redeem", 7, ChainId::Ethereum, None);
+    persist_transaction(pool, &tx).await.unwrap();
+
+    type Row = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<i16>,
+        Option<i16>,
+    );
+    let row: Row = sqlx::query_as(
+        "SELECT direction, observed_tx_hash, message_key, source_tx_hash, destination_tx_hash,
+                status, source_chain_id, destination_chain_id
+         FROM bridge_transfers WHERE observed_tx_hash = 'sig-redeem'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "Inbound");
+    assert_eq!(row.1, "sig-redeem");
+    assert_eq!(row.2, "2/emitter-addr/7");
+    assert_eq!(row.3, None, "the origin tx is unknown until enrichment");
+    assert_eq!(row.4.as_deref(), Some("sig-redeem"));
+    assert_eq!(row.5, "Completed");
+    assert_eq!(row.6, sql_resolve(pool, "wormhole", "2").await);
+    assert_eq!(row.7, sql_resolve(pool, "wormhole", "1").await);
+
+    let emitter_chain: i32 = sqlx::query_scalar("SELECT emitter_chain FROM wormhole_messages")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(emitter_chain, 2);
+}
+
+#[tokio::test]
+async fn enrichment_fills_the_origin_tx_of_a_redeem_and_it_sticks() {
+    let db = common::test_db().await;
+    let pool = &db.pool;
+
+    persist_transaction(
+        pool,
+        &common::sample_redeem_tx("sig-fill", 8, ChainId::Ethereum, None),
+    )
+    .await
+    .unwrap();
+
+    // Enrichment learned the origin tx.
+    persist_transaction(
+        pool,
+        &common::sample_redeem_tx("sig-fill", 8, ChainId::Ethereum, Some("0xorigin")),
+    )
+    .await
+    .unwrap();
+
+    // A later analysis that could not reach WormholeScan must not erase it.
+    persist_transaction(
+        pool,
+        &common::sample_redeem_tx("sig-fill", 8, ChainId::Ethereum, None),
+    )
+    .await
+    .unwrap();
+
+    let (count, source, status): (i64, Option<String>, String) =
+        sqlx::query_as("SELECT COUNT(*) OVER (), source_tx_hash, status FROM bridge_transfers")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 1, "the redeem is one row, however often it is seen");
+    assert_eq!(source.as_deref(), Some("0xorigin"));
+    assert_eq!(status, "Completed");
+}
+
+#[tokio::test]
+async fn redeems_stored_like_sends_are_turned_around_by_the_repair() {
+    let db = common::empty_db().await;
+    let pool = &db.pool;
+    common::migrate_before(pool, A7).await;
+
+    // (hash, emitter chain, destination chain id): as the old WormholeScan-driven path
+    // wrote them, always 'Outbound' with the observed tx as source_tx_hash.
+    let rows: [(&str, i32, &str); 3] = [
+        ("old-redeem", 2, "1"),    // from Ethereum into Solana: a redeem
+        ("old-send", 1, "2"),      // a send out of Solana: untouched
+        ("old-elsewhere", 2, "4"), // emitted on Ethereum, observed elsewhere: untouched
+    ];
+    for (i, (hash, emitter_chain, destination)) in rows.iter().enumerate() {
+        let transaction_id: i64 = sqlx::query_scalar(
+            "INSERT INTO transactions (hash, chain, status, slot, fee_lamports)
+             VALUES ($1, 1, 'Success', 1, 5000) RETURNING id",
+        )
+        .bind(hash)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let transfer_id: i64 = sqlx::query_scalar(
+            "INSERT INTO bridge_transfers
+                 (transaction_id, protocol, message_key, direction, observed_tx_hash,
+                  source_tx_hash, source_ref_protocol, source_ref_id,
+                  destination_ref_protocol, destination_ref_id, destination_tx_hash,
+                  status, analysis)
+             VALUES ($1, 'wormhole', $2, 'Outbound', $3, $3, 'wormhole', $4,
+                     'wormhole', $5, NULL, 'Pending', '{\"cached\": true}')
+             RETURNING id",
+        )
+        .bind(transaction_id)
+        .bind(format!("{emitter_chain}/aa/{i}"))
+        .bind(hash)
+        .bind(emitter_chain.to_string())
+        .bind(destination)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO wormhole_messages (transfer_id, emitter_chain, emitter_address, sequence)
+             VALUES ($1, $2, 'aa', $3::numeric)",
+        )
+        .bind(transfer_id)
+        .bind(emitter_chain)
+        .bind(i as i64)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    common::migrate_all(pool).await;
+
+    type Row = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<serde_json::Value>,
+    );
+    let read = |hash: &'static str| async move {
+        let row: Row = sqlx::query_as(
+            "SELECT direction, observed_tx_hash, source_tx_hash, destination_tx_hash,
+                    status, analysis
+             FROM bridge_transfers WHERE observed_tx_hash = $1",
+        )
+        .bind(hash)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        row
+    };
+
+    let redeem = read("old-redeem").await;
+    assert_eq!(redeem.0, "Inbound");
+    assert_eq!(redeem.2, None, "the observed tx is not a source tx");
+    assert_eq!(redeem.3.as_deref(), Some("old-redeem"));
+    assert_eq!(redeem.4, "Completed");
+    assert_eq!(redeem.5, None, "the stale cached analysis is dropped");
+
+    for hash in ["old-send", "old-elsewhere"] {
+        let row = read(hash).await;
+        assert_eq!(row.0, "Outbound", "{hash}");
+        assert_eq!(row.2.as_deref(), Some(hash), "{hash}");
+        assert_eq!(row.3, None, "{hash}");
+        assert_eq!(row.4, "Pending", "{hash}");
+        assert!(row.5.is_some(), "{hash}: analysis untouched");
+    }
 }

@@ -8,11 +8,14 @@
 //! instructions, and its output must agree with what WormholeScan reports.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use bridge::chains::Snapshot;
+use bridge::domain::bridge_transfer::{BridgeStatus, ChainId};
 use bridge::protocols::registry::default_registry;
 use bridge::protocols::wormhole::TOKEN_BRIDGE;
 use bridge::protocols::{
     AccountData, Classification, DetectedTransfer, Direction, Protocol, Reject, SolanaTx,
 };
+use bridge::services::detect::{self, Enrichment};
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -261,6 +264,52 @@ fn inbound_redeems_without_their_account_are_unsupported() {
             ),
             "{name}: {:?}",
             classify(&f)
+        );
+    }
+}
+
+/// A7: the redeem becomes an inbound transfer the way `analyse_tx` builds it. The observed
+/// Solana tx is the destination side, the matched WormholeScan operation names the origin
+/// tx, and the origin tx is exactly what WormholeScan reports.
+#[test]
+fn inbound_redeems_become_completed_inbound_transfers() {
+    for name in INBOUND {
+        let mut f = fixture(name);
+        with_vaa_account(&mut f);
+        let found = transfers(&f);
+        let snapshot = Snapshot::default();
+
+        let mut t = detect::to_bridge_transfer(&found[0], None, &snapshot)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+
+        assert_eq!(t.direction(), Direction::Inbound, "{name}");
+        assert!(matches!(t.status, BridgeStatus::Completed), "{name}");
+        assert_eq!(t.destination_chain, ChainId::Solana, "{name}");
+        assert_eq!(
+            t.destination_tx_hash.as_deref(),
+            Some(f.tx.signature.as_str()),
+            "{name}: destination tx"
+        );
+        assert_eq!(t.source_tx_hash, None, "{name}: unknown before enrichment");
+
+        assert_eq!(
+            detect::apply_wormholescan(&mut t, &f.op, &snapshot),
+            Enrichment::Applied,
+            "{name}"
+        );
+        let expected = f.op["sourceChain"]["transaction"]["txHash"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name}: no origin tx in the fixture"));
+        assert_eq!(
+            t.source_tx_hash.as_deref(),
+            Some(expected),
+            "{name}: origin tx"
+        );
+        assert!(matches!(t.status, BridgeStatus::Completed), "{name}");
+        assert_eq!(
+            t.destination_tx_hash.as_deref(),
+            Some(f.tx.signature.as_str()),
+            "{name}: destination tx kept"
         );
     }
 }

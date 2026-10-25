@@ -1,11 +1,11 @@
 use crate::clients::limiter::call_upstream;
 use crate::clients::{helius, wormhole};
 use crate::domain::bridge_transfer::BridgeMessageId;
-use crate::domain::transaction::NormalisedTransaction;
+use crate::domain::transaction::{NormalisedTransaction, TxStatus};
 use crate::enrichment::{EnrichInput, EnrichOutcome, Prefetch};
 use crate::error::AppError;
 use crate::normaliser;
-use crate::protocols::{Direction, SolanaTx};
+use crate::protocols::SolanaTx;
 use crate::services::correlator;
 use crate::services::detect;
 use crate::services::token_metadata::resolve_token_metadata;
@@ -51,14 +51,9 @@ pub async fn analyse_tx(
     // Chain first: if an adapter decodes a transfer from the Solana tx alone, it is
     // stored as `Detected` whatever WormholeScan says. WormholeScan only enriches.
     if let Some(solana_tx) = &solana_tx {
-        // Only sends out of Solana are stored here. A redeem into Solana is decoded
-        // (A1b) but keeps the WormholeScan-driven path below until A7 stores inbound
-        // rows: this pipeline's `source_tx_hash` is the Solana tx, which is the
-        // destination side of a redeem.
-        let detected: Vec<_> = detect::detect(&state.protocols, solana_tx)
-            .into_iter()
-            .filter(|t| t.direction == Direction::Outbound)
-            .collect();
+        // Sends out of Solana and redeems into it are both stored (A7). For a redeem the
+        // observed Solana tx is the destination side, see `detect::to_bridge_transfer`.
+        let detected = detect::detect(&state.protocols, solana_tx);
 
         if let Some(first) = detected.first() {
             if detected.len() > 1 {
@@ -205,6 +200,12 @@ pub async fn analyse_tx(
                 correlate_ms = t_corr.elapsed().as_millis() as u64,
                 "correlate"
             );
+            // A redeem that reaches this path (its VAA account could not be loaded) is
+            // still the destination side of the transfer.
+            let mut correlated = correlated;
+            if matches!(tx.status, TxStatus::Success) {
+                detect::as_inbound_observation(&mut correlated, hash, &state.chains.snapshot());
+            }
             tx.bridge_transfer = Some(correlated);
 
             tx.bridge_event = Some(bridge_event);

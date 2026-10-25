@@ -1,3 +1,4 @@
+use crate::protocols::Direction;
 use serde::{Deserialize, Serialize};
 
 /// The chain as `/api/v1` and stored analyses spell it. Frozen: logic never branches on
@@ -69,7 +70,8 @@ pub struct BridgeMessageId {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BridgeTransfer {
     pub source_chain: ChainId,
-    pub source_tx_hash: String,
+    /// `None` for an inbound redeem until the origin chain's tx is learned from enrichment.
+    pub source_tx_hash: Option<String>,
     pub source_wallet: Option<String>,
     pub source_explorer_url: Option<String>,
     pub destination_chain: ChainId,
@@ -82,4 +84,74 @@ pub struct BridgeTransfer {
     pub amount_formatted: Option<String>, // new — human-readable, decimals-aware
     pub message_id: BridgeMessageId,
     pub status: BridgeStatus,
+}
+
+impl BridgeTransfer {
+    /// Which way the transfer moves relative to Solana. The Solana tx the pipeline observes
+    /// is the send for an outbound transfer and the redeem for an inbound one, so a transfer
+    /// that lands on Solana from another chain is inbound. Derived, so the stored analyses
+    /// and the frozen `/api/v1` shape do not change.
+    pub fn direction(&self) -> Direction {
+        if self.destination_chain == ChainId::Solana && self.source_chain != ChainId::Solana {
+            Direction::Inbound
+        } else {
+            Direction::Outbound
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn transfer(source: ChainId, destination: ChainId) -> BridgeTransfer {
+        BridgeTransfer {
+            source_chain: source,
+            source_tx_hash: None,
+            source_wallet: None,
+            source_explorer_url: None,
+            destination_chain: destination,
+            destination_wallet: None,
+            destination_tx_hash: None,
+            destination_explorer_url: None,
+            token: None,
+            token_symbol: None,
+            amount: None,
+            amount_formatted: None,
+            message_id: BridgeMessageId {
+                emitter_chain: 2,
+                emitter_address: "aa".into(),
+                sequence: 1,
+            },
+            status: BridgeStatus::Detected,
+        }
+    }
+
+    #[test]
+    fn a_send_out_of_solana_is_outbound() {
+        assert_eq!(
+            transfer(ChainId::Solana, ChainId::Ethereum).direction(),
+            Direction::Outbound
+        );
+    }
+
+    #[test]
+    fn a_redeem_into_solana_is_inbound() {
+        assert_eq!(
+            transfer(ChainId::Ethereum, ChainId::Solana).direction(),
+            Direction::Inbound
+        );
+        assert_eq!(
+            transfer(ChainId::Unknown(9999), ChainId::Solana).direction(),
+            Direction::Inbound
+        );
+    }
+
+    #[test]
+    fn a_transfer_that_does_not_touch_solana_is_outbound() {
+        assert_eq!(
+            transfer(ChainId::Ethereum, ChainId::Bsc).direction(),
+            Direction::Outbound
+        );
+    }
 }
