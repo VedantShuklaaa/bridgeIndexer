@@ -98,7 +98,7 @@ pub fn sample_tx(
         bridge_event: None,
         bridge_transfer: Some(BridgeTransfer {
             source_chain: ChainId::Solana,
-            source_tx_hash: hash.to_string(),
+            source_tx_hash: Some(hash.to_string()),
             source_wallet: Some("SomeSignerPubkey".to_string()),
             source_explorer_url: None,
             destination_chain: destination,
@@ -117,6 +117,26 @@ pub fn sample_tx(
             status: BridgeStatus::Pending,
         }),
     }
+}
+
+/// A Solana tx holding one Wormhole redeem of a message sent from `source`. The transfer
+/// is the destination side: the observed tx is `hash`, the origin tx is `source_tx`.
+pub fn sample_redeem_tx(
+    hash: &str,
+    sequence: u64,
+    source: ChainId,
+    source_tx: Option<&str>,
+) -> NormalisedTransaction {
+    let mut tx = sample_tx(hash, sequence, ChainId::Solana, Some("1000000"));
+    let wormhole_id = source.wormhole_id();
+    let transfer = tx.bridge_transfer.as_mut().unwrap();
+    transfer.source_chain = source;
+    transfer.source_tx_hash = source_tx.map(String::from);
+    transfer.source_wallet = None;
+    transfer.destination_tx_hash = Some(hash.to_string());
+    transfer.status = BridgeStatus::Completed;
+    transfer.message_id.emitter_chain = wormhole_id;
+    tx
 }
 
 async fn fresh_database(base_url: &str) -> PgPool {

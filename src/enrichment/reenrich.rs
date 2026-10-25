@@ -203,7 +203,7 @@ mod tests {
     fn transfer(status: BridgeStatus) -> BridgeTransfer {
         BridgeTransfer {
             source_chain: ChainId::Solana,
-            source_tx_hash: "sig".into(),
+            source_tx_hash: Some("sig".into()),
             source_wallet: None,
             source_explorer_url: None,
             destination_chain: ChainId::Ethereum,

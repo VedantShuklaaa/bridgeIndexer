@@ -1,7 +1,7 @@
 use crate::chains::NS_WORMHOLE;
 use crate::domain::bridge_transfer::BridgeTransfer;
 use crate::domain::transaction::NormalisedTransaction;
-use crate::protocols::{Direction, MessageId, amount::RawAmount};
+use crate::protocols::{MessageId, amount::RawAmount};
 use anyhow::Result;
 use sqlx::{PgPool, Postgres, Transaction};
 
@@ -41,7 +41,7 @@ pub async fn persist_transaction(pool: &PgPool, tx: &NormalisedTransaction) -> a
 
     if let Some(bridge) = &tx.bridge_transfer {
         let analysis = serde_json::to_value(tx)?;
-        persist_bridge_transfer(&mut db_tx, transaction_id, bridge, &analysis).await?;
+        persist_bridge_transfer(&mut db_tx, transaction_id, &tx.hash, bridge, &analysis).await?;
     }
 
     db_tx.commit().await?;
@@ -52,6 +52,7 @@ pub async fn persist_transaction(pool: &PgPool, tx: &NormalisedTransaction) -> a
 async fn persist_bridge_transfer(
     db_tx: &mut Transaction<'_, Postgres>,
     transaction_id: i64,
+    observed_tx_hash: &str,
     bridge: &BridgeTransfer,
     analysis: &serde_json::Value,
 ) -> anyhow::Result<()> {
@@ -79,7 +80,7 @@ async fn persist_bridge_transfer(
         )
         VALUES (
             $1, $2, $3, $4, $5,
-            $5, $6, $7, resolve_chain($6, $7),
+            $21, $6, $7, resolve_chain($6, $7),
             $8, $9,
             $10, $11, resolve_chain($10, $11),
             $12, $13, $14,
@@ -87,6 +88,9 @@ async fn persist_bridge_transfer(
         )
         ON CONFLICT (protocol, message_key)
         DO UPDATE SET
+            -- an inbound redeem learns its origin tx later, from enrichment
+            source_tx_hash = COALESCE(EXCLUDED.source_tx_hash, bridge_transfers.source_tx_hash),
+            source_explorer_url = COALESCE(EXCLUDED.source_explorer_url, bridge_transfers.source_explorer_url),
             destination_tx_hash = COALESCE(EXCLUDED.destination_tx_hash, bridge_transfers.destination_tx_hash),
             destination_wallet = COALESCE(EXCLUDED.destination_wallet, bridge_transfers.destination_wallet),
             destination_explorer_url = COALESCE(EXCLUDED.destination_explorer_url, bridge_transfers.destination_explorer_url),
@@ -106,8 +110,8 @@ async fn persist_bridge_transfer(
     .bind(transaction_id)
     .bind(message.protocol().as_str())
     .bind(message.key())
-    .bind(Direction::Outbound.as_str())
-    .bind(&bridge.source_tx_hash)
+    .bind(bridge.direction().as_str())
+    .bind(observed_tx_hash)
     .bind(NS_WORMHOLE)
     .bind(bridge.source_chain.wormhole_id().to_string())
     .bind(&bridge.source_wallet)
@@ -123,6 +127,7 @@ async fn persist_bridge_transfer(
     .bind(&bridge.amount_formatted)
     .bind(format!("{:?}", bridge.status))
     .bind(analysis)
+    .bind(&bridge.source_tx_hash)
     .fetch_one(&mut **db_tx)
     .await?;
 

@@ -83,7 +83,7 @@ pub async fn correlate(
 
     Ok(BridgeTransfer {
         source_chain: ChainId::from_wormhole_id(message_id.emitter_chain),
-        source_tx_hash,
+        source_tx_hash: Some(source_tx_hash),
         source_wallet,
         source_explorer_url,
         destination_chain,

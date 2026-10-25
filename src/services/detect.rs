@@ -7,7 +7,7 @@ use crate::chains::{NS_WORMHOLE, RawChainRef, Snapshot};
 use crate::domain::bridge_transfer::{BridgeMessageId, BridgeStatus, BridgeTransfer, ChainId};
 use crate::error::AppError;
 use crate::protocols::{
-    Classification, DetectedTransfer, MessageId, SolanaTx, compose::compose,
+    Classification, DetectedTransfer, Direction, MessageId, SolanaTx, compose::compose,
     registry::ProtocolRegistry,
 };
 use crate::services::token_metadata::TokenMetadata;
@@ -52,8 +52,13 @@ fn wormhole_id(chain: &RawChainRef) -> Result<u16, AppError> {
         .map_err(|_| AppError::Normalisation(format!("bad wormhole chain id {:?}", chain.id)))
 }
 
-/// A decoded transfer as the API's `BridgeTransfer`. Status is `Detected`: the chain
-/// shows the send, nothing else has confirmed it yet.
+/// A decoded transfer as the API's `BridgeTransfer`.
+///
+/// An outbound send starts as `Detected`: the chain shows the send, nothing else has
+/// confirmed it yet. An inbound redeem is `Completed` at detection: the observed Solana tx
+/// succeeded (adapters reject a failed tx) and it is the destination side of the transfer,
+/// so there is nothing left to wait for. Its source tx is on the origin chain and unknown
+/// until enrichment learns it.
 pub fn to_bridge_transfer(
     d: &DetectedTransfer,
     metadata: Option<TokenMetadata>,
@@ -70,16 +75,21 @@ pub fn to_bridge_transfer(
 
     let raw_amount: Option<u128> = d.amount_raw.as_ref().and_then(|a| a.as_str().parse().ok());
     let decimals = metadata.as_ref().and_then(|m| m.decimals);
+    let inbound = d.direction == Direction::Inbound;
 
     Ok(BridgeTransfer {
         source_chain: ChainId::from_wormhole_id(source_id),
-        source_tx_hash: d.observed_tx.clone(),
+        source_tx_hash: (!inbound).then(|| d.observed_tx.clone()),
         source_wallet: d.source_wallet.clone(),
-        source_explorer_url: chains.explorer_tx_url_for(&d.source, &d.observed_tx),
+        source_explorer_url: (!inbound)
+            .then(|| chains.explorer_tx_url_for(&d.source, &d.observed_tx))
+            .flatten(),
         destination_chain: ChainId::from_wormhole_id(destination_id),
         destination_wallet: d.destination_wallet.clone(),
-        destination_tx_hash: None,
-        destination_explorer_url: None,
+        destination_tx_hash: inbound.then(|| d.observed_tx.clone()),
+        destination_explorer_url: inbound
+            .then(|| chains.explorer_tx_url_for(&d.destination, &d.observed_tx))
+            .flatten(),
         token: d.token.as_ref().map(|t| t.address.clone()),
         token_symbol: metadata.and_then(|m| m.symbol),
         amount: d.amount_raw.as_ref().map(|a| a.to_string()),
@@ -89,8 +99,41 @@ pub fn to_bridge_transfer(
             emitter_address: emitter_address.clone(),
             sequence: *sequence,
         },
-        status: BridgeStatus::Detected,
+        status: if inbound {
+            BridgeStatus::Completed
+        } else {
+            BridgeStatus::Detected
+        },
     })
+}
+
+/// Re-reads a transfer the WormholeScan-driven path built for a Solana redeem. That path
+/// sets `source_tx_hash` to the observed tx, but for a transfer that lands on Solana the
+/// observed tx is the destination side. Only used for a successful Solana tx, which is
+/// what makes the transfer `Completed`.
+pub fn as_inbound_observation(transfer: &mut BridgeTransfer, observed_tx: &str, chains: &Snapshot) {
+    if transfer.direction() != Direction::Inbound {
+        return;
+    }
+    transfer.source_tx_hash = None;
+    transfer.source_explorer_url = None;
+    transfer.destination_tx_hash = Some(observed_tx.to_string());
+    transfer.destination_explorer_url = chains.explorer_tx_url_for(
+        &RawChainRef::wormhole(transfer.destination_chain.wormhole_id()),
+        observed_tx,
+    );
+    transfer.status = BridgeStatus::Completed;
+}
+
+/// The origin chain's tx inside a WormholeScan `/operations` item.
+pub fn source_tx_from_operation(raw: &Value) -> Option<String> {
+    raw.get("sourceChain")?
+        .get("transaction")?
+        .get("txHash")?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +181,18 @@ pub fn apply_wormholescan(
 
     if let Some(hash) = destination_tx_from_operation(wh_raw) {
         apply_destination_tx(transfer, &hash, chains);
+    }
+
+    // A redeem is stored without its origin tx. The matched operation names it.
+    if transfer.direction() == Direction::Inbound
+        && transfer.source_tx_hash.is_none()
+        && let Some(hash) = source_tx_from_operation(wh_raw)
+    {
+        transfer.source_explorer_url = chains.explorer_tx_url_for(
+            &RawChainRef::wormhole(transfer.source_chain.wormhole_id()),
+            &hash,
+        );
+        transfer.source_tx_hash = Some(hash);
     }
     Enrichment::Applied
 }
@@ -241,7 +296,7 @@ mod tests {
         assert!(matches!(t.status, BridgeStatus::Detected));
         assert_eq!(t.source_chain, ChainId::Solana);
         assert_eq!(t.destination_chain, ChainId::Ethereum);
-        assert_eq!(t.source_tx_hash, "sig");
+        assert_eq!(t.source_tx_hash.as_deref(), Some("sig"));
         assert_eq!(t.source_wallet.as_deref(), Some("Wallet"));
         assert_eq!(t.destination_wallet.as_deref(), Some("0xabc"));
         assert_eq!(t.token.as_deref(), Some("TokenMint"));
@@ -474,5 +529,135 @@ mod tests {
         assert!(apply_destination_tx(&mut t, "0xdest", &snap()));
         assert!(t.destination_explorer_url.is_none());
         assert!(matches!(t.status, BridgeStatus::Completed));
+    }
+
+    fn inbound() -> DetectedTransfer {
+        DetectedTransfer {
+            direction: Direction::Inbound,
+            observed_tx: "redeem".into(),
+            source: RawChainRef::wormhole(2),
+            destination: RawChainRef::wormhole(1),
+            source_wallet: None,
+            destination_wallet: Some("SolWallet".into()),
+            message: MessageId::Wormhole {
+                emitter_chain: 2,
+                emitter_address: EMITTER_HEX.into(),
+                sequence: 42,
+            },
+            ..detected()
+        }
+    }
+
+    #[test]
+    fn an_inbound_redeem_is_completed_with_the_observed_tx_as_destination() {
+        let t = to_bridge_transfer(&inbound(), None, &snap()).unwrap();
+
+        assert_eq!(t.direction(), Direction::Inbound);
+        assert!(matches!(t.status, BridgeStatus::Completed));
+        assert_eq!(t.source_chain, ChainId::Ethereum);
+        assert_eq!(t.destination_chain, ChainId::Solana);
+        assert_eq!(t.source_tx_hash, None);
+        assert_eq!(t.source_explorer_url, None);
+        assert_eq!(t.source_wallet, None);
+        assert_eq!(t.destination_tx_hash.as_deref(), Some("redeem"));
+        assert_eq!(t.destination_wallet.as_deref(), Some("SolWallet"));
+    }
+
+    fn inbound_transfer() -> BridgeTransfer {
+        to_bridge_transfer(&inbound(), None, &snap()).unwrap()
+    }
+
+    fn operation_with_source(sequence: u64, source_tx: &str) -> Value {
+        json!({
+            "vaa": {"raw": vaa_b64(2, [9; 32], sequence)},
+            "sourceChain": {"transaction": {"txHash": source_tx}},
+        })
+    }
+
+    #[test]
+    fn a_matching_operation_fills_the_origin_tx_of_a_redeem() {
+        let mut t = inbound_transfer();
+        let op = operation_with_source(42, "0xorigin");
+
+        assert_eq!(
+            apply_wormholescan(&mut t, &op, &snap()),
+            Enrichment::Applied
+        );
+        assert_eq!(t.source_tx_hash.as_deref(), Some("0xorigin"));
+        assert!(matches!(t.status, BridgeStatus::Completed));
+        assert_eq!(t.destination_tx_hash.as_deref(), Some("redeem"));
+    }
+
+    #[test]
+    fn an_operation_for_another_message_does_not_fill_the_origin_tx() {
+        let mut t = inbound_transfer();
+        let op = operation_with_source(43, "0xorigin");
+
+        assert_eq!(
+            apply_wormholescan(&mut t, &op, &snap()),
+            Enrichment::Mismatch
+        );
+        assert_eq!(t.source_tx_hash, None);
+    }
+
+    #[test]
+    fn an_origin_tx_that_is_already_known_is_not_overwritten() {
+        let mut t = inbound_transfer();
+        t.source_tx_hash = Some("0xfirst".into());
+        let op = operation_with_source(42, "0xother");
+
+        apply_wormholescan(&mut t, &op, &snap());
+        assert_eq!(t.source_tx_hash.as_deref(), Some("0xfirst"));
+    }
+
+    #[test]
+    fn an_outbound_transfer_never_takes_an_origin_tx_from_the_operation() {
+        let mut t = transfer();
+        let op = json!({
+            "vaa": {"raw": vaa_b64(1, [9; 32], 42)},
+            "sourceChain": {"transaction": {"txHash": "other"}},
+        });
+
+        apply_wormholescan(&mut t, &op, &snap());
+        assert_eq!(t.source_tx_hash.as_deref(), Some("sig"));
+    }
+
+    #[test]
+    fn source_tx_from_operation_ignores_empty_and_missing_values() {
+        assert_eq!(source_tx_from_operation(&json!({})), None);
+        assert_eq!(
+            source_tx_from_operation(&json!({"sourceChain": {"transaction": {"txHash": " "}}})),
+            None
+        );
+        assert_eq!(
+            source_tx_from_operation(&json!({"sourceChain": {"transaction": {"txHash": " 0xa "}}})),
+            Some("0xa".to_string())
+        );
+    }
+
+    #[test]
+    fn the_legacy_redeem_shape_is_turned_around() {
+        // What the WormholeScan-driven path builds for a redeem: the observed tx is
+        // recorded as the source tx.
+        let mut t = inbound_transfer();
+        t.source_tx_hash = Some("redeem".into());
+        t.destination_tx_hash = None;
+        t.status = BridgeStatus::Pending;
+
+        as_inbound_observation(&mut t, "redeem", &snap());
+
+        assert_eq!(t.source_tx_hash, None);
+        assert_eq!(t.destination_tx_hash.as_deref(), Some("redeem"));
+        assert!(matches!(t.status, BridgeStatus::Completed));
+    }
+
+    #[test]
+    fn the_legacy_fix_leaves_an_outbound_transfer_alone() {
+        let mut t = transfer();
+        as_inbound_observation(&mut t, "sig", &snap());
+
+        assert_eq!(t.source_tx_hash.as_deref(), Some("sig"));
+        assert!(t.destination_tx_hash.is_none());
+        assert!(matches!(t.status, BridgeStatus::Detected));
     }
 }
