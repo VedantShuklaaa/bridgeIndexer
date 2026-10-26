@@ -236,3 +236,42 @@ guarantees.
 The repeat rounds agree with the initial round within about 2% for the old
 build and 1% for the new one, so no drift was measured. One deployed API
 instance and one warm key set only.
+
+## 3c-1 — mimalloc global allocator (2026-10-27)
+
+### Hypothesis
+
+Warm `R-hit` throughput is server-CPU-bound. Replacing the default system
+allocator with mimalloc (`mimalloc = "0.1.52"`, `#[global_allocator]` in
+`src/main.rs`) may reduce allocator time and raise throughput. No runs have
+been made; every result below is blank on purpose.
+
+### Workload
+
+`R-hit` (v1), warm cache, 30 s runs at 50, 200 and 400 connections, run per the
+procedure above. Says nothing about the cold path or writes.
+
+### Setup
+
+Baseline is the commit this branch was cut from, on the same server and load
+generator. The only change is the global allocator. The allocator is declared
+in the `bridge` binary only, so integration-test binaries still use the system
+allocator and benchmarks must run the `bridge` binary.
+
+### Before
+
+### After
+
+### Delta
+
+### Runs
+
+| Run | Connections | req/s | median latency (ms) | p99 latency (ms) | success rate | non-200 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+|  |  |  |  |  |  |  |
+|  |  |  |  |  |  |  |
+|  |  |  |  |  |  |  |
+
+### Limited by
+
+### Notes
