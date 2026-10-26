@@ -9,12 +9,16 @@ use bridge::redis::producer::RedisProducer;
 use bridge::routes::build_router;
 use bridge::shutdown::wait_for_shutdown_signal;
 use bridge::state::AppState;
+use mimalloc::MiMalloc;
 use reqwest::Client;
 use rustls::crypto::ring;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn spawn_supervised<F, Fut>(task_name: &'static str, shutdown: CancellationToken, make_task: F)
 where
