@@ -850,6 +850,41 @@ nothing is known about the cold path or writes, and memory use under mimalloc
 was not measured. Methodology and per-run numbers:
 [docs/scaling-log.md](docs/scaling-log.md).
 
+### 3c-2: AppState behind one Arc
+
+Against `06b891a` on the same `m7i-flex.large` server and `c7i.xlarge`
+generator: 142,095 → 156,819 req/s at 50 connections (+10.4%), 134,784 →
+147,438 at 200 (+9.4%) and 130,376 → 145,689 at 400 (+11.7%). At 50 connections
+median latency went from about 0.35 to 0.31 ms and p99 from about 0.55 to
+0.50 ms. The runs were interleaved old/new/old/new; the 50 connection figures
+are the means of four runs per build and 200 and 400 are means of two runs
+each. Server CPU-bound, and every run reported 100% success with zero non-200
+responses.
+
+| Connections | `06b891a` (before), req/s | `0144ea9` (after), req/s | Change |
+| ---: | ---: | ---: | ---: |
+| 50 | 142,095 (141,846, 140,579, 142,260 and 143,697) | 156,819 (155,643, 156,057, 156,984 and 158,590) | +10.4% |
+| 200 | 134,784 (133,581 and 135,986) | 147,438 (145,878 and 148,998) | +9.4% |
+| 400 | 130,376 (129,347 and 131,404) | 145,689 (146,457 and 144,921) | +11.7% |
+
+The reason for the change: a profile at `16018712` put about 4% of server time
+in `drop_glue<AppState>` and `FromRef::from_ref`, and the old `AppState` clone
+took about 8 refcount increments per request against 1 now.
+
+The gain is larger than that 4%. A likely explanation, stated as a hypothesis
+rather than a measured fact: the removed atomic refcount operations probably
+also cause cache-line contention between cores, which a CPU profile does not
+attribute cleanly.
+
+The 50 connection ranges do not overlap (old 140.6k–143.7k, new
+155.6k–158.6k), and the old runs agree with each other within about 1.3%.
+Caveats: the runs were interleaved old/new/old/new; 200 and 400 connections
+have two runs per version only; this covers `R-hit` only, so nothing is known
+about the cold path or writes; server and load generator CPU were not recorded
+for these rounds; the old baseline already includes mimalloc; and the tradeoff
+is one extra pointer hop per field access through `Deref`. Methodology and
+per-run numbers: [docs/scaling-log.md](docs/scaling-log.md).
+
 ### Phase 1 — correctness
 
 | Version | Change | `C-agree` | Pending % | `D-decode` ns/op | Cold p50 / p99 |
@@ -872,7 +907,7 @@ was not measured. Methodology and per-run numbers:
 | 4ffb783 | re-baseline, new load generator | 77.3k | ~1.05 ms | ~20 (quota) | — | server CPU |
 | 03bbb0d (3b) | `/api/v1` cache stores the serialized body; a hit returns it directly | 132.1k | ~0.59 ms | — | — | server CPU |
 | 3c-1 | global allocator switched to mimalloc | 139.3k | ~0.57 ms | — | — | server CPU |
-| 3c-2 | `AppState` clone behind a single `Arc` | — | — | — | — | — |
+| 3c-2 | `AppState` clone behind a single `Arc` | 156.8k | ~0.50 ms | — | — | server CPU |
 | | | | | | | |
 
 ### Phase 4 — stream
