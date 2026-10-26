@@ -13,6 +13,7 @@ use governor::{
 use reqwest::Client;
 use sqlx::PgPool;
 use std::num::NonZeroU32;
+use std::ops::Deref;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
@@ -25,8 +26,10 @@ const HELIUS_LIVE_RPS: u32 = 4;
 
 pub type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
+/// The shared state itself. Kept behind a single `Arc` in [`AppState`] so cloning
+/// the state is one refcount bump instead of one per field.
 #[derive(Clone)]
-pub struct AppState {
+pub struct Inner {
     pub db: PgPool,
     pub http_client: Client,
     pub config: Arc<AppConfig>,
@@ -38,6 +41,19 @@ pub struct AppState {
     pub helius_limiter: Arc<Limiter>,
     pub wormhole_limiter: Arc<Limiter>,
     pub enrichment: Arc<dyn EnrichmentProvider>,
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    inner: Arc<Inner>,
+}
+
+impl Deref for AppState {
+    type Target = Inner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 impl AppState {
@@ -61,19 +77,21 @@ impl AppState {
         ));
 
         Ok(Self {
-            db,
-            http_client,
-            config: Arc::new(config),
-            registry: Arc::new(registry),
-            chains,
-            protocols: Arc::new(default_registry()),
-            tx_broadcast,
-            read_through,
-            helius_limiter: Arc::new(RateLimiter::direct(Quota::per_second(
-                NonZeroU32::new(HELIUS_API_RPS).unwrap(),
-            ))),
-            wormhole_limiter,
-            enrichment,
+            inner: Arc::new(Inner {
+                db,
+                http_client,
+                config: Arc::new(config),
+                registry: Arc::new(registry),
+                chains,
+                protocols: Arc::new(default_registry()),
+                tx_broadcast,
+                read_through,
+                helius_limiter: Arc::new(RateLimiter::direct(Quota::per_second(
+                    NonZeroU32::new(HELIUS_API_RPS).unwrap(),
+                ))),
+                wormhole_limiter,
+                enrichment,
+            }),
         })
     }
 
@@ -83,12 +101,14 @@ impl AppState {
     /// (database, broadcast channel, Wormholescan limiter) stays shared.
     pub fn for_live(&self, config: AppConfig, registry: AdapterRegistry) -> Self {
         Self {
-            config: Arc::new(config),
-            registry: Arc::new(registry),
-            helius_limiter: Arc::new(RateLimiter::direct(Quota::per_second(
-                NonZeroU32::new(HELIUS_LIVE_RPS).unwrap(),
-            ))),
-            ..self.clone()
+            inner: Arc::new(Inner {
+                config: Arc::new(config),
+                registry: Arc::new(registry),
+                helius_limiter: Arc::new(RateLimiter::direct(Quota::per_second(
+                    NonZeroU32::new(HELIUS_LIVE_RPS).unwrap(),
+                ))),
+                ..(*self.inner).clone()
+            }),
         }
     }
 }
