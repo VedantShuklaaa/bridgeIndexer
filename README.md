@@ -822,6 +822,34 @@ entry, the v1 remap, and per-hit serialization. The numbers are their combined
 effect and do not isolate any one of them. Methodology and per-run numbers:
 [docs/scaling-log.md](docs/scaling-log.md).
 
+### 3c-1: mimalloc allocator
+
+Against `16018712` on the same `m7i-flex.large` server and `c7i.xlarge`
+generator: 130,817 → 139,345 req/s at 50 connections (+6.5%), 125,318 →
+134,973 at 200 (+7.7%) and 123,239 → 131,172 at 400 (+6.4%). At 50 connections
+median latency went from 0.38 to 0.35 ms and p99 from 0.59 to 0.57 ms. The 50
+connection figures are the means of two runs per build; 200 and 400 are single
+runs each. Server CPU-bound, the load generator about 70.4% idle in the
+mimalloc runs, and every run reported 100% success with zero non-200 responses.
+
+| Connections | `16018712` (glibc), req/s | `59fe708` (mimalloc), req/s | Change |
+| ---: | ---: | ---: | ---: |
+| 50 | 130,817 (131,033 and 130,601) | 139,345 (139,755 and 138,936) | +6.5% |
+| 200 | 125,318 | 134,973 | +7.7% |
+| 400 | 123,239 | 131,172 | +6.4% |
+
+The reason for the change: a profile at `16018712` put about 12.5% of server
+time in glibc allocation (`malloc`, `_int_malloc`, `_int_free`,
+`malloc_consolidate`, `realloc`, `cfree`). During the mimalloc runs the server
+was at 50.1 user, 23.1 system and 27.1 idle CPU, against about 57% user CPU
+with glibc.
+
+These are single comparison runs per connection count (two at 50), the glibc
+runs were not interleaved with the mimalloc runs, and they cover `R-hit` only:
+nothing is known about the cold path or writes, and memory use under mimalloc
+was not measured. Methodology and per-run numbers:
+[docs/scaling-log.md](docs/scaling-log.md).
+
 ### Phase 1 — correctness
 
 | Version | Change | `C-agree` | Pending % | `D-decode` ns/op | Cold p50 / p99 |
@@ -843,7 +871,7 @@ effect and do not isolate any one of them. Methodology and per-run numbers:
 | v0 | baseline | 36.5k | ~33 ms | ~20 (quota) | — | load generator |
 | 4ffb783 | re-baseline, new load generator | 77.3k | ~1.05 ms | ~20 (quota) | — | server CPU |
 | 03bbb0d (3b) | `/api/v1` cache stores the serialized body; a hit returns it directly | 132.1k | ~0.59 ms | — | — | server CPU |
-| 3c-1 | global allocator switched to mimalloc | — | — | — | — | — |
+| 3c-1 | global allocator switched to mimalloc | 139.3k | ~0.57 ms | — | — | server CPU |
 | | | | | | | |
 
 ### Phase 4 — stream

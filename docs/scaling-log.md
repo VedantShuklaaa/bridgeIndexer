@@ -243,8 +243,7 @@ instance and one warm key set only.
 
 Warm `R-hit` throughput is server-CPU-bound. Replacing the default system
 allocator with mimalloc (`mimalloc = "0.1.52"`, `#[global_allocator]` in
-`src/main.rs`) may reduce allocator time and raise throughput. No runs have
-been made; every result below is blank on purpose.
+`src/main.rs`) may reduce allocator time and raise throughput.
 
 ### Workload
 
@@ -253,25 +252,65 @@ procedure above. Says nothing about the cold path or writes.
 
 ### Setup
 
-Baseline is the commit this branch was cut from, on the same server and load
-generator. The only change is the global allocator. The allocator is declared
-in the `bridge` binary only, so integration-test binaries still use the system
-allocator and benchmarks must run the `bridge` binary.
+Baseline `16018712` (glibc `malloc`), after `59fe708` (mimalloc, full SHA
+`59fe7086145948617e395b425e605108bdd07129`), on the same `m7i-flex.large`
+server with a `c7i.xlarge` load generator. The runs were not interleaved: the
+glibc runs were made before the mimalloc runs. The only change is the global
+allocator. The allocator is declared in the `bridge` binary only, so
+integration-test binaries still use the system allocator and benchmarks must
+run the `bridge` binary.
 
 ### Before
 
+`16018712` (glibc `malloc`): 131,033 and 130,601 req/s at 50 connections (mean
+130,817), median 0.38 ms and p99 0.59 ms; 125,318 req/s at 200 connections and
+123,239 at 400.
+
 ### After
 
+`59fe708` (mimalloc): 139,755 and 138,936 req/s at 50 connections (mean
+139,345), median 0.35 ms and p99 0.57 ms (runs 0.56 and 0.58); 134,973 req/s at
+200 connections and 131,172 at 400.
+
 ### Delta
+
+| Connections | `16018712` (glibc), req/s | `59fe708` (mimalloc), req/s | Change |
+| ---: | ---: | ---: | ---: |
+| 50 | 130,817 (runs 131,033 and 130,601) | 139,345 (runs 139,755 and 138,936) | +6.5% |
+| 200 | 125,318 | 134,973 | +7.7% |
+| 400 | 123,239 | 131,172 | +6.4% |
+
+At 50 connections median latency went from 0.38 to 0.35 ms and p99 from 0.59 to
+0.57 ms.
 
 ### Runs
 
 | Run | Connections | req/s | median latency (ms) | p99 latency (ms) | success rate | non-200 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-|  |  |  |  |  |  |  |
-|  |  |  |  |  |  |  |
-|  |  |  |  |  |  |  |
+| `16018712` (glibc), run 1 | 50 | 131,033 | — | — | 100% | 0 |
+| `16018712` (glibc), run 2 | 50 | 130,601 | — | — | 100% | 0 |
+| `16018712` (glibc) | 200 | 125,318 | — | — | 100% | 0 |
+| `16018712` (glibc) | 400 | 123,239 | — | — | 100% | 0 |
+| `59fe708` (mimalloc), run 1 | 50 | 139,755 | — | 0.56 | 100% | 0 |
+| `59fe708` (mimalloc), run 2 | 50 | 138,936 | — | 0.58 | 100% | 0 |
+| `59fe708` (mimalloc) | 200 | 134,973 | — | — | 100% | 0 |
+| `59fe708` (mimalloc) | 400 | 131,172 | — | — | 100% | 0 |
+
+`—` means not recorded. The 50-connection medians above are per-build figures
+(0.38 ms for `16018712`, 0.35 ms for `59fe708`), not per-run values.
 
 ### Limited by
 
+Server CPU. During the mimalloc run the server reported us 50.1, sy 23.1 and
+id 27.1; the load generator was 70.4% idle, so it was not the bottleneck. With
+glibc, server user CPU was about 57%.
+
 ### Notes
+
+A profile at `16018712` put about 12.5% of server time in glibc allocation
+(`malloc`, `_int_malloc`, `_int_free`, `malloc_consolidate`, `realloc`,
+`cfree`), which is why the allocator was swapped. Caveats: one comparison run
+per connection count (two at 50 connections); the glibc runs were not
+interleaved with the mimalloc runs; `R-hit` only, so nothing is known about the
+cold path or writes; memory use under mimalloc was not measured. Zero non-200
+responses in every run.
