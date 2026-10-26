@@ -149,38 +149,90 @@ directly should raise `R-hit` throughput and cut latency.
 
 ### Workload
 
-`R-hit` (v1), warm cache, 50 connections, 30 s, run per the procedure above.
-Says nothing about the cold path or writes.
+`R-hit` (v1), warm cache, 30 s runs at 50, 200 and 400 connections, run per the
+procedure above. Says nothing about the cold path or writes.
 
 ### Setup
 
-Same server and load generator as the Arc AppState entry. Fill in the commit
-and run metadata from `bench-results/<timestamp>/`.
+Same server (`m7i-flex.large`) and load generator (`c7i.xlarge`) as the Arc
+AppState entry. The benchmark ran against the deployed API instance with
+ingestion off, using the 769-URL list from the deployed database; the warm-up
+run is excluded. Old build `35d3e1b`, optimized build `03bbb0d` (merged as
+`05d3192`, PR #29). Four rounds: old, new, old again, new again. The repeats
+check for drift; the comparison uses the mean of the initial and repeat rounds
+for each build (four samples at 50 connections, two at 200 and 400).
 
 ### Before
 
+`35d3e1b`: 86,115 req/s at 50 connections (mean of four runs), 0.58 ms median,
+0.94 ms p99; 83,293 req/s at 200; 81,711 req/s at 400.
+
 ### After
 
+`03bbb0d`: 132,082 req/s at 50 connections (mean of four runs), 0.38 ms median,
+0.59 ms p99; 124,969 req/s at 200; 124,706 req/s at 400.
+
 ### Delta
+
++53.4% at 50 connections, +50.0% at 200 and +52.6% at 400. At 50 connections
+the median fell from 0.58 to 0.38 ms and p99 from 0.94 to 0.59 ms. Every run
+reported 100% success and zero non-200 responses.
 
 ### Caveat
 
 The change bundles three effects: the deep clone of the cached entry is gone,
 the v1 remap (and its string allocations) is gone, and per-hit serialization is
-gone. Any gain is not attributable to serialization alone.
+gone. Any gain is not attributable to serialization alone. The baseline
+already contains the Arc AppState change, so the delta is relative to
+`35d3e1b`, not `4ffb783` or `v0`.
 
 ### Runs
 
-| Run | Connections | req/s | median latency (ms) | p99 latency (ms) | success rate | non-200 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-|  |  |  |  |  |  |  |
+All runs reported 100% success and zero non-200s.
 
-Median and min–max across the repeated runs:
+| Run | Commit | Connections | req/s | median latency (ms) | p99 latency (ms) | success rate | non-200 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| baseline, initial | 35d3e1b | 50 | 85,346.6 | 0.59 | 0.94 | 100% | 0 |
+| baseline, initial | 35d3e1b | 50 | 85,026.4 | 0.59 | 0.96 | 100% | 0 |
+| baseline, initial | 35d3e1b | 200 | 83,189.4 | 2.38 | 4.01 | 100% | 0 |
+| baseline, initial | 35d3e1b | 400 | 81,274.6 | 4.40 | 13.96 | 100% | 0 |
+| optimized, initial | 03bbb0d | 50 | 132,588.2 | 0.38 | 0.59 | 100% | 0 |
+| optimized, initial | 03bbb0d | 50 | 130,422.7 | 0.39 | 0.60 | 100% | 0 |
+| optimized, initial | 03bbb0d | 200 | 125,208.5 | 1.57 | 2.74 | 100% | 0 |
+| optimized, initial | 03bbb0d | 400 | 125,441.1 | 2.72 | 12.36 | 100% | 0 |
+| baseline, repeat | 35d3e1b | 50 | 87,300.9 | 0.57 | 0.92 | 100% | 0 |
+| baseline, repeat | 35d3e1b | 50 | 86,784.9 | 0.58 | 0.93 | 100% | 0 |
+| baseline, repeat | 35d3e1b | 200 | 83,396.9 | 2.37 | 4.04 | 100% | 0 |
+| baseline, repeat | 35d3e1b | 400 | 82,146.5 | 4.38 | 14.25 | 100% | 0 |
+| optimized, repeat | 03bbb0d | 50 | 132,899.5 | 0.38 | 0.59 | 100% | 0 |
+| optimized, repeat | 03bbb0d | 50 | 132,417.7 | 0.38 | 0.59 | 100% | 0 |
+| optimized, repeat | 03bbb0d | 200 | 124,729.0 | 1.59 | 2.69 | 100% | 0 |
+| optimized, repeat | 03bbb0d | 400 | 123,970.3 | 2.76 | 12.33 | 100% | 0 |
 
-| Metric | Before (median, min–max) | After (median, min–max) | Delta |
+Mean and min–max across the repeated rounds of each build. These means are the
+comparison:
+
+| Metric | Before, `35d3e1b` (mean, min–max) | After, `03bbb0d` (mean, min–max) | Delta |
 | --- | --- | --- | --- |
-|  |  |  |  |
+| 50 connections, req/s | 86,115 (85,026–87,301) | 132,082 (130,423–132,900) | +53.4% |
+| 50 connections, median latency (ms) | 0.58 (0.57–0.59) | 0.38 (0.38–0.39) | −34.5% |
+| 50 connections, p99 latency (ms) | 0.94 (0.92–0.96) | 0.59 (0.59–0.60) | −37.2% |
+| 200 connections, req/s | 83,293 (83,189–83,397) | 124,969 (124,729–125,209) | +50.0% |
+| 200 connections, median latency (ms) | 2.38 (2.37–2.38) | 1.58 (1.57–1.59) | −33.6% |
+| 200 connections, p99 latency (ms) | 4.03 (4.01–4.04) | 2.72 (2.69–2.74) | −32.5% |
+| 400 connections, req/s | 81,711 (81,275–82,147) | 124,706 (123,970–125,441) | +52.6% |
+| 400 connections, median latency (ms) | 4.39 (4.38–4.40) | 2.74 (2.72–2.76) | −37.6% |
+| 400 connections, p99 latency (ms) | 14.11 (13.96–14.25) | 12.35 (12.33–12.36) | −12.5% |
 
 ### Limited by
 
+Server CPU. The load generator was about 66.5–78.6% idle in the old runs and
+66.5–69.5% idle in the optimized runs, so it was not the bottleneck. Throughput
+depends on this hardware and this workload; these numbers are not capacity
+guarantees.
+
 ### Notes
+
+The repeat rounds agree with the initial round within about 2% for the old
+build and 1% for the new one, so no drift was measured. One deployed API
+instance and one warm key set only.
