@@ -29,7 +29,7 @@ pub type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 pub struct AppState {
     pub db: PgPool,
     pub http_client: Client,
-    pub config: AppConfig,
+    pub config: Arc<AppConfig>,
     pub registry: Arc<AdapterRegistry>,
     pub chains: ChainRegistry,
     pub protocols: Arc<ProtocolRegistry>,
@@ -63,7 +63,7 @@ impl AppState {
         Ok(Self {
             db,
             http_client,
-            config,
+            config: Arc::new(config),
             registry: Arc::new(registry),
             chains,
             protocols: Arc::new(default_registry()),
@@ -83,7 +83,7 @@ impl AppState {
     /// (database, broadcast channel, Wormholescan limiter) stays shared.
     pub fn for_live(&self, config: AppConfig, registry: AdapterRegistry) -> Self {
         Self {
-            config,
+            config: Arc::new(config),
             registry: Arc::new(registry),
             helius_limiter: Arc::new(RateLimiter::direct(Quota::per_second(
                 NonZeroU32::new(HELIUS_LIVE_RPS).unwrap(),
