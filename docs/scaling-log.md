@@ -237,7 +237,7 @@ The repeat rounds agree with the initial round within about 2% for the old
 build and 1% for the new one, so no drift was measured. One deployed API
 instance and one warm key set only.
 
-## 3c-1 — mimalloc global allocator (2026-10-27)
+## perf-1 — mimalloc global allocator (2026-10-27)
 
 ### Hypothesis
 
@@ -315,7 +315,7 @@ interleaved with the mimalloc runs; `R-hit` only, so nothing is known about the
 cold path or writes; memory use under mimalloc was not measured. Zero non-200
 responses in every run.
 
-## 3c-2 — `AppState` clone behind one `Arc` (2026-10-27)
+## perf-2 — `AppState` clone behind one `Arc` (2026-10-27)
 
 ### Hypothesis
 
@@ -327,7 +327,7 @@ refcount bump.
 
 ### Workload
 
-`R-hit` (v1), warm cache, same procedure and connection counts as 3c-1. Says
+`R-hit` (v1), warm cache, same procedure and connection counts as perf-1. Says
 nothing about the cold path or writes.
 
 ### Setup

@@ -659,7 +659,7 @@ the `unresolved` handling. The constraints the design has to satisfy:
 Provider lanes, replay and the decode bench stay in this phase. Items 1a, 1b and
 1d are delivered by Phase A (1a by A1, 1b by A5, 1d by A9).
 
-* \[ ] 1a. Split `analyse_tx` into fetch (IO), decode (pure, no network or state), enrich (IO). Delivered by A1
+* \[x] 1a. Split `analyse_tx` into fetch (IO), decode (pure, no network or state), enrich (IO). Delivered by A1
 * \[x] 1b. Destination tx resolution: operation payload paths first, then the `global-tx` lookup through the WormholeScan limiter. Delivered by A5b, as the WormholeScan enrichment provider
 * \[ ] 1c. Provider lanes: `Lane::Api` and `Lane::Ingest`, each with its own Helius URL (`HELIUS_API_URL`, `HELIUS_STREAM_URL`) and its own limiter. Fall back to `HELIUS_URL` when unset. Today the code has one extra endpoint, `HELIUS_LIVE_URL`, and `AppState::for_live` for the live pipeline. This item replaces it
 * \[x] 1d. Golden tests per fixture, status matrix test. Delivered by A9, with the matrix redefined for on-chain-first statuses: every outbound fixture is `Detected` from its on-chain decode alone, a matched VAA without a destination tx raises it to `Pending`, and a matched VAA plus its destination tx to `Completed`; no VAA, a VAA for another message (even with a destination tx), or a destination tx with no VAA leaves it `Detected`. Registry membership no longer chooses a status: the same rows produce the same status with an unregistered destination (only resolution and explorer URLs differ). Inbound redeems are `Completed` at detection. The old WormholeScan-driven matrix (known tx → `Completed`, none + registered chain → `Pending`, unregistered → `Detected`) remains only for the fallback path in `services::correlator`, tested there.
@@ -676,7 +676,7 @@ Exit: ≥ 99% agreement on transfers older than 15 minutes; `Pending` only when 
 * \[ ] CI builds the release binary; CD over SSH on merge to `main`: deploy key, one systemd unit per role, health check, rollback to previous binary
 * \[ ] `/health` (Postgres and Redis ping) and metrics: request latency histogram, cache hit/miss counters, limiter wait time, stream lag
 * \[ ] Hardening: compose publishes Postgres/Redis on `127.0.0.1` only, no default credentials on a public box, security group allows only 80/443 and SSH from a fixed IP
-* \[ ] Load generator on a second instance in the same VPC, larger than the `t3.micro` used for v0
+* \[x] Load generator on a second instance in the same VPC, larger than the `t3.micro` used for v0
 
 Exit: merge to `main` deploys both roles; the API benchmark runs against the deployed service.
 
@@ -686,6 +686,8 @@ Measure before changing anything. Each item is one tagged experiment with the sa
 
 * \[ ] 3a. True server ceiling: re-run `R-hit` with a stronger load generator; profile (samply / `perf`, `tokio-console`); explain the 33–45 ms latency cluster
 * \[x] 3b. `v1` cache pre-serialized response bytes instead of cloning `NormalisedTransaction` and re-serializing per hit
+* \[x] perf-1. mimalloc as the global allocator
+* \[x] perf-2. `AppState` behind one `Arc<Inner>`, so clone is one refcount operation
 * \[ ] 3c. `v2` one cache lookup instead of four
 * \[ ] 3d. `v3` two API instances behind a proxy: per-process caches duplicate refreshes; compare a Redis-shared cache against sticky routing
 * \[ ] 3e. Cold path: fake upstream server replaying fixtures with injected latency and 429s so quota isn't burned; try JSON-RPC batching for Helius, priority for user requests over background refresh, limiters set to the real plan limits
@@ -822,7 +824,7 @@ entry, the v1 remap, and per-hit serialization. The numbers are their combined
 effect and do not isolate any one of them. Methodology and per-run numbers:
 [docs/scaling-log.md](docs/scaling-log.md).
 
-### 3c-1: mimalloc allocator
+### perf-1: mimalloc allocator
 
 Against `16018712` on the same `m7i-flex.large` server and `c7i.xlarge`
 generator: 130,817 → 139,345 req/s at 50 connections (+6.5%), 125,318 →
@@ -850,7 +852,7 @@ nothing is known about the cold path or writes, and memory use under mimalloc
 was not measured. Methodology and per-run numbers:
 [docs/scaling-log.md](docs/scaling-log.md).
 
-### 3c-2: AppState behind one Arc
+### perf-2: AppState behind one Arc
 
 Against `06b891a` on the same `m7i-flex.large` server and `c7i.xlarge`
 generator: 142,095 → 156,819 req/s at 50 connections (+10.4%), 134,784 →
@@ -906,8 +908,8 @@ per-run numbers: [docs/scaling-log.md](docs/scaling-log.md).
 | v0 | baseline | 36.5k | ~33 ms | ~20 (quota) | — | load generator |
 | 4ffb783 | re-baseline, new load generator | 77.3k | ~1.05 ms | ~20 (quota) | — | server CPU |
 | 03bbb0d (3b) | `/api/v1` cache stores the serialized body; a hit returns it directly | 132.1k | ~0.59 ms | — | — | server CPU |
-| 3c-1 | global allocator switched to mimalloc | 139.3k | ~0.57 ms | — | — | server CPU |
-| 3c-2 | `AppState` clone behind a single `Arc` | 156.8k | ~0.50 ms | — | — | server CPU |
+| perf-1 | global allocator switched to mimalloc | 139.3k | ~0.57 ms | — | — | server CPU |
+| perf-2 | `AppState` clone behind a single `Arc` | 156.8k | ~0.50 ms | — | — | server CPU |
 | | | | | | | |
 
 ### Phase 4 — stream
