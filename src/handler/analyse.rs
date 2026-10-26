@@ -1,12 +1,14 @@
 use axum::Json;
+use axum::body::Body;
 use axum::extract::{Query, State};
+use axum::http::{HeaderValue, header::CONTENT_TYPE};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::domain::api::TransactionResponse;
-use crate::domain::transaction::NormalisedTransaction;
 use crate::error::AppError;
 use crate::routes::v1::compat;
-use crate::services::read_through;
+use crate::services::read_through::{self, V2Analysis};
 use crate::state::AppState;
 
 fn default_chain() -> String {
@@ -23,13 +25,29 @@ pub struct AnalyseQuery {
 pub async fn analyse_handler(
     State(state): State<AppState>,
     Query(params): Query<AnalyseQuery>,
-) -> Result<Json<NormalisedTransaction>, AppError> {
+) -> Result<Response, AppError> {
     let analysed =
         read_through::analyse_cached_v2(&state, &params.chain, &params.transaction_hash).await?;
+    v1_response(&analysed)
+}
+
+/// A v1 cache hit serves the body serialized when the entry was filled. An entry that
+/// v1 cannot represent falls back to the old map-and-serialize path, so its error is
+/// unchanged.
+fn v1_response(analysed: &V2Analysis) -> Result<Response, AppError> {
+    if let Some(body) = analysed.v1_body() {
+        let mut response = Response::new(Body::from(body.clone()));
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        return Ok(response);
+    }
+
     Ok(Json(compat::to_v1(
-        &analysed.response,
-        analysed.bridge_event,
-    )?))
+        analysed.response(),
+        analysed.bridge_event().cloned(),
+    )?)
+    .into_response())
 }
 
 pub async fn analyse_v2_handler(
@@ -38,5 +56,113 @@ pub async fn analyse_v2_handler(
 ) -> Result<Json<TransactionResponse>, AppError> {
     let analysed =
         read_through::analyse_cached_v2(&state, &params.chain, &params.transaction_hash).await?;
-    Ok(Json(analysed.response))
+    Ok(Json(analysed.response().clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chains::NS_WORMHOLE;
+    use crate::domain::api::{ChainDetails, ChainView, TransferStatus, TransferView};
+    use crate::domain::transaction::TxStatus;
+    use crate::protocols::{Direction, MessageId};
+
+    fn chain(protocol: &str, id: &str) -> ChainView {
+        ChainView {
+            protocol: protocol.to_string(),
+            id: id.to_string(),
+            chain: None,
+        }
+    }
+
+    fn transfer(protocol: &str) -> TransferView {
+        TransferView {
+            protocol: protocol.to_string(),
+            direction: Direction::Outbound,
+            via: None,
+            observed_tx_hash: "sig".to_string(),
+            event_index: 0,
+            message_id: MessageId::Wormhole {
+                emitter_chain: 1,
+                emitter_address: "09".repeat(32),
+                sequence: 1,
+            },
+            source: chain(NS_WORMHOLE, "1"),
+            destination: chain(NS_WORMHOLE, "2"),
+            source_wallet: None,
+            destination_wallet: None,
+            source_tx_hash: Some("sig".to_string()),
+            destination_tx_hash: None,
+            source_explorer_url: None,
+            destination_explorer_url: None,
+            token: None,
+            token_symbol: None,
+            amount_raw: None,
+            amount_formatted: None,
+            status: TransferStatus::Completed,
+        }
+    }
+
+    fn response(transfers: Vec<TransferView>) -> TransactionResponse {
+        TransactionResponse {
+            hash: "sig".to_string(),
+            chain: ChainView {
+                protocol: NS_WORMHOLE.to_string(),
+                id: "1".to_string(),
+                chain: Some(ChainDetails {
+                    id: 1,
+                    slug: "solana".to_string(),
+                    name: "Solana".to_string(),
+                }),
+            },
+            status: TxStatus::Success,
+            slot: 1,
+            timestamp: None,
+            fee_lamports: 0,
+            signer: None,
+            transfers,
+        }
+    }
+
+    async fn bytes_of(response: Response) -> axum::body::Bytes {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body")
+    }
+
+    /// The cached bytes must equal what the pre-change handler returned: axum's
+    /// `Json` over the v1 compatibility mapping, status and headers included.
+    #[tokio::test]
+    async fn a_cache_hit_matches_the_old_json_response_byte_for_byte() {
+        let response = response(vec![transfer("wormhole")]);
+        let old =
+            Json(compat::to_v1(&response, None).expect("v1 can represent it")).into_response();
+        let expected_status = old.status();
+        let expected_headers = old.headers().clone();
+        let expected_body = bytes_of(old).await;
+
+        let entry = V2Analysis::new(response, None);
+
+        // Two hits: the first and a later one both serve the pre-serialized body.
+        for hit_number in 0..2 {
+            let hit = v1_response(&entry).expect("cache hit");
+            assert_eq!(hit.status(), expected_status, "hit {hit_number}");
+            assert_eq!(hit.headers(), &expected_headers, "hit {hit_number}");
+            assert_eq!(
+                hit.headers().get(CONTENT_TYPE),
+                Some(&HeaderValue::from_static("application/json"))
+            );
+            assert_eq!(bytes_of(hit).await, expected_body, "hit {hit_number}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unrepresentable_entry_falls_back_to_the_old_error() {
+        let entry = V2Analysis::new(response(vec![transfer("cctp")]), None);
+        assert!(entry.v1_body().is_none());
+        assert!(matches!(
+            v1_response(&entry),
+            Err(AppError::Normalisation(_))
+        ));
+    }
 }
