@@ -787,6 +787,22 @@ What these do and don't mean:
 * There is a cluster of 33–45 ms requests that hasn't been explained yet.
 * The cache lives in one process, so several instances would each refresh their own copies.
 
+### Re-baseline (4ffb783)
+
+New hardware, before the Arc AppState change: `c7i.xlarge` load generator,
+server CPU-bound, generator about 72% idle. 30 s runs, 50 connections, the same
+769 transactions.
+
+| Workload | Result |
+| --- | --- |
+| `R-hit` | 77,275 and 77,302 req/s over two runs, 50 connections, every response a 200 |
+| `R-hit` latency | 0.64 ms median, p99 1.05 ms |
+| `R-hit`, 200 connections | 75,118 req/s, server CPU-bound |
+
+v0's ~33 ms p99 was measured with the `t3.micro` generator at 100% CPU and is
+not comparable to the re-baseline's 1.05 ms. The latency difference is not
+attributable to the Arc change.
+
 ### Phase 1 — correctness
 
 | Version | Change | `C-agree` | Pending % | `D-decode` ns/op | Cold p50 / p99 |
@@ -806,6 +822,7 @@ What these do and don't mean:
 | Version | Change | `R-hit` req/s | `R-hit` p99 | `R-cold` req/s | `W-ingest` tx/s | Limited by |
 | --- | --- | --- | --- | --- | --- | --- |
 | v0 | baseline | 36.5k | ~33 ms | ~20 (quota) | — | load generator |
+| 4ffb783 | re-baseline, new load generator | 77.3k | ~1.05 ms | ~20 (quota) | — | server CPU |
 | | | | | | | |
 
 ### Phase 4 — stream

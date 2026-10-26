@@ -97,3 +97,42 @@ Median and min–max across the repeated runs:
 
 ### Notes
 ```
+
+## Arc AppState, 35d3e1b vs 4ffb783 (2026-10-26)
+
+### Setup
+
+m7i-flex.large server, c7i.xlarge load generator. Limited by server CPU. Load
+generator about 72% idle. Zero non-200s in every run.
+
+### Workload
+
+`R-hit`, single warm key set. Says nothing about the cold path or writes.
+
+### Reason for change
+
+Profile showed `AppState::clone` plus drops at about 4% and `String::clone` at
+1.35%.
+
+### Control
+
+Old commit 4ffb783 gave 77,275 and 77,302 req/s at 08:40 and 76,954 and 77,329
+at 11:24. Within about 0.5%, so there was no drift.
+
+### Runs
+
+req/s:
+
+| Connections | 4ffb783 (08:40) | 4ffb783 (11:24) | 35d3e1b (11:11) | Change vs same-day old |
+| --- | ---: | ---: | ---: | ---: |
+| 50, run 1 | 77,275 | 76,954 | 84,995 | |
+| 50, run 2 | 77,302 | 77,329 | 84,391 | |
+| 50, mean | 77,289 | 77,141 | 84,693 | +9.8% |
+| 50, median / p99 (ms) | 0.64 / 1.05 | 0.645 / 1.055 | 0.59 / 0.955 | -8.5% / -9.5% |
+| 200 | 75,118 | 74,729 | 80,754 | +8.1% |
+| 400 | 74,431 | 73,604 | 81,173 | +10.3% |
+
+### Caveats
+
+200 and 400 are single runs per commit. Runs were not interleaved (new at 11:11,
+old at 11:24). One workload only.
