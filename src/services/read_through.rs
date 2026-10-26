@@ -1,4 +1,5 @@
 use crate::domain::bridge_transfer::BridgeStatus;
+use axum::body::Bytes;
 use dashmap::DashMap;
 use moka::future::Cache;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use crate::domain::api::TransactionResponse;
 use crate::domain::bridge::BridgeEvent;
 use crate::domain::transaction::NormalisedTransaction;
 use crate::error::AppError;
+use crate::routes::v1::compat;
 use crate::services::analyzer::analyse_tx;
 use crate::services::api_v2;
 use crate::state::AppState;
@@ -59,8 +61,38 @@ impl Neg {
 /// mapper reproduce the frozen v1 response exactly.
 #[derive(Clone)]
 pub struct V2Analysis {
-    pub response: TransactionResponse,
-    pub bridge_event: Option<BridgeEvent>,
+    response: TransactionResponse,
+    bridge_event: Option<BridgeEvent>,
+    v1_body: Option<Bytes>,
+}
+
+impl V2Analysis {
+    /// Fills the cache entry. The `/api/v1` body is serialized once here, so a hit
+    /// clones a `Bytes` handle instead of remapping and re-serializing.
+    // v2-only misses pay this v1 serialization once too; that cost is cold-path only.
+    pub fn new(response: TransactionResponse, bridge_event: Option<BridgeEvent>) -> Self {
+        let v1_body = compat::to_v1(&response, bridge_event.clone())
+            .ok()
+            .and_then(|tx| serde_json::to_vec(&tx).ok())
+            .map(Bytes::from);
+        Self {
+            response,
+            bridge_event,
+            v1_body,
+        }
+    }
+
+    pub fn response(&self) -> &TransactionResponse {
+        &self.response
+    }
+
+    pub fn bridge_event(&self) -> Option<&BridgeEvent> {
+        self.bridge_event.as_ref()
+    }
+
+    pub fn v1_body(&self) -> Option<&Bytes> {
+        self.v1_body.as_ref()
+    }
 }
 
 pub struct ReadThrough {
@@ -68,8 +100,8 @@ pub struct ReadThrough {
     upstream_permits: Semaphore,
     completed: Cache<String, NormalisedTransaction>,
     open: Cache<String, NormalisedTransaction>,
-    v2_completed: Cache<String, V2Analysis>,
-    v2_open: Cache<String, V2Analysis>,
+    v2_completed: Cache<String, Arc<V2Analysis>>,
+    v2_open: Cache<String, Arc<V2Analysis>>,
     // negative caches
     not_found: Cache<String, Neg>, // tx doesn't exist: longer TTL
     failed: Cache<String, Neg>,    // transient upstream failure: very short TTL
@@ -306,7 +338,7 @@ pub async fn analyse_cached_v2(
     state: &AppState,
     chain: &str,
     hash: &str,
-) -> Result<V2Analysis, AppError> {
+) -> Result<Arc<V2Analysis>, AppError> {
     let rt = &state.read_through;
 
     if let Some(hit) = rt.v2_completed.get(hash).await {
@@ -328,11 +360,8 @@ pub async fn analyse_cached_v2(
         Err(error) => return Err(AppError::Internal(error)),
     };
 
-    let entry = V2Analysis {
-        response,
-        bridge_event: legacy.bridge_event,
-    };
-    let cache = if entry.response.is_complete() {
+    let entry = Arc::new(V2Analysis::new(response, legacy.bridge_event));
+    let cache = if entry.response().is_complete() {
         &rt.v2_completed
     } else {
         &rt.v2_open

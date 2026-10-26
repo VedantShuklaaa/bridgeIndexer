@@ -823,6 +823,7 @@ attributable to the Arc change.
 | --- | --- | --- | --- | --- | --- | --- |
 | v0 | baseline | 36.5k | ~33 ms | ~20 (quota) | — | load generator |
 | 4ffb783 | re-baseline, new load generator | 77.3k | ~1.05 ms | ~20 (quota) | — | server CPU |
+| 3b | `/api/v1` cache stores the serialized body; a hit returns it directly | pending | pending | — | — | pending measurement |
 | | | | | | | |
 
 ### Phase 4 — stream
