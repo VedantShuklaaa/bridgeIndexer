@@ -685,7 +685,7 @@ Exit: merge to `main` deploys both roles; the API benchmark runs against the dep
 Measure before changing anything. Each item is one tagged experiment with the same workloads.
 
 * \[ ] 3a. True server ceiling: re-run `R-hit` with a stronger load generator; profile (samply / `perf`, `tokio-console`); explain the 33–45 ms latency cluster
-* \[ ] 3b. `v1` cache pre-serialized response bytes instead of cloning `NormalisedTransaction` and re-serializing per hit
+* \[x] 3b. `v1` cache pre-serialized response bytes instead of cloning `NormalisedTransaction` and re-serializing per hit
 * \[ ] 3c. `v2` one cache lookup instead of four
 * \[ ] 3d. `v3` two API instances behind a proxy: per-process caches duplicate refreshes; compare a Redis-shared cache against sticky routing
 * \[ ] 3e. Cold path: fake upstream server replaying fixtures with injected latency and 429s so quota isn't burned; try JSON-RPC batching for Helius, priority for user requests over background refresh, limiters set to the real plan limits
@@ -803,6 +803,25 @@ v0's ~33 ms p99 was measured with the `t3.micro` generator at 100% CPU and is
 not comparable to the re-baseline's 1.05 ms. The latency difference is not
 attributable to the Arc change.
 
+### 3b — pre-serialized `/api/v1` cache bodies (03bbb0d)
+
+Against `35d3e1b` on the same hardware: 86,115 → 132,082 req/s at 50
+connections (+53.4%), 83,293 → 124,969 at 200 (+50.0%) and 81,711 → 124,706 at
+400 (+52.6%). At 50 connections median latency went from 0.58 to 0.38 ms and
+p99 from 0.94 to 0.59 ms. These are the means of the initial and repeated
+rounds for each build.
+
+The API ran as a deployed instance with ingestion off, against 769 URLs, 30 s
+runs, warm-up run excluded. Server CPU-bound; the load generator was about
+66.5–78.6% idle in the old runs and 66.5–69.5% idle in the new ones, so these
+figures are not capacity guarantees. Every run reported 100% success and zero
+non-200 responses.
+
+The change removes three costs per warm hit: the deep clone of the cached
+entry, the v1 remap, and per-hit serialization. The numbers are their combined
+effect and do not isolate any one of them. Methodology and per-run numbers:
+[docs/scaling-log.md](docs/scaling-log.md).
+
 ### Phase 1 — correctness
 
 | Version | Change | `C-agree` | Pending % | `D-decode` ns/op | Cold p50 / p99 |
@@ -823,7 +842,7 @@ attributable to the Arc change.
 | --- | --- | --- | --- | --- | --- | --- |
 | v0 | baseline | 36.5k | ~33 ms | ~20 (quota) | — | load generator |
 | 4ffb783 | re-baseline, new load generator | 77.3k | ~1.05 ms | ~20 (quota) | — | server CPU |
-| 3b | `/api/v1` cache stores the serialized body; a hit returns it directly | pending | pending | — | — | pending measurement |
+| 03bbb0d (3b) | `/api/v1` cache stores the serialized body; a hit returns it directly | 132.1k | ~0.59 ms | — | — | server CPU |
 | | | | | | | |
 
 ### Phase 4 — stream
