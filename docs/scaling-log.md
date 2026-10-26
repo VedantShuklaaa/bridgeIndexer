@@ -315,7 +315,7 @@ interleaved with the mimalloc runs; `R-hit` only, so nothing is known about the
 cold path or writes; memory use under mimalloc was not measured. Zero non-200
 responses in every run.
 
-## 3c-2 — `AppState` clone behind one `Arc` (pending benchmark)
+## 3c-2 — `AppState` clone behind one `Arc` (2026-10-27)
 
 ### Hypothesis
 
@@ -332,38 +332,79 @@ nothing about the cold path or writes.
 
 ### Setup
 
-Pending. Record the baseline and after SHAs here when the benchmark is run.
+Baseline `06b891ac4c157e4cff4881174dd84b884988b3bf` (includes mimalloc), after
+`0144ea90ea3088bbcba76a0eecb6da0ebe17ebe0` (`AppState { inner: Arc<Inner> }`),
+on the same `m7i-flex.large` server with a `c7i.xlarge` load generator. The
+runs were interleaved in the order old, new, old, new. The only change is how
+`AppState` is cloned.
 
 ### Before
 
-—
+`06b891a`: 142,095 req/s at 50 connections (mean of four runs: 141,846,
+140,579, 142,260 and 143,697), median about 0.35 ms and p99 about 0.55 ms;
+134,784 req/s at 200 connections (mean of two: 133,581 and 135,986) and 130,376
+at 400 (mean of two: 129,347 and 131,404).
 
 ### After
 
-—
+`0144ea9`: 156,819 req/s at 50 connections (mean of four runs: 155,643,
+156,057, 156,984 and 158,590), median about 0.31 ms and p99 about 0.50 ms;
+147,438 req/s at 200 connections (mean of two: 145,878 and 148,998) and 145,689
+at 400 (mean of two: 146,457 and 144,921).
 
 ### Delta
 
-| Connections | Before, req/s | After, req/s | Change |
+| Connections | `06b891a`, req/s | `0144ea9`, req/s | Change |
 | ---: | ---: | ---: | ---: |
-| 50 | — | — | — |
-| 200 | — | — | — |
-| 400 | — | — | — |
+| 50 | 142,095 (141,846, 140,579, 142,260 and 143,697) | 156,819 (155,643, 156,057, 156,984 and 158,590) | +10.4% |
+| 200 | 134,784 (133,581 and 135,986) | 147,438 (145,878 and 148,998) | +9.4% |
+| 400 | 130,376 (129,347 and 131,404) | 145,689 (146,457 and 144,921) | +11.7% |
 
 ### Runs
 
 | Run | Connections | req/s | median latency (ms) | p99 latency (ms) | success rate | non-200 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| — | — | — | — | — | — | — |
+| `06b891a`, run 1 | 50 | 141,846 | — | — | 100% | 0 |
+| `0144ea9`, run 1 | 50 | 155,643 | — | — | 100% | 0 |
+| `06b891a`, run 2 | 50 | 140,579 | — | — | 100% | 0 |
+| `0144ea9`, run 2 | 50 | 156,057 | — | — | 100% | 0 |
+| `06b891a`, run 3 | 50 | 142,260 | — | — | 100% | 0 |
+| `0144ea9`, run 3 | 50 | 156,984 | — | — | 100% | 0 |
+| `06b891a`, run 4 | 50 | 143,697 | — | — | 100% | 0 |
+| `0144ea9`, run 4 | 50 | 158,590 | — | — | 100% | 0 |
+| `06b891a`, run 1 | 200 | 133,581 | — | — | 100% | 0 |
+| `0144ea9`, run 1 | 200 | 145,878 | — | — | 100% | 0 |
+| `06b891a`, run 2 | 200 | 135,986 | — | — | 100% | 0 |
+| `0144ea9`, run 2 | 200 | 148,998 | — | — | 100% | 0 |
+| `06b891a`, run 1 | 400 | 129,347 | — | — | 100% | 0 |
+| `0144ea9`, run 1 | 400 | 146,457 | — | — | 100% | 0 |
+| `06b891a`, run 2 | 400 | 131,404 | — | — | 100% | 0 |
+| `0144ea9`, run 2 | 400 | 144,921 | — | — | 100% | 0 |
+
+`—` means not recorded. The 50-connection medians and p99s above are per-build
+approximate values (about 0.35 and 0.55 ms for `06b891a`; about 0.31 and
+0.50 ms for `0144ea9`), not per-run values.
 
 ### Limited by
 
-—
+Server CPU. Server and load generator CPU percentages were not recorded for
+these rounds.
 
 ### Notes
 
-The expected gain is small: every field was already cheap to clone on its own,
-so this removes one struct copy and a handful of atomic increments per clone
-rather than a large allocation. It therefore needs interleaved before/after
-runs to separate it from run-to-run noise. Results are intentionally blank
-until the benchmark is run.
+The reason for the change: a profile at `16018712` showed about 4% of server
+time in `drop_glue<AppState>` and `FromRef::from_ref`. The old `AppState` clone
+did about 8 refcount increments per request; the new one does 1.
+
+The measured gain (+9.4% to +11.7%) is larger than that 4%. A likely
+explanation, stated as a hypothesis rather than a measured fact: the removed
+atomic refcount operations probably also cause cache-line contention between
+cores, which a CPU profile does not attribute cleanly.
+
+Caveats: the runs were interleaved old/new/old/new; 200 and 400 connections
+have two runs per version; `R-hit` only, so nothing is known about the cold
+path or writes; server and load generator CPU were not recorded for these
+rounds; the old baseline already includes mimalloc; the tradeoff is one extra
+pointer hop per field access through `Deref`. At 50 connections the old and new
+ranges do not overlap (140.6k–143.7k against 155.6k–158.6k), and the old runs
+agree with each other within about 1.3%. Zero non-200 responses in every run.
