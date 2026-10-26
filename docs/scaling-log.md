@@ -314,3 +314,56 @@ per connection count (two at 50 connections); the glibc runs were not
 interleaved with the mimalloc runs; `R-hit` only, so nothing is known about the
 cold path or writes; memory use under mimalloc was not measured. Zero non-200
 responses in every run.
+
+## 3c-2 — `AppState` clone behind one `Arc` (pending benchmark)
+
+### Hypothesis
+
+`AppState` is cloned for every axum state extraction and for each spawned
+worker task. All of its fields were already cheap to clone, but each clone
+still copied the whole struct and took one refcount per `Arc`-backed field.
+Holding the fields in one `Inner` behind a single `Arc` makes a clone one
+refcount bump.
+
+### Workload
+
+`R-hit` (v1), warm cache, same procedure and connection counts as 3c-1. Says
+nothing about the cold path or writes.
+
+### Setup
+
+Pending. Record the baseline and after SHAs here when the benchmark is run.
+
+### Before
+
+—
+
+### After
+
+—
+
+### Delta
+
+| Connections | Before, req/s | After, req/s | Change |
+| ---: | ---: | ---: | ---: |
+| 50 | — | — | — |
+| 200 | — | — | — |
+| 400 | — | — | — |
+
+### Runs
+
+| Run | Connections | req/s | median latency (ms) | p99 latency (ms) | success rate | non-200 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| — | — | — | — | — | — | — |
+
+### Limited by
+
+—
+
+### Notes
+
+The expected gain is small: every field was already cheap to clone on its own,
+so this removes one struct copy and a handful of atomic increments per clone
+rather than a large allocation. It therefore needs interleaved before/after
+runs to separate it from run-to-run noise. Results are intentionally blank
+until the benchmark is run.

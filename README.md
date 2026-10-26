@@ -872,6 +872,7 @@ was not measured. Methodology and per-run numbers:
 | 4ffb783 | re-baseline, new load generator | 77.3k | ~1.05 ms | ~20 (quota) | — | server CPU |
 | 03bbb0d (3b) | `/api/v1` cache stores the serialized body; a hit returns it directly | 132.1k | ~0.59 ms | — | — | server CPU |
 | 3c-1 | global allocator switched to mimalloc | 139.3k | ~0.57 ms | — | — | server CPU |
+| 3c-2 | `AppState` clone behind a single `Arc` | — | — | — | — | — |
 | | | | | | | |
 
 ### Phase 4 — stream
