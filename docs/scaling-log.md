@@ -408,3 +408,65 @@ rounds; the old baseline already includes mimalloc; the tradeoff is one extra
 pointer hop per field access through `Deref`. At 50 connections the old and new
 ranges do not overlap (140.6k–143.7k against 155.6k–158.6k), and the old runs
 agree with each other within about 1.3%. Zero non-200 responses in every run.
+
+## 3c — pre-serialized `/api/v2` response bodies (2026-10-27)
+
+### Hypothesis
+
+A warm `/api/v2` hit already costs one cache lookup (`v2_completed`, then
+`v2_open` on a miss), so the roadmap's "one lookup instead of four" no longer
+applies. The remaining per-hit cost was the deep clone of the cached
+`TransactionResponse` and its JSON serialization on every request. Storing the
+serialized body in the cache and returning it directly, as 3b did for
+`/api/v1`, should raise `R-hit` throughput and cut latency.
+
+### Workload
+
+`R-hit` (`v2`), warm cache, 30 s runs at 50, 200 and 400 connections, run per
+the procedure above. One `/api/v1` pass on each build, at 50 connections,
+served as a control. Says nothing about the cold path or writes.
+
+### Setup
+
+Old build `5a2fce3`, new build `0ed3edb`. The runs were interleaved in the
+order old, new, old, new.
+
+### Before
+
+`5a2fce3`: 86,660 req/s at 50 connections (mean of four runs), 0.58 ms median,
+0.82 ms p99; 82,852 req/s at 200 connections and 80,290 at 400.
+
+### After
+
+`0ed3edb`: 128,872 req/s at 50 connections (mean of four runs), 0.39 ms median,
+0.53 ms p99; 127,498 req/s at 200 connections and 121,888 at 400.
+
+### Delta
+
+| Connections | `5a2fce3`, req/s | `0ed3edb`, req/s | Change |
+| ---: | ---: | ---: | ---: |
+| 50 | 86,660 (mean of 4) | 128,872 (mean of 4) | +48.7% |
+| 200 | 82,852 | 127,498 | +53.9% |
+| 400 | 80,290 | 121,888 | +51.8% |
+
+At 50 connections the median fell from 0.58 to 0.39 ms and p99 from 0.82 to
+0.53 ms.
+
+### Control
+
+A `/api/v1` pass on each build on the same day, at 50 connections, gave
+127.9k req/s on `5a2fce3` and 128.2k on `0ed3edb`, so there is no `v1`
+regression from this change. The control is one pass per build.
+
+### Limited by
+
+CPU is not comparable: the old1 sampler ran too long. No CPU numbers are
+reported.
+
+### Notes
+
+Caveats: the runs were interleaved old/new/old/new; 200 and 400 connections
+have two runs per version; `R-hit` only, so nothing is known about the cold
+path or writes; the `/api/v1` control is one pass per build. The tradeoff is
+one more serialized body per cached entry in memory (up to 50k completed
+entries), plus one more serialization on a v2-only miss.

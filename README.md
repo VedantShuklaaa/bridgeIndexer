@@ -688,7 +688,7 @@ Measure before changing anything. Each item is one tagged experiment with the sa
 * \[x] 3b. `v1` cache pre-serialized response bytes instead of cloning `NormalisedTransaction` and re-serializing per hit
 * \[x] perf-1. mimalloc as the global allocator
 * \[x] perf-2. `AppState` behind one `Arc<Inner>`, so clone is one refcount operation
-* \[ ] 3c. `v2` pre-serialized response body, as 3b did for `v1`. A warm `v2` hit is already a single cache lookup; the per-hit cost was the response clone and JSON serialization
+* \[x] 3c. `v2` pre-serialized response body, as 3b did for `v1`. A warm `v2` hit is already a single cache lookup; the per-hit cost was the response clone and JSON serialization
 * \[ ] 3d. `v3` two API instances behind a proxy: per-process caches duplicate refreshes; compare a Redis-shared cache against sticky routing
 * \[ ] 3e. Cold path: fake upstream server replaying fixtures with injected latency and 429s so quota isn't burned; try JSON-RPC batching for Helius, priority for user requests over background refresh, limiters set to the real plan limits
 * \[ ] 3f. Write path: consumer throughput against the fake upstream. Try larger `XREADGROUP COUNT`, concurrent processing inside a worker, batched upserts per Postgres transaction, pool sizing against RDS limits
@@ -891,9 +891,9 @@ per-run numbers: [docs/scaling-log.md](docs/scaling-log.md).
 
 ### 3c: v2 pre-serialized body
 
-Not yet benchmarked. The `/api/v2` hit path already costs one cache lookup
-(`v2_completed`, then `v2_open` on a miss), so the roadmap's "one lookup instead
-of four" no longer applies. The per-hit cost was the deep clone of the cached
+The `/api/v2` hit path already costs one cache lookup (`v2_completed`, then
+`v2_open` on a miss), so the roadmap's "one lookup instead of four" no longer
+applies. The per-hit cost was the deep clone of the cached
 `TransactionResponse` and its JSON serialization on every request. `V2Analysis`
 now serializes the v2 body once at fill time and a hit serves a `Bytes` handle,
 as 3b did for `v1`. Status, headers and body bytes are pinned against the old
@@ -903,8 +903,26 @@ Tradeoffs: each cached entry holds one more serialized body in memory (up to 50k
 completed entries), and a v2-only miss pays one more serialization on the cold
 path.
 
-Results: pending. Workload is `/api/v2`, interleaved old/new/old/new against
-main, plus one `/api/v1` pass on the new build to confirm no regression.
+Against `5a2fce3`, on `/api/v2`: 86,660 → 128,872 req/s at 50 connections
+(+48.7%), 82,852 → 127,498 at 200 (+53.9%) and 80,290 → 121,888 at 400
+(+51.8%). At 50 connections median latency went from 0.58 to 0.39 ms and p99
+from 0.82 to 0.53 ms.
+
+| Connections | `5a2fce3` (before), req/s | `0ed3edb` (after), req/s | Change |
+| ---: | ---: | ---: | ---: |
+| 50 | 86,660 (mean of 4) | 128,872 (mean of 4) | +48.7% |
+| 200 | 82,852 | 127,498 | +53.9% |
+| 400 | 80,290 | 121,888 | +51.8% |
+
+The runs were interleaved old/new/old/new. A `/api/v1` control pass on the same
+day, at 50 connections, gave 127.9k req/s on the old build and 128.2k on the
+new, so there is no `v1` regression. Server CPU is not comparable: the old1
+sampler ran too long, so no CPU figures are reported.
+
+Caveats: 200 and 400 connections have two runs per version; this covers
+`R-hit` only, so nothing is known about the cold path or writes; the `/api/v1`
+control is one pass each. Methodology:
+[docs/scaling-log.md](docs/scaling-log.md).
 
 ### Phase 1 — correctness
 
