@@ -688,7 +688,7 @@ Measure before changing anything. Each item is one tagged experiment with the sa
 * \[x] 3b. `v1` cache pre-serialized response bytes instead of cloning `NormalisedTransaction` and re-serializing per hit
 * \[x] perf-1. mimalloc as the global allocator
 * \[x] perf-2. `AppState` behind one `Arc<Inner>`, so clone is one refcount operation
-* \[ ] 3c. `v2` one cache lookup instead of four
+* \[ ] 3c. `v2` pre-serialized response body, as 3b did for `v1`. A warm `v2` hit is already a single cache lookup; the per-hit cost was the response clone and JSON serialization
 * \[ ] 3d. `v3` two API instances behind a proxy: per-process caches duplicate refreshes; compare a Redis-shared cache against sticky routing
 * \[ ] 3e. Cold path: fake upstream server replaying fixtures with injected latency and 429s so quota isn't burned; try JSON-RPC batching for Helius, priority for user requests over background refresh, limiters set to the real plan limits
 * \[ ] 3f. Write path: consumer throughput against the fake upstream. Try larger `XREADGROUP COUNT`, concurrent processing inside a worker, batched upserts per Postgres transaction, pool sizing against RDS limits
@@ -886,6 +886,25 @@ about the cold path or writes; server and load generator CPU were not recorded
 for these rounds; the old baseline already includes mimalloc; and the tradeoff
 is one extra pointer hop per field access through `Deref`. Methodology and
 per-run numbers: [docs/scaling-log.md](docs/scaling-log.md).
+
+| — | 3c: v2 pre-serialized body | — | — | — | — | — |
+
+### 3c: v2 pre-serialized body
+
+Not yet benchmarked. The `/api/v2` hit path already costs one cache lookup
+(`v2_completed`, then `v2_open` on a miss), so the roadmap's "one lookup instead
+of four" no longer applies. The per-hit cost was the deep clone of the cached
+`TransactionResponse` and its JSON serialization on every request. `V2Analysis`
+now serializes the v2 body once at fill time and a hit serves a `Bytes` handle,
+as 3b did for `v1`. Status, headers and body bytes are pinned against the old
+`Json` path by a test.
+
+Tradeoffs: each cached entry holds one more serialized body in memory (up to 50k
+completed entries), and a v2-only miss pays one more serialization on the cold
+path.
+
+Results: pending. Workload is `/api/v2`, interleaved old/new/old/new against
+main, plus one `/api/v1` pass on the new build to confirm no regression.
 
 ### Phase 1 — correctness
 

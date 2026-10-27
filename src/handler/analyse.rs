@@ -5,7 +5,6 @@ use axum::http::{HeaderValue, header::CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
-use crate::domain::api::TransactionResponse;
 use crate::error::AppError;
 use crate::routes::v1::compat;
 use crate::services::read_through::{self, V2Analysis};
@@ -31,16 +30,20 @@ pub async fn analyse_handler(
     v1_response(&analysed)
 }
 
+fn json_bytes_response(body: &axum::body::Bytes) -> Response {
+    let mut response = Response::new(Body::from(body.clone()));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
+}
+
 /// A v1 cache hit serves the body serialized when the entry was filled. An entry that
 /// v1 cannot represent falls back to the old map-and-serialize path, so its error is
 /// unchanged.
 fn v1_response(analysed: &V2Analysis) -> Result<Response, AppError> {
     if let Some(body) = analysed.v1_body() {
-        let mut response = Response::new(Body::from(body.clone()));
-        response
-            .headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        return Ok(response);
+        return Ok(json_bytes_response(body));
     }
 
     Ok(Json(compat::to_v1(
@@ -53,17 +56,28 @@ fn v1_response(analysed: &V2Analysis) -> Result<Response, AppError> {
 pub async fn analyse_v2_handler(
     State(state): State<AppState>,
     Query(params): Query<AnalyseQuery>,
-) -> Result<Json<TransactionResponse>, AppError> {
+) -> Result<Response, AppError> {
     let analysed =
         read_through::analyse_cached_v2(&state, &params.chain, &params.transaction_hash).await?;
-    Ok(Json(analysed.response().clone()))
+    Ok(v2_response(&analysed))
+}
+
+/// A v2 cache hit serves the body serialized when the entry was filled. If that
+/// serialization failed at fill time, fall back to the old clone-and-serialize path.
+fn v2_response(analysed: &V2Analysis) -> Response {
+    if let Some(body) = analysed.v2_body() {
+        return json_bytes_response(body);
+    }
+    Json(analysed.response().clone()).into_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::chains::NS_WORMHOLE;
-    use crate::domain::api::{ChainDetails, ChainView, TransferStatus, TransferView};
+    use crate::domain::api::{
+        ChainDetails, ChainView, TransactionResponse, TransferStatus, TransferView,
+    };
     use crate::domain::transaction::TxStatus;
     use crate::protocols::{Direction, MessageId};
 
@@ -164,5 +178,26 @@ mod tests {
             v1_response(&entry),
             Err(AppError::Normalisation(_))
         ));
+    }
+
+    /// The cached v2 bytes must equal what the old handler returned: axum's `Json`
+    /// over a clone of the response, status and headers included.
+    #[tokio::test]
+    async fn a_v2_cache_hit_matches_the_old_json_response_byte_for_byte() {
+        let response = response(vec![transfer("wormhole")]);
+        let old = Json(response.clone()).into_response();
+        let expected_status = old.status();
+        let expected_headers = old.headers().clone();
+        let expected_body = bytes_of(old).await;
+
+        let entry = V2Analysis::new(response, None);
+        assert!(entry.v2_body().is_some());
+
+        for hit_number in 0..2 {
+            let hit = v2_response(&entry);
+            assert_eq!(hit.status(), expected_status, "hit {hit_number}");
+            assert_eq!(hit.headers(), &expected_headers, "hit {hit_number}");
+            assert_eq!(bytes_of(hit).await, expected_body, "hit {hit_number}");
+        }
     }
 }

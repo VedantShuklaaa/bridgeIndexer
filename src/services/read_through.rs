@@ -64,6 +64,7 @@ pub struct V2Analysis {
     response: TransactionResponse,
     bridge_event: Option<BridgeEvent>,
     v1_body: Option<Bytes>,
+    v2_body: Option<Bytes>,
 }
 
 impl V2Analysis {
@@ -75,10 +76,13 @@ impl V2Analysis {
             .ok()
             .and_then(|tx| serde_json::to_vec(&tx).ok())
             .map(Bytes::from);
+        // Same bytes axum's `Json` would produce per request; cold-path cost only.
+        let v2_body = serde_json::to_vec(&response).ok().map(Bytes::from);
         Self {
             response,
             bridge_event,
             v1_body,
+            v2_body,
         }
     }
 
@@ -92,6 +96,10 @@ impl V2Analysis {
 
     pub fn v1_body(&self) -> Option<&Bytes> {
         self.v1_body.as_ref()
+    }
+
+    pub fn v2_body(&self) -> Option<&Bytes> {
+        self.v2_body.as_ref()
     }
 }
 
