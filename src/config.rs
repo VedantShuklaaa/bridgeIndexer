@@ -41,6 +41,16 @@ pub struct AppConfig {
     /// Falls back to `helius_url` when `HELIUS_LIVE_URL` is unset.
     pub helius_live_url: String,
     pub wormhole_url: String,
+    /// Helius requests/sec for the GET API. Helius free plan: 10 requests/sec per key.
+    /// The API and the live pipeline share one key until Phase 2 gives each its own,
+    /// so `helius_api_rps + helius_live_rps` must add up to the plan limit.
+    pub helius_api_rps: u32,
+    /// Helius requests/sec for the live pipeline (backfill + consumer workers).
+    pub helius_live_rps: u32,
+    /// WormholeScan requests/sec, shared by the GET API and enrichment.
+    pub wormhole_rps: u32,
+    /// Most upstream fetches one cold `/analyse` may run at once.
+    pub upstream_permits: usize,
     pub port: u16,
     pub solana_token_bridge_program: String,
     pub solana_ws_url: String,
@@ -85,6 +95,10 @@ impl AppConfig {
             helius_live_url: optional("HELIUS_LIVE_URL", &helius_url),
             helius_url,
             wormhole_url: optional("WORMHOLE_URL", "https://api.wormholescan.io"),
+            helius_api_rps: number("HELIUS_API_RPS", 6u32).max(1),
+            helius_live_rps: number("HELIUS_LIVE_RPS", 4u32).max(1),
+            wormhole_rps: number("WORMHOLE_RPS", 20u32).max(1),
+            upstream_permits: number("UPSTREAM_PERMITS", 16usize).max(1),
             port: std::env::var("PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())

@@ -19,11 +19,6 @@ use tokio::sync::broadcast;
 
 const BROADCAST_CAPACITY: usize = 1024;
 
-/// Helius free plan: 10 requests/sec per key. The API and the live pipeline share one key
-/// until Phase 2 gives each its own, so the two quotas must add up to the plan limit.
-const HELIUS_API_RPS: u32 = 6;
-const HELIUS_LIVE_RPS: u32 = 4;
-
 pub type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
 /// The shared state itself. Kept behind a single `Arc` in [`AppState`] so cloning
@@ -65,9 +60,11 @@ impl AppState {
         chains: ChainRegistry,
     ) -> anyhow::Result<Self> {
         let (tx_broadcast, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let read_through = Arc::new(ReadThrough::new(16));
+        let read_through = Arc::new(ReadThrough::new(config.upstream_permits));
+        let api_rps = config.helius_api_rps;
+        let wormhole_rps = config.wormhole_rps;
         let wormhole_limiter: Arc<Limiter> = Arc::new(RateLimiter::direct(Quota::per_second(
-            NonZeroU32::new(20).unwrap(),
+            NonZeroU32::new(wormhole_rps).unwrap(),
         )));
         let enrichment = Arc::new(WormholeScanProvider::new(
             http_client.clone(),
@@ -87,7 +84,7 @@ impl AppState {
                 tx_broadcast,
                 read_through,
                 helius_limiter: Arc::new(RateLimiter::direct(Quota::per_second(
-                    NonZeroU32::new(HELIUS_API_RPS).unwrap(),
+                    NonZeroU32::new(api_rps).unwrap(),
                 ))),
                 wormhole_limiter,
                 enrichment,
@@ -100,12 +97,13 @@ impl AppState {
     /// live traffic can never eat into the GET API's quota. Everything else
     /// (database, broadcast channel, Wormholescan limiter) stays shared.
     pub fn for_live(&self, config: AppConfig, registry: AdapterRegistry) -> Self {
+        let live_rps = config.helius_live_rps;
         Self {
             inner: Arc::new(Inner {
                 config: Arc::new(config),
                 registry: Arc::new(registry),
                 helius_limiter: Arc::new(RateLimiter::direct(Quota::per_second(
-                    NonZeroU32::new(HELIUS_LIVE_RPS).unwrap(),
+                    NonZeroU32::new(live_rps).unwrap(),
                 ))),
                 ..(*self.inner).clone()
             }),
