@@ -470,3 +470,100 @@ have two runs per version; `R-hit` only, so nothing is known about the cold
 path or writes; the `/api/v1` control is one pass per build. The tradeoff is
 one more serialized body per cached entry in memory (up to 50k completed
 entries), plus one more serialization on a v2-only miss.
+
+## 3e experiment 1 — take the Helius token before the Wormholescan call (2026-10-28)
+
+### Finding
+
+A request that was shed on the Helius limiter had already started its
+Wormholescan call, whose result was then discarded. In config A `R-cold` this
+showed up as 2.19 to 2.23 operations calls per `getTransaction`. Taking the
+Helius token before starting either call brings the ratio to 1.000.
+
+### Workload
+
+`R-cold` (all-unique signatures) and, for config A, `R-mix` (90% hot / 10%
+cold), both against the fake upstream with 50 ms latency, `/api/v2`, per
+`scripts/bench_cold.sh`. Says nothing about writes and nothing about the real
+upstream's own behaviour.
+
+Config A: `HELIUS_API_RPS=6 HELIUS_LIVE_RPS=4 WORMHOLE_RPS=20
+UPSTREAM_PERMITS=16`, where the Helius limiter binds. Config B: all limiters
+`100000`, `UPSTREAM_PERMITS=16`, where the limiters should not bind.
+
+### Setup
+
+Old build `e9708ee` (main), new build `cdb471f`. The baseline was measured on
+the same app code as `e9708ee`. The runs were interleaved in the order old,
+new, old, new, with two pairs per config. The benchmark ran with
+`FAKE_429_RATE=0`.
+
+### Before
+
+Baseline, before the change, fake upstream, two runs each:
+
+- Config A `R-cold`: 18.3 and 18.4 req/s; about 28% of requests answered 200 and
+  the rest 503 from the Helius limiter.
+- Config B `R-cold`: 130.5 and 130.8 req/s, median 373 ms, p99 533 ms.
+
+`e9708ee` under config A paid 2.186 and 2.232 Wormholescan operations per
+`getTransaction` on `R-cold` (365 and 366 operations calls in 30 s) and 2.193
+and 2.178 on `R-mix`. The 200 responses were 164 and 160 in the `R-cold` runs.
+
+### After
+
+`cdb471f` under config A paid 1.000 and 1.000 operations per `getTransaction`
+on `R-cold` (169 and 162 operations calls in 30 s) and 1.006 and 1.000 on
+`R-mix`. The 200 responses were 168 and 159 in the `R-cold` runs.
+
+Under config B, `R-cold` gave 130.8 and 129.7 req/s on the new build against
+131.3 and 130.6 on the old, with a median of 372 to 377 ms on both. `R-mix`
+was within noise.
+
+### Delta
+
+| Config | Workload | Old, operations per `getTransaction` | New, operations per `getTransaction` |
+| --- | --- | ---: | ---: |
+| A | `R-cold` | 2.186, 2.232 | 1.000, 1.000 |
+| A | `R-mix` | 2.193, 2.178 | 1.006, 1.000 |
+
+Under config B the old build did 131.3 and 130.6 req/s and the new build 130.8
+and 129.7, so there is no regression.
+
+| Config | Build | Run | Operations calls in 30 s | 200 responses | req/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| A `R-cold` | `e9708ee` | 1 | 365 | 164 | — |
+| A `R-cold` | `e9708ee` | 2 | 366 | 160 | — |
+| A `R-cold` | `cdb471f` | 1 | 169 | 168 | — |
+| A `R-cold` | `cdb471f` | 2 | 162 | 159 | — |
+| B `R-cold` | `e9708ee` | 1 | — | — | 131.3 |
+| B `R-cold` | `e9708ee` | 2 | — | — | 130.6 |
+| B `R-cold` | `cdb471f` | 1 | — | — | 130.8 |
+| B `R-cold` | `cdb471f` | 2 | — | — | 129.7 |
+
+Under config A the number of 200 responses did not change: the run is
+limiter-bound by design, so no throughput change was expected. Under config B
+there is no regression.
+
+### Limited by
+
+Config A is bound by the Helius limiter, not by the server or the upstream
+latency. Config B is not limiter-bound.
+
+### Caveats
+
+Two runs per build per config. The database was not reset between the old and
+new sub-runs inside a series. The benchmark ran with `FAKE_429_RATE=0`;
+retry-through-the-limiter is covered by a unit test rather than by these runs.
+`R-mix` numbers use `--disable-keepalive` and are not comparable with the
+keep-alive `R-hit` numbers.
+
+### Next
+
+Findings, not commitments:
+
+- `getAsset` (token metadata) hits the Helius URL, is called twice per detected
+  token, and is outside both the limiter and the permit pool.
+- In config A `R-mix` the 503 count (about 300) is roughly double the
+  cold-request count (about 150), so hot-set requests are probably also
+  returning 503; the cause is not yet established.
