@@ -9,7 +9,8 @@
 //!
 //! Served routes:
 //!   POST /                                  Helius JSON-RPC (getTransaction,
-//!                                           getMultipleAccounts, getSignaturesForAddress)
+//!                                           getMultipleAccounts, getSignaturesForAddress,
+//!                                           getAsset)
 //!   GET  /api/v1/operations?txHash=...      WormholeScan operations
 //!   GET  /api/v1/global-tx/:chain/:emitter/:sequence
 //!   GET  /stats                             per-method calls, injected 429s, in-flight high-water
@@ -308,6 +309,22 @@ async fn json_rpc(State(state): State<Arc<FakeState>>, Json(body): Json<Value>) 
             )
         }
         "getSignaturesForAddress" => rpc_result(id, json!([])),
+        // Token metadata. The values are derived from the mint so every run answers
+        // the same way, and the shape matches `token_info` in Helius's response.
+        "getAsset" => {
+            let mint = body
+                .get("params")
+                .and_then(|p| p.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let hash = fnv1a(mint.as_bytes());
+            let decimals = if hash.is_multiple_of(2) { 6u64 } else { 9u64 };
+            let symbol = format!("T{:04X}", (hash >> 16) as u16);
+            rpc_result(
+                id,
+                json!({"token_info": {"decimals": decimals, "symbol": symbol}}),
+            )
+        }
         other => rpc_error(id, -32601, &format!("Method not found: {other}")),
     }
 }

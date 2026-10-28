@@ -64,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
 
-    let registry = build_registry(&config, &http_client);
+    let registry = build_registry(&config, &http_client, config.helius_api_rps);
     let chains = ChainRegistry::load(&db).await?;
     let state = AppState::new(
         db.clone(),
@@ -78,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
     // and rate limiter, so it can't use up the GET API's quota.
     let live_config = config.clone();
 
-    let live_registry = build_registry(&live_config, &http_client);
+    let live_registry = build_registry(&live_config, &http_client, live_config.helius_live_rps);
     let live_state = state.for_live(live_config, live_registry);
 
     let redis = RedisProducer::new(&config.redis_url).await?;

@@ -51,6 +51,30 @@ impl SolanaAdapter {
     }
 }
 
+fn decimals_from(asset: &Value) -> Option<u8> {
+    asset
+        .get("token_info")
+        .and_then(|t| t.get("decimals"))
+        .and_then(Value::as_u64)
+        .map(|d| d as u8)
+}
+
+fn symbol_from(asset: &Value) -> Option<String> {
+    asset
+        .get("token_info")
+        .and_then(|t| t.get("symbol"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            asset
+                .get("content")
+                .and_then(|c| c.get("metadata"))
+                .and_then(|m| m.get("symbol"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+}
+
 #[async_trait]
 impl ChainAdapter for SolanaAdapter {
     fn name(&self) -> &'static str {
@@ -59,30 +83,21 @@ impl ChainAdapter for SolanaAdapter {
 
     async fn token_decimals(&self, token_address: &str) -> Result<Option<u8>, AppError> {
         let asset = self.get_asset(token_address).await?;
-        Ok(asset
-            .get("token_info")
-            .and_then(|t| t.get("decimals"))
-            .and_then(Value::as_u64)
-            .map(|d| d as u8))
+        Ok(decimals_from(&asset))
     }
 
     async fn token_symbol(&self, token_address: &str) -> Result<Option<String>, AppError> {
         let asset = self.get_asset(token_address).await?;
+        Ok(symbol_from(&asset))
+    }
 
-        let symbol = asset
-            .get("token_info")
-            .and_then(|t| t.get("symbol"))
-            .and_then(Value::as_str)
-            .or_else(|| {
-                asset
-                    .get("content")
-                    .and_then(|c| c.get("metadata"))
-                    .and_then(|m| m.get("symbol"))
-                    .and_then(Value::as_str)
-            })
-            .map(str::to_string)
-            .filter(|s| !s.is_empty());
-
-        Ok(symbol)
+    /// One `getAsset` answers both fields, halving the calls `token_decimals` and
+    /// `token_symbol` would make separately.
+    async fn token_metadata(
+        &self,
+        token_address: &str,
+    ) -> Result<(Option<u8>, Option<String>), AppError> {
+        let asset = self.get_asset(token_address).await?;
+        Ok((decimals_from(&asset), symbol_from(&asset)))
     }
 }

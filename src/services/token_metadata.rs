@@ -14,21 +14,27 @@ pub async fn resolve_token_metadata(
 ) -> Result<TokenMetadata, AppError> {
     let (symbol, decimals) = match registry.get_token_metadata(token_chain) {
         Some(adapter) => {
-            let decimals = match adapter.token_decimals(token_address).await {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!(token = %token_address, token_chain, error = %e, "token_decimals failed");
-                    None
+            // The lookup is shared per registry: it caches per mint and only spends
+            // a Helius token a getTransaction does not need right now. Without one
+            // (bare registries in tests), ask the adapter directly.
+            let resolved = match registry.token_metadata_lookup() {
+                Some(lookup) => {
+                    lookup
+                        .resolve(token_chain, token_address, adapter.as_ref())
+                        .await
                 }
+                None => adapter.token_metadata(token_address).await.map(Some),
             };
-            let symbol = match adapter.token_symbol(token_address).await {
-                Ok(s) => s,
+            match resolved {
+                Ok(Some((decimals, symbol))) => (symbol, decimals),
+                // No token was free: best effort, so skip metadata instead of
+                // delaying the transfer and do not log a failure.
+                Ok(None) => (None, None),
                 Err(e) => {
-                    tracing::warn!(token = %token_address, token_chain, error = %e, "token_symbol failed");
-                    None
+                    tracing::warn!(token = %token_address, token_chain, error = %e, "token metadata failed");
+                    (None, None)
                 }
-            };
-            (symbol, decimals)
+            }
         }
         None => (None, None),
     };
