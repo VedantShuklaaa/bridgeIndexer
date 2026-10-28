@@ -369,10 +369,17 @@ fi
 
 # Deterministic fixed hot set: SHA-512 of a label, base58-encoded, so every run
 # and both configs warm exactly the same keys. The set is not secret material.
+# Only signatures whose fixture resolves to Completed are kept: those live in the
+# 600 s completed cache, while Detected/Pending results would expire from the 15 s
+# open cache and turn part of R-mix into extra cold fetches. The fake's
+# /debug/fixture endpoint maps a signature with the same FNV-1a hash it uses for
+# replay, so this selection matches what a request will actually hit.
 hot_file="$run_dir/hot-signatures.txt"
-python3 - "$hot_file" "$HOT_COUNT" <<'PY'
+python3 - "$hot_file" "$FAKE_URL" "$HOT_COUNT" <<'PY'
 import hashlib
+import json
 import sys
+import urllib.request
 
 ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
@@ -387,15 +394,42 @@ def base58(raw: bytes) -> str:
     return "1" * zeros + ("".join(reversed(digits)) if digits else "")
 
 
-path, count = sys.argv[1], int(sys.argv[2])
-signatures = []
-for i in range(count):
-    digest = hashlib.sha512(f"bridgeIndexer/3e/hot/{i}".encode()).digest()
-    signatures.append(base58(digest))
-assert len(set(signatures)) == count, "hot signature collision"
+def candidate(index: int) -> str:
+    digest = hashlib.sha512(f"bridgeIndexer/3e/hot/{index}".encode()).digest()
+    return base58(digest)
+
+
+path, fake_url, count = sys.argv[1], sys.argv[2].rstrip("/"), int(sys.argv[3])
+selected = []
+fixtures = {}
+index = 0
+while len(selected) < count:
+    signature = candidate(index)
+    index += 1
+    try:
+        with urllib.request.urlopen(
+            f"{fake_url}/debug/fixture/{signature}", timeout=5
+        ) as response:
+            info = json.load(response)
+    except OSError as error:
+        raise SystemExit(f"cannot reach {fake_url}/debug/fixture: {error}") from error
+    fixture = info.get("fixture", "unknown")
+    fixtures[fixture] = fixtures.get(fixture, 0) + 1
+    if info.get("completed") is True:
+        selected.append(signature)
+    if index > count * 100:
+        raise SystemExit(
+            f"only {len(selected)} of {count} hot candidates map to Completed fixtures"
+        )
+assert len(set(selected)) == count, "hot signature collision"
 with open(path, "w", encoding="utf-8") as handle:
-    for signature in signatures:
+    for signature in selected:
         handle.write(signature + "\n")
+breakdown = ", ".join(f"{name}={n}" for name, n in sorted(fixtures.items()))
+print(
+    f"bench_cold.sh: hot set {count} Completed keys from {index} candidates ({breakdown})",
+    file=sys.stderr,
+)
 PY
 
 hot_urls_file="$run_dir/hot-urls.txt"

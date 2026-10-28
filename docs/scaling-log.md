@@ -567,3 +567,56 @@ Findings, not commitments:
 - In config A `R-mix` the 503 count (about 300) is roughly double the
   cold-request count (about 150), so hot-set requests are probably also
   returning 503; the cause is not yet established.
+
+## 3e R-mix hot-set correction and re-baseline (2026-10-29)
+
+### Correction
+
+The earlier `R-mix` runs used a fixed hot set chosen without regard to the
+fixture a signature maps to. 264 of the 769 hot keys mapped to fixtures whose
+analysis is `Detected` or `Pending`; those keys expired from the 15 s open cache
+during a run and were fetched cold again. `R-mix` absolute req/s and 503 counts
+from before this change are therefore not comparable with later runs. The
+experiment 1 and 2 ratios are unaffected: they compare upstream calls per cold
+request, and the old hot-set leak added cold requests to both sides of those
+comparisons.
+
+The hot set now contains only signatures whose fixture resolves to `Completed`,
+so all 769 keys stay in the 600 s completed cache. After warm-up, a sequential
+pass over the new set returned 769/769 `200`, p50 0.29 ms, p99 0.78 ms, no
+request above 10 ms, and the fake upstream saw no `getTransaction` calls. A
+per-kind labelled R-mix probe on config A recorded 0 503s for hot requests
+(4,718 hot requests, every one `200`) against 370 503s for cold requests.
+
+### Workload and setup
+
+`R-mix` (90% hot / 10% cold), fake upstream with `FAKE_LATENCY_MS=50` and
+`FAKE_429_RATE=0`, `/api/v2`, 50 connections, 30 s per run, two runs per config.
+Local bench Postgres and Redis; the database was reset and the app restarted
+before each run. Config A: `HELIUS_API_RPS=6 HELIUS_LIVE_RPS=4 WORMHOLE_RPS=20
+UPSTREAM_PERMITS=16`. Config B: all limiters `100000`, `UPSTREAM_PERMITS=16`.
+
+### Results
+
+| Config | Run | req/s | median (ms) | p99 (ms) | requests | 200 | 503 | cold requests | getTransaction |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| A | 1 | 189.6 | 0.30 | 3997.78 | 5689 | 5294 | 345 | 557 | 166 |
+| A | 2 | 182.5 | 0.31 | 3995.89 | 5475 | 5071 | 354 | 560 | 157 |
+| B | 1 | 1816.8 | 0.30 | 312.82 | 54513 | 54463 | 0 | 5508 | 5490 |
+| B | 2 | 1862.5 | 0.29 | 313.70 | 55879 | 55829 | 0 | 5507 | 5477 |
+
+Every run also had 50 transport errors from oha's per-connection deadline
+abort. There were no 429s.
+
+### Limited by
+
+Config A is bound by the Helius limiter: 557 to 560 cold requests produced 157
+to 166 `getTransaction` calls, and the rest were shed before reaching the fake.
+Config B is not limiter-bound; `getTransaction` tracks cold requests one-for-one.
+
+### Caveats
+
+Two runs per config. Fixtures are synthetic, so absolute numbers describe the
+fake upstream, not Helius. `R-mix` uses `--disable-keepalive` and is not
+comparable with `R-hit`. Earlier `R-mix` numbers are not comparable with these.
+

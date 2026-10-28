@@ -694,7 +694,8 @@ Measure before changing anything. Each item is one tagged experiment with the sa
 * \[x] perf-2. `AppState` behind one `Arc<Inner>`, so clone is one refcount operation
 * \[x] 3c. `v2` pre-serialized response body, as 3b did for `v1`. A warm `v2` hit is already a single cache lookup; the per-hit cost was the response clone and JSON serialization
 * \[ ] 3d. `v3` two API instances behind a proxy: per-process caches duplicate refreshes; compare a Redis-shared cache against sticky routing
-* \[ ] 3e. Cold path: fake upstream server replaying fixtures with injected latency and 429s so quota isn't burned; try JSON-RPC batching for Helius, priority for user requests over background refresh, limiters set to the real plan limits
+* \[x] 3e. Cold path: fake upstream server replaying fixtures with injected latency and 429s so quota isn't burned; try JSON-RPC batching for Helius, priority for user requests over background refresh, limiters set to the real plan limits
+  Helius batching not pursued (free plan, unverified credit accounting, cold path already limiter-bound).
 * \[ ] 3f. Write path: consumer throughput against the fake upstream. Try larger `XREADGROUP COUNT`, concurrent processing inside a worker, batched upserts per Postgres transaction, pool sizing against RDS limits
 * \[ ] 3g. List endpoint using the `idx_bt_*` indexes with keyset pagination, benchmarked on ~1M seeded rows with `EXPLAIN ANALYZE`
 

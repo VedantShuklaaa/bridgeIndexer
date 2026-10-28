@@ -15,6 +15,7 @@
 //!   GET  /api/v1/global-tx/:chain/:emitter/:sequence
 //!   GET  /stats                             per-method calls, injected 429s, in-flight high-water
 //!   POST /stats/reset                       zero the counters
+//!   GET  /debug/fixture/:signature          which fixture a signature maps to and its status
 //!
 //! Env: FAKE_PORT (9090), FAKE_LATENCY_MS (50), FAKE_JITTER_MS (0), FAKE_429_RATE (0.0,
 //! clamped to 0..=1). No API key and no network access are needed.
@@ -24,8 +25,12 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use bridge::protocols::SolanaTx;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use bridge::chains::Snapshot;
+use bridge::domain::bridge_transfer::{BridgeMessageId, BridgeStatus};
 use bridge::protocols::registry::default_registry;
+use bridge::protocols::{AccountData, SolanaTx};
+use bridge::services::detect;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -81,6 +86,35 @@ impl Config {
     }
 }
 
+/// The status the app's pipeline resolves a replayed fixture to. The chain-first
+/// detection and the fixture's own WormholeScan operation are the same inputs the app
+/// uses, so this answers the cache question directly: only `Completed` results live in
+/// the 600 s completed cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixtureStatus {
+    Completed,
+    Pending,
+    Detected,
+    NoTransfer,
+    Malformed,
+}
+
+impl FixtureStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "Completed",
+            Self::Pending => "Pending",
+            Self::Detected => "Detected",
+            Self::NoTransfer => "NoTransfer",
+            Self::Malformed => "Malformed",
+        }
+    }
+
+    fn completed(self) -> bool {
+        self == Self::Completed
+    }
+}
+
 /// One captured pair (`helius_<name>.json` + `wormhole_<name>.json`), plus the posted
 /// VAA account when the fixture is an inbound redeem.
 struct Fixture {
@@ -88,6 +122,7 @@ struct Fixture {
     helius: Value,
     wormhole: Option<Value>,
     account: Option<Value>,
+    status: FixtureStatus,
 }
 
 fn read_json(path: &FsPath) -> anyhow::Result<Value> {
@@ -121,6 +156,7 @@ fn load_fixtures(dir: &FsPath) -> anyhow::Result<Vec<Fixture>> {
                 .then(|| read_json(&wormhole))
                 .transpose()?,
             account: account.exists().then(|| read_json(&account)).transpose()?,
+            status: FixtureStatus::Malformed,
         });
     }
     fixtures.sort_by(|a, b| a.name.cmp(&b.name));
@@ -129,7 +165,86 @@ fn load_fixtures(dir: &FsPath) -> anyhow::Result<Vec<Fixture>> {
         "no helius_*.json fixtures in {}",
         dir.display()
     );
+
+    let statuses: Vec<FixtureStatus> = fixtures
+        .iter()
+        .map(|fixture| fixture_status(fixture, &fixtures))
+        .collect();
+    for (fixture, status) in fixtures.iter_mut().zip(statuses) {
+        fixture.status = status;
+    }
     Ok(fixtures)
+}
+
+/// Rebuilds the tx the app analyses: the captured transaction plus the posted VAA
+/// account that `getMultipleAccounts` supplies for inbound redeems.
+fn fixture_tx(fixture: &Fixture) -> Option<SolanaTx> {
+    let mut tx = SolanaTx::from_helius(&fixture.helius, &fixture.name).ok()?;
+    let Some(account) = fixture.account.as_ref() else {
+        return Some(tx);
+    };
+    let value = account.get("value")?;
+    let owner = value.get("owner")?.as_str()?;
+    let data = value.get("data")?.get(0)?.as_str()?;
+    let data = STANDARD.decode(data).ok()?;
+    if let [key] = default_registry().required_accounts(&tx).as_slice() {
+        tx.accounts.insert(
+            key.clone(),
+            AccountData {
+                owner: owner.to_string(),
+                data,
+            },
+        );
+    }
+    Some(tx)
+}
+
+/// The destination tx the fake's `/global-tx` route would return for this message.
+fn global_destination_tx(fixtures: &[Fixture], id: &BridgeMessageId) -> Option<String> {
+    fixtures
+        .iter()
+        .filter_map(|fixture| fixture.wormhole.as_ref())
+        .find(|operation| {
+            operation.get("emitterChain").and_then(Value::as_u64)
+                == Some(u64::from(id.emitter_chain))
+                && operation
+                    .get("emitterAddress")
+                    .and_then(Value::as_str)
+                    .is_some_and(|address| address.eq_ignore_ascii_case(&id.emitter_address))
+                && operation.get("sequence").and_then(Value::as_u64) == Some(id.sequence)
+        })
+        .and_then(|operation| operation.pointer("/targetChain/transaction/txHash"))
+        .and_then(Value::as_str)
+        .map(String::from)
+}
+
+/// Mirrors the app's status resolution: detection, then the captured WormholeScan
+/// operation, then the `/global-tx` fallback the enrichment provider would make.
+fn fixture_status(fixture: &Fixture, fixtures: &[Fixture]) -> FixtureStatus {
+    let Some(tx) = fixture_tx(fixture) else {
+        return FixtureStatus::Malformed;
+    };
+    let detected = detect::detect(&default_registry(), &tx);
+    let Some(first) = detected.first() else {
+        return FixtureStatus::NoTransfer;
+    };
+    let chains = Snapshot::default();
+    let Ok(mut bridge) = detect::to_bridge_transfer(first, None, &chains) else {
+        return FixtureStatus::Malformed;
+    };
+    if let Some(operation) = &fixture.wormhole {
+        detect::apply_wormholescan(&mut bridge, operation, &chains);
+        if matches!(bridge.status, BridgeStatus::Pending)
+            && let Some(hash) = global_destination_tx(fixtures, &bridge.message_id)
+        {
+            detect::apply_destination_tx(&mut bridge, &hash, &chains);
+        }
+    }
+    match bridge.status {
+        BridgeStatus::Completed => FixtureStatus::Completed,
+        BridgeStatus::Pending => FixtureStatus::Pending,
+        BridgeStatus::Detected => FixtureStatus::Detected,
+    }
 }
 
 /// Stable 64-bit FNV-1a: a signature always maps to the same fixture, across runs.
@@ -408,6 +523,29 @@ async fn reset_stats(State(state): State<Arc<FakeState>>) -> Response {
     Json(json!({"reset": true})).into_response()
 }
 
+/// Benchmark helper: which fixture the fake will replay for this signature, and the
+/// status the app resolves it to. The hot set uses only Completed fixtures so its keys
+/// stay in the 600 s completed cache instead of expiring from the 15 s open cache.
+async fn debug_fixture(
+    State(state): State<Arc<FakeState>>,
+    Path(signature): Path<String>,
+) -> Response {
+    match state.fixture_for(&signature) {
+        Some(fixture) => Json(json!({
+            "signature": signature,
+            "fixture": fixture.name,
+            "status": fixture.status.as_str(),
+            "completed": fixture.status.completed(),
+        }))
+        .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no fixtures loaded"})),
+        )
+            .into_response(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let config = Config::from_env()?;
@@ -432,6 +570,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/stats", get(stats))
         .route("/stats/reset", post(reset_stats))
+        .route("/debug/fixture/:signature", get(debug_fixture))
         .with_state(state.clone());
 
     let address = format!("127.0.0.1:{port}");
