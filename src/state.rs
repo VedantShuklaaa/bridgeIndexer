@@ -61,8 +61,14 @@ impl AppState {
     ) -> anyhow::Result<Self> {
         let (tx_broadcast, _) = broadcast::channel(BROADCAST_CAPACITY);
         let read_through = Arc::new(ReadThrough::new(config.upstream_permits));
-        let api_rps = config.helius_api_rps;
         let wormhole_rps = config.wormhole_rps;
+        // The registry built the Helius adapter and its token metadata lookup around
+        // one limiter; reuse it so metadata and getTransaction share the same quota.
+        let helius_limiter = registry.helius_limiter().unwrap_or_else(|| {
+            Arc::new(RateLimiter::direct(Quota::per_second(
+                NonZeroU32::new(config.helius_api_rps).unwrap(),
+            )))
+        });
         let wormhole_limiter: Arc<Limiter> = Arc::new(RateLimiter::direct(Quota::per_second(
             NonZeroU32::new(wormhole_rps).unwrap(),
         )));
@@ -83,9 +89,7 @@ impl AppState {
                 protocols: Arc::new(default_registry()),
                 tx_broadcast,
                 read_through,
-                helius_limiter: Arc::new(RateLimiter::direct(Quota::per_second(
-                    NonZeroU32::new(api_rps).unwrap(),
-                ))),
+                helius_limiter,
                 wormhole_limiter,
                 enrichment,
             }),
@@ -97,14 +101,18 @@ impl AppState {
     /// live traffic can never eat into the GET API's quota. Everything else
     /// (database, broadcast channel, Wormholescan limiter) stays shared.
     pub fn for_live(&self, config: AppConfig, registry: AdapterRegistry) -> Self {
-        let live_rps = config.helius_live_rps;
+        // Same wiring as `new`: the live registry's metadata lookup and the live
+        // pipeline share one limiter, separate from the GET API's.
+        let helius_limiter = registry.helius_limiter().unwrap_or_else(|| {
+            Arc::new(RateLimiter::direct(Quota::per_second(
+                NonZeroU32::new(config.helius_live_rps).unwrap(),
+            )))
+        });
         Self {
             inner: Arc::new(Inner {
                 config: Arc::new(config),
                 registry: Arc::new(registry),
-                helius_limiter: Arc::new(RateLimiter::direct(Quota::per_second(
-                    NonZeroU32::new(live_rps).unwrap(),
-                ))),
+                helius_limiter,
                 ..(*self.inner).clone()
             }),
         }

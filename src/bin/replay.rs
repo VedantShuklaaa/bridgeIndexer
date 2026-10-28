@@ -235,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
 
     let db = db::connection::connect(&config.database_url).await?;
     let http_client = Client::builder().timeout(Duration::from_secs(15)).build()?;
-    let registry = build_registry(&config, &http_client);
+    let registry = build_registry(&config, &http_client, config.helius_api_rps);
     let chains = ChainRegistry::load(&db).await?;
     let state = AppState::new(db, config, http_client, registry, chains)?;
 
