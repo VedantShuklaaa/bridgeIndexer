@@ -1,4 +1,4 @@
-use crate::clients::limiter::call_upstream;
+use crate::clients::limiter::{acquire_token, call_upstream, call_upstream_after_token};
 use crate::clients::{helius, wormhole};
 use crate::domain::analysis::{Analysis, DecodedTransfer};
 use crate::domain::bridge_transfer::BridgeMessageId;
@@ -20,10 +20,21 @@ pub async fn analyse_tx(state: &AppState, chain: &str, hash: &str) -> Result<Ana
     }
 
     let t_total = std::time::Instant::now();
+
+    // Take the Helius token before either upstream call starts: a request that
+    // times out here must not spend a WormholeScan call whose result is then
+    // discarded. The token pays for the first getTransaction attempt below.
+    let first_attempt_paid = if chain == "solana" {
+        acquire_token(&state.helius_limiter).await?;
+        true
+    } else {
+        false
+    };
+
     let (source_result, wormhole_result) = tokio::join!(
         async {
             let t = std::time::Instant::now();
-            let r = fetch_source_transaction(state, chain, hash).await;
+            let r = fetch_source_transaction(state, chain, hash, first_attempt_paid).await;
             tracing::info!(helius_ms = t.elapsed().as_millis() as u64, "source fetch");
             r
         },
@@ -275,13 +286,18 @@ async fn fetch_source_transaction(
     state: &AppState,
     chain: &str,
     hash: &str,
+    first_attempt_paid: bool,
 ) -> Result<(NormalisedTransaction, Option<SolanaTx>), AppError> {
     match chain {
         "solana" => {
-            let raw = call_upstream(&state.helius_limiter, || {
-                helius::get_transaction(&state.http_client, &state.config.helius_url, hash)
-            })
-            .await?;
+            let get_transaction =
+                || helius::get_transaction(&state.http_client, &state.config.helius_url, hash);
+            // Retries still wait on the limiter in both branches.
+            let raw = if first_attempt_paid {
+                call_upstream_after_token(&state.helius_limiter, get_transaction).await?
+            } else {
+                call_upstream(&state.helius_limiter, get_transaction).await?
+            };
 
             let mut solana_tx = SolanaTx::from_helius(&raw, hash)
                 .inspect_err(|error| tracing::warn!(signature = %hash, %error, "unreadable tx"))
