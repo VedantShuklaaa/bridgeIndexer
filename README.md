@@ -409,6 +409,10 @@ which has to stay under the configured provider quotas.
 | Cache TTLs and capacities | `ReadThrough::new` | see table above |
 | Provider quotas | `HELIUS_API_RPS`, `HELIUS_LIVE_RPS` in `state.rs`, `wormhole_limiter` in `AppState::new` | Helius 6/s (API) + 4/s (live) to fit the free plan's 10/s on one shared key, WormholeScan 20/s. Raise them when you upgrade or split keys (Phase 2) |
 
+### Token metadata
+
+Symbol and decimals come from one Helius `getAsset` per mint, cached per mint (24h resolved, 60s failed or empty). A cache miss uses the shared Helius limiter only if a token is free; otherwise the transfer is processed without metadata and the miss is not cached, so a later request retries. `HELIUS_API_RPS` and `HELIUS_LIVE_RPS` set the quota for the API and live pipeline respectively.
+
 ## Reliability properties
 
 * **At-least-once processing, exactly-once persistence.** Redis Streams
