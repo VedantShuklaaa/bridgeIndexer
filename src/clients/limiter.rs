@@ -117,6 +117,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_after_paid_first_attempt_still_waits_on_the_limiter() {
+        let limiter = slow_limiter();
+        acquire_token(&limiter).await.expect("token is available");
+
+        let calls = AtomicUsize::new(0);
+        let started = Instant::now();
+        let result = call_upstream_after_token(&limiter, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err::<(), _>(AppError::UpstreamTimeout("test")) }
+        })
+        .await;
+
+        // The paid first attempt runs; the retry must take a token, none arrives
+        // within 2 s, so it sheds. The elapsed time includes the backoff first.
+        assert!(matches!(result, Err(AppError::Overloaded)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_secs(2),
+            "shed after only {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "shed after {waited:?}, much later than the 2 s timeout"
+        );
+    }
+
+    #[tokio::test]
     async fn paid_first_attempt_does_not_wait_on_the_limiter() {
         let limiter = slow_limiter();
         acquire_token(&limiter).await.expect("token is available");
