@@ -252,39 +252,34 @@ fn extract_wormholescan_field(raw: &Value, field: &str) -> Option<String> {
         .map(String::from)
 }
 
-/// Reads the accounts the adapters asked for into the tx view. Best effort: when the
-/// read fails the adapters see the accounts as missing and reject what needs them
-/// (`Unsupported`), and the WormholeScan path still runs.
-async fn preload_accounts(state: &AppState, tx: &mut SolanaTx) {
+/// Reads the accounts the adapters asked for into the tx view, and reports why when
+/// the read failed. The caller decides whether that is fatal: a live redeem is worth
+/// retrying, while the reconcile tool keeps the best-effort behaviour.
+async fn preload_accounts(state: &AppState, tx: &mut SolanaTx) -> Result<(), AppError> {
     let keys = state.protocols.required_accounts(tx);
     if keys.is_empty() {
-        return;
+        return Ok(());
     }
-    let fetched = call_upstream(&state.helius_limiter, || {
+    let accounts = call_upstream(&state.helius_limiter, || {
         helius::get_multiple_accounts(&state.http_client, &state.config.helius_url, &keys)
     })
-    .await;
-    match fetched {
-        Ok(accounts) => {
-            for (key, account) in keys.into_iter().zip(accounts) {
-                if let Some(account) = account {
-                    tx.accounts.insert(key, account);
-                }
-            }
+    .await?;
+
+    for (key, account) in keys.into_iter().zip(accounts) {
+        if let Some(account) = account {
+            tx.accounts.insert(key, account);
         }
-        Err(error) => tracing::warn!(
-            signature = %tx.signature,
-            %error,
-            "could not preload accounts"
-        ),
     }
+    Ok(())
 }
 
 /// Fetches one Solana transaction and preloads the accounts the adapters ask for,
 /// without running any classifier. The reconcile tool reuses this so it classifies
 /// exactly the view `analyse_tx` would.
 pub async fn load_solana_tx(state: &AppState, hash: &str) -> Result<Option<SolanaTx>, AppError> {
-    let (_, view) = fetch_solana_source(state, "solana", hash, false).await?;
+    // Reconcile is read-only and runs behind its own limiter: a failed preload must
+    // not turn into a retry loop there, so it stays best effort.
+    let (_, view) = fetch_solana_source(state, "solana", hash, false, false).await?;
     Ok(view)
 }
 
@@ -296,7 +291,10 @@ async fn fetch_source_transaction(
     hash: &str,
     first_attempt_paid: bool,
 ) -> Result<(NormalisedTransaction, Option<SolanaTx>), AppError> {
-    let (raw, solana_tx) = fetch_solana_source(state, chain, hash, first_attempt_paid).await?;
+    // A live message is retried by the consumer, so a transient preload failure must
+    // surface instead of silently degrading the row.
+    let (raw, solana_tx) =
+        fetch_solana_source(state, chain, hash, first_attempt_paid, true).await?;
     Ok((normaliser::solana::normalise(raw, hash)?, solana_tx))
 }
 
@@ -307,6 +305,7 @@ async fn fetch_solana_source(
     chain: &str,
     hash: &str,
     first_attempt_paid: bool,
+    preload_errors_are_fatal: bool,
 ) -> Result<(Value, Option<SolanaTx>), AppError> {
     match chain {
         "solana" => {
@@ -323,8 +322,21 @@ async fn fetch_solana_source(
                 .inspect_err(|error| tracing::warn!(signature = %hash, %error, "unreadable tx"))
                 .ok();
 
-            if let Some(view) = solana_tx.as_mut() {
-                preload_accounts(state, view).await;
+            if let Some(view) = solana_tx.as_mut()
+                && let Err(error) = preload_accounts(state, view).await
+            {
+                // Without the posted VAA account a redeem is reported Unsupported and
+                // falls back to the WormholeScan-driven path, which can store a row with
+                // the wrong source wallet (or dead-letter when WormholeScan is down).
+                // A transient failure is worth another delivery instead.
+                if preload_errors_are_fatal && error.is_transient() {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    signature = %hash,
+                    %error,
+                    "could not preload accounts"
+                );
             }
 
             Ok((raw, solana_tx))

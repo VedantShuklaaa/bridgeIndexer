@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 /// Background re-enrichment of `Detected` and `Pending` transfers.
 #[derive(Clone, Debug)]
 pub struct ReenrichConfig {
@@ -14,6 +16,19 @@ pub struct ReenrichConfig {
     pub max_age_secs: i64,
 }
 
+/// Stream consumer and recovery worker.
+#[derive(Clone, Debug)]
+pub struct WorkerConfig {
+    /// Deliveries of one message before it is dead-lettered. A transient failure
+    /// leaves the message pending, so this bounds how many times it can come back.
+    pub max_deliveries: u32,
+    /// How long a message must sit unacknowledged before recovery reclaims it.
+    /// Must stay well below any outage that would justify a dead letter.
+    pub reclaim_idle_ms: u64,
+    /// Seconds between recovery sweeps.
+    pub reclaim_interval_secs: u64,
+}
+
 /// Always-on Solana ingestion (A8).
 #[derive(Clone, Debug)]
 pub struct IngestConfig {
@@ -25,6 +40,8 @@ pub struct IngestConfig {
     /// outage; the checkpoint still moves forward, so the next restart does not repeat it.
     pub backfill_max: usize,
     /// Pause between backfilled signatures, to stay under the Helius plan's rate cap.
+    /// A backfilled message costs up to three live Helius calls, so the pause has to
+    /// be long enough that publishing cannot outrun the live limiter.
     pub backfill_pace_ms: u64,
     /// How long a published signature is remembered so a repeat (backfill overlapping the
     /// live feed, a reconnect) is not published twice. `0` disables the check.
@@ -50,6 +67,10 @@ pub struct AppConfig {
     pub helius_api_rps: u32,
     /// Helius requests/sec for the live pipeline (backfill + consumer workers).
     pub helius_live_rps: u32,
+    /// How long a live worker waits for its first Helius token of a message. The
+    /// message stays in the stream meanwhile; it must stay well below the reclaim
+    /// idle time, or a message would be reclaimed before it finishes waiting.
+    pub helius_live_token_wait: Duration,
     /// Helius requests/sec for the `reconcile` tool, on its own lane so a
     /// reconciliation run cannot starve the running pipeline.
     pub reconcile_rps: u32,
@@ -63,6 +84,7 @@ pub struct AppConfig {
     pub allowed_origins: Vec<String>,
     pub ingest: IngestConfig,
     pub reenrich: ReenrichConfig,
+    pub worker: WorkerConfig,
     /// How often the in-memory chain registry reloads from Postgres.
     pub chain_registry_refresh_secs: u64,
 }
@@ -104,6 +126,10 @@ impl AppConfig {
             wormhole_url: optional("WORMHOLE_URL", "https://api.wormholescan.io"),
             helius_api_rps: number("HELIUS_API_RPS", 6u32).max(1),
             helius_live_rps: number("HELIUS_LIVE_RPS", 4u32).max(1),
+            helius_live_token_wait: Duration::from_millis(number(
+                "HELIUS_LIVE_TOKEN_WAIT_MS",
+                20_000u64,
+            )),
             reconcile_rps: number("RECONCILE_RPS", 3u32).max(1),
             wormhole_rps: number("WORMHOLE_RPS", 20u32).max(1),
             upstream_permits: number("UPSTREAM_PERMITS", 16usize).max(1),
@@ -122,8 +148,13 @@ impl AppConfig {
                     .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     .unwrap_or(true),
                 backfill_max: number("INGEST_BACKFILL_MAX", 5000usize),
-                backfill_pace_ms: number("INGEST_BACKFILL_PACE_MS", 150u64),
-                dedupe_ttl_secs: number("INGEST_DEDUPE_TTL_SECS", 3600u64),
+                backfill_pace_ms: number("INGEST_BACKFILL_PACE_MS", 750u64),
+                dedupe_ttl_secs: number("INGEST_DEDUPE_TTL_SECS", 7200u64),
+            },
+            worker: WorkerConfig {
+                max_deliveries: number("WORKER_MAX_DELIVERIES", 10u32).max(1),
+                reclaim_idle_ms: number("WORKER_RECLAIM_IDLE_MS", 300_000u64),
+                reclaim_interval_secs: number("WORKER_RECLAIM_INTERVAL_SECS", 30u64).max(1),
             },
             chain_registry_refresh_secs: number("CHAIN_REGISTRY_REFRESH_SECS", 60u64).max(5),
             reenrich: ReenrichConfig {

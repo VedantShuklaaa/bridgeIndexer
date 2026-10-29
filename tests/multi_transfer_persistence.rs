@@ -2,7 +2,6 @@
 //! is stored as its own `bridge_transfers` row, told apart by `event_index`, with its own
 //! message identity, raw chain references, router and token.
 
-#[allow(dead_code)]
 mod common;
 
 use bridge::chains::RawChainRef;

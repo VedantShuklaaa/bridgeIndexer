@@ -1,10 +1,11 @@
 use crate::db::repository::persist_analysis;
 use crate::domain::analysis::Analysis;
-use crate::error::AppError;
+use crate::error::{AppError, persistence_error_is_transient};
 use crate::services::analyzer::analyse_tx;
 use crate::state::AppState;
 use anyhow::{Context, Result};
 use redis::Value;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -77,7 +78,9 @@ impl RedisConsumer {
                 result = read_fut => result?,
             };
 
-            self.process_messages(&mut connection, response).await?;
+            // A new message has been delivered once.
+            self.process_messages(&mut connection, response, &HashMap::new())
+                .await?;
         }
     }
 
@@ -95,6 +98,8 @@ impl RedisConsumer {
             "Redis recovery worker started"
         );
 
+        let interval = Duration::from_secs(self.state.config.worker.reclaim_interval_secs);
+
         loop {
             self.reclaim_pending_messages(&mut connection).await?;
 
@@ -103,7 +108,7 @@ impl RedisConsumer {
                     info!("shutdown requested, stopping recovery worker");
                     return Ok(());
                 }
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                _ = tokio::time::sleep(interval) => {}
             }
         }
     }
@@ -167,12 +172,11 @@ impl RedisConsumer {
                     tokio::time::sleep(VAA_RETRY_INTERVAL).await;
                 }
 
-                Err(
-                    AppError::TransactionNotFound(_)
-                    | AppError::UpstreamRateLimited(_)
-                    | AppError::UpstreamTimeout(_)
-                    | AppError::Overloaded,
-                ) if transient_attempts + 1 < MAX_TRANSIENT_ATTEMPTS => {
+                // Everything short of a missing VAA (matched above) that a retry can
+                // plausibly fix: shed permits, timeouts, 5xx provider answers.
+                Err(error)
+                    if error.is_transient() && transient_attempts + 1 < MAX_TRANSIENT_ATTEMPTS =>
+                {
                     transient_attempts += 1;
                     let delay_ms = 500 * 2_u64.pow(transient_attempts - 1);
 
@@ -267,7 +271,7 @@ impl RedisConsumer {
             .arg(BRIDGE_TX_STREAM)
             .arg(CONSUMER_GROUP)
             .arg(&self.consumer_name)
-            .arg(5 * 60 * 1000)
+            .arg(self.state.config.worker.reclaim_idle_ms)
             .arg("0-0")
             .arg("COUNT")
             .arg(10)
@@ -294,26 +298,84 @@ impl RedisConsumer {
 
         info!(count = messages.len(), "Reclaimed pending Redis messages");
 
+        // XAUTOCLAIM does not report how often a message has been delivered, and it
+        // has already incremented the counter by now, so read it from the pending list.
+        let message_ids: Vec<String> = messages
+            .iter()
+            .filter_map(|message| match message {
+                Value::Array(parts) => match parts.first() {
+                    Some(Value::BulkString(bytes)) => String::from_utf8(bytes.clone()).ok(),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let deliveries = self.delivery_counts(connection, &message_ids).await?;
+
         let response = Value::Array(vec![Value::Array(vec![
             Value::BulkString(BRIDGE_TX_STREAM.as_bytes().to_vec()),
             Value::Array(messages),
         ])]);
 
-        self.process_messages(connection, response).await?;
+        self.process_messages(connection, response, &deliveries)
+            .await?;
 
         Ok(())
+    }
+
+    /// Times each message has been delivered, from the group's pending list. The
+    /// extended `XPENDING` form answers `[id, consumer, idle, times-delivered]`.
+    async fn delivery_counts(
+        &self,
+        connection: &mut redis::aio::MultiplexedConnection,
+        message_ids: &[String],
+    ) -> Result<HashMap<String, u64>> {
+        let mut counts = HashMap::new();
+        let (Some(first), Some(last)) = (message_ids.first(), message_ids.last()) else {
+            return Ok(counts);
+        };
+
+        let rows: Value = redis::cmd("XPENDING")
+            .arg(BRIDGE_TX_STREAM)
+            .arg(CONSUMER_GROUP)
+            .arg(first)
+            .arg(last)
+            .arg(message_ids.len())
+            .query_async(&mut *connection)
+            .await?;
+
+        let Value::Array(rows) = rows else {
+            return Ok(counts);
+        };
+
+        for row in rows {
+            let Value::Array(entry) = row else {
+                continue;
+            };
+            let (Some(Value::BulkString(id)), Some(Value::Int(deliveries))) =
+                (entry.first(), entry.get(3))
+            else {
+                continue;
+            };
+            if let Ok(id) = String::from_utf8(id.clone()) {
+                counts.insert(id, *deliveries as u64);
+            }
+        }
+
+        Ok(counts)
     }
 
     async fn process_messages(
         &self,
         connection: &mut redis::aio::MultiplexedConnection,
         response: Value,
+        deliveries: &HashMap<String, u64>,
     ) -> Result<()> {
         let Value::Array(streams) = response else {
             return Ok(());
         };
 
-        let mut batch: Vec<(String, CandidateTransaction)> = Vec::new();
+        let mut batch: Vec<(String, CandidateTransaction, u64)> = Vec::new();
 
         for stream in streams {
             let Value::Array(mut stream_parts) = stream else {
@@ -393,21 +455,26 @@ impl RedisConsumer {
                     "Parsed transaction from Redis"
                 );
 
-                batch.push((message_id, candidate));
+                // A message read with `>` has been delivered once; a reclaimed one
+                // carries how many times the group has handed it to a worker.
+                let delivery_count = deliveries.get(&message_id).copied().unwrap_or(1);
+
+                batch.push((message_id, candidate, delivery_count));
             }
         }
 
         // A transaction waiting for its VAA can take a while, so a batch is handled
         // concurrently instead of letting one slow transaction hold up the rest.
-        let results =
-            futures_util::future::join_all(batch.into_iter().map(|(message_id, candidate)| {
+        let results = futures_util::future::join_all(batch.into_iter().map(
+            |(message_id, candidate, delivery_count)| {
                 let mut connection = connection.clone();
                 async move {
-                    self.process_candidate(&mut connection, &message_id, &candidate)
+                    self.process_candidate(&mut connection, &message_id, &candidate, delivery_count)
                         .await
                 }
-            }))
-            .await;
+            },
+        ))
+        .await;
 
         for result in results {
             result?;
@@ -421,13 +488,53 @@ impl RedisConsumer {
         connection: &mut redis::aio::MultiplexedConnection,
         message_id: &str,
         candidate: &CandidateTransaction,
+        delivery_count: u64,
     ) -> Result<()> {
+        let max_deliveries = u64::from(self.state.config.worker.max_deliveries);
+
+        // The retry budget is what keeps a message that keeps failing from being
+        // redelivered forever. Everything below is either a success or a dead letter.
+        if delivery_count > max_deliveries {
+            tracing::error!(
+                worker = %self.consumer_name,
+                message_id = %message_id,
+                tx_hash = %candidate.tx_hash,
+                delivery_count,
+                max_deliveries,
+                "Transaction exceeded its delivery budget, dead-lettering it"
+            );
+
+            self.dead_letter(
+                connection,
+                message_id,
+                candidate,
+                &format!("exceeded max deliveries ({delivery_count}) without succeeding"),
+            )
+            .await?;
+
+            return Ok(());
+        }
+
         match self
             .analyse_with_retry(&candidate.chain, &candidate.tx_hash)
             .await
         {
             Ok(analysed) => {
                 if let Err(error) = self.persist_with_retry(&analysed).await {
+                    if persistence_error_is_transient(&error) {
+                        // Do not ack and do not dead-letter: an outage is not the
+                        // transaction's fault, and recovery will redeliver it.
+                        tracing::warn!(
+                            worker = %self.consumer_name,
+                            message_id = %message_id,
+                            tx_hash = %candidate.tx_hash,
+                            delivery_count,
+                            ?error,
+                            "Transient persistence failure, leaving the message pending"
+                        );
+                        return Ok(());
+                    }
+
                     tracing::error!(
                         worker = %self.consumer_name,
                         message_id = %message_id,
@@ -470,6 +577,19 @@ impl RedisConsumer {
                     message_id = %message_id,
                     tx_hash = %candidate.tx_hash,
                     "Redis message acknowledged"
+                );
+            }
+
+            Err(error) if error.is_transient() => {
+                // No ack: the message stays pending and the recovery worker hands it
+                // back after its idle time, up to the delivery budget.
+                tracing::warn!(
+                    worker = %self.consumer_name,
+                    message_id = %message_id,
+                    tx_hash = %candidate.tx_hash,
+                    delivery_count,
+                    ?error,
+                    "Transient analysis failure, leaving the message pending"
                 );
             }
 

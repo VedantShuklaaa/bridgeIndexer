@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 mod common;
 
 use bridge::db::repository::persist_transaction;

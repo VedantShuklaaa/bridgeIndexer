@@ -21,9 +21,6 @@ use tokio::sync::broadcast;
 const BROADCAST_CAPACITY: usize = 1024;
 
 pub type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
-/// How long a live worker waits for a Helius token. Its message stays in the
-/// stream while it waits, so a burst queues instead of being dead-lettered.
-const LIVE_TOKEN_WAIT: Duration = Duration::from_secs(20);
 
 /// The shared state itself. Kept behind a single `Arc` in [`AppState`] so cloning
 /// the state is one refcount bump instead of one per field.
@@ -114,12 +111,13 @@ impl AppState {
                 NonZeroU32::new(config.helius_live_rps).unwrap(),
             )))
         });
+        let helius_wait = config.helius_live_token_wait;
         Self {
             inner: Arc::new(Inner {
                 config: Arc::new(config),
                 registry: Arc::new(registry),
                 helius_limiter,
-                helius_wait: LIVE_TOKEN_WAIT,
+                helius_wait,
                 ..(*self.inner).clone()
             }),
         }

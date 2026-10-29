@@ -55,6 +55,22 @@ impl JsonRpcRequest<(String, GetTransactionOptions)> {
     }
 }
 
+/// An HTTP answer that is worth another attempt: a server-side failure or a request
+/// timeout. Other 4xx answers (auth, bad request) will not change on retry.
+pub(crate) fn status_is_retryable(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT
+}
+
+/// A JSON-RPC error object worth another attempt. A malformed request, an unknown
+/// method, invalid params or an unsupported transaction version will answer the same
+/// every time; node/server errors may clear.
+pub(crate) fn json_rpc_error_is_retryable(error: &Value) -> bool {
+    !matches!(
+        error.get("code").and_then(Value::as_i64),
+        Some(-32700 | -32600 | -32601 | -32602 | -32015)
+    )
+}
+
 pub async fn get_transaction(client: &Client, url: &str, hash: &str) -> Result<Value, AppError> {
     let body = JsonRpcRequest::get_transaction(hash);
 
@@ -68,6 +84,7 @@ pub async fn get_transaction(client: &Client, url: &str, hash: &str) -> Result<V
         return Err(AppError::UpstreamProvider {
             provider: "helius",
             message: format!("status {}", resp.status()),
+            retryable: status_is_retryable(resp.status()),
         });
     }
 
@@ -77,6 +94,7 @@ pub async fn get_transaction(client: &Client, url: &str, hash: &str) -> Result<V
         return Err(AppError::UpstreamProvider {
             provider: "helius",
             message: err.to_string(),
+            retryable: json_rpc_error_is_retryable(err),
         });
     }
 
@@ -116,6 +134,7 @@ pub async fn get_multiple_accounts(
         return Err(AppError::UpstreamProvider {
             provider: "helius",
             message: format!("status {}", resp.status()),
+            retryable: status_is_retryable(resp.status()),
         });
     }
 
@@ -125,6 +144,7 @@ pub async fn get_multiple_accounts(
         return Err(AppError::UpstreamProvider {
             provider: "helius",
             message: err.to_string(),
+            retryable: json_rpc_error_is_retryable(err),
         });
     }
 
@@ -138,6 +158,8 @@ fn parse_multiple_accounts(
     let bad = |message: &str| AppError::UpstreamProvider {
         provider: "helius",
         message: message.to_string(),
+        // The body itself is unusable; the same response would parse the same way.
+        retryable: false,
     };
     let values = payload
         .pointer("/result/value")
@@ -200,6 +222,7 @@ pub async fn get_signatures_for_address(
         return Err(AppError::UpstreamProvider {
             provider: "helius",
             message: format!("status {}", resp.status()),
+            retryable: status_is_retryable(resp.status()),
         });
     }
 
@@ -209,6 +232,7 @@ pub async fn get_signatures_for_address(
         return Err(AppError::UpstreamProvider {
             provider: "helius",
             message: err.to_string(),
+            retryable: json_rpc_error_is_retryable(err),
         });
     }
 
@@ -217,6 +241,7 @@ pub async fn get_signatures_for_address(
         _ => Err(AppError::UpstreamProvider {
             provider: "helius",
             message: "invalid getSignaturesForAddress response".to_string(),
+            retryable: false,
         }),
     }
 }

@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 mod common;
 
 use bridge::chains::{ChainKey, ChainRef, ChainRegistry, NS_EVM, RawChainRef};
