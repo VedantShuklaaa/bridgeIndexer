@@ -830,6 +830,20 @@ entry, the v1 remap, and per-hit serialization. The numbers are their combined
 effect and do not isolate any one of them. Methodology and per-run numbers:
 [docs/scaling-log.md](docs/scaling-log.md).
 
+### 3e-2 — Live workers wait for Helius tokens
+
+Live workers, recovery, and backfill now wait up to 20 seconds for a Helius
+rate-limit token, while API requests retain the existing 2-second wait. This
+lets queued transactions tolerate temporary rate-limit pressure instead of
+unnecessarily entering the dead-letter stream.
+
+- **Before:** 197 `service overloaded` dead-letter entries initially; the count continued growing during redrive, reaching 237.
+- **After:** No new dead-letter entries or overload log lines observed after deployment. The 7 remaining entries were successfully redriven, leaving 0.
+- **Rate limit and sizing:** Approximately 4 tokens/s. Five workers with `XREADGROUP COUNT 10` can have up to 50 messages waiting for tokens.
+- **Validation limitation:** Only a few messages arrived after deployment. This is evidence of normal-load behavior, not proof that a large burst or 400-entry redrive will succeed.
+
+Link to the detailed notes: [`docs/3e-worker-patience.md`](docs/3e-worker-patience.md).
+
 ### perf-1: mimalloc allocator
 
 Against `16018712` on the same `m7i-flex.large` server and `c7i.xlarge`
