@@ -280,6 +280,14 @@ async fn preload_accounts(state: &AppState, tx: &mut SolanaTx) {
     }
 }
 
+/// Fetches one Solana transaction and preloads the accounts the adapters ask for,
+/// without running any classifier. The reconcile tool reuses this so it classifies
+/// exactly the view `analyse_tx` would.
+pub async fn load_solana_tx(state: &AppState, hash: &str) -> Result<Option<SolanaTx>, AppError> {
+    let (_, view) = fetch_solana_source(state, "solana", hash, false).await?;
+    Ok(view)
+}
+
 /// The normalised tx, plus the pure `SolanaTx` view adapters read (`None` if the raw
 /// response could not be viewed, in which case only the WormholeScan path can run).
 async fn fetch_source_transaction(
@@ -288,6 +296,18 @@ async fn fetch_source_transaction(
     hash: &str,
     first_attempt_paid: bool,
 ) -> Result<(NormalisedTransaction, Option<SolanaTx>), AppError> {
+    let (raw, solana_tx) = fetch_solana_source(state, chain, hash, first_attempt_paid).await?;
+    Ok((normaliser::solana::normalise(raw, hash)?, solana_tx))
+}
+
+/// The raw `getTransaction` response and its pure view, with adapter accounts
+/// preloaded. Shared by `analyse_tx` and the reconcile tool.
+async fn fetch_solana_source(
+    state: &AppState,
+    chain: &str,
+    hash: &str,
+    first_attempt_paid: bool,
+) -> Result<(Value, Option<SolanaTx>), AppError> {
     match chain {
         "solana" => {
             let get_transaction =
@@ -307,7 +327,7 @@ async fn fetch_source_transaction(
                 preload_accounts(state, view).await;
             }
 
-            Ok((normaliser::solana::normalise(raw, hash)?, solana_tx))
+            Ok((raw, solana_tx))
         }
         other => Err(AppError::Normalisation(format!(
             "unsupported chain: {other}"

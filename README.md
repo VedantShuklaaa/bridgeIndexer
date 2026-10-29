@@ -25,7 +25,7 @@ but not stored yet. The [Roadmap](#roadmap) tracks the move.
 | Read path (`/analyse`) | Working, cache-hit throughput measured (see [Results](#results)) |
 | Destination tx resolution | **Fixed (A5b).** Read from the `/operations` payload (`targetChain.transaction.txHash`, legacy paths as fallback), then `/global-tx` through the WormholeScan limiter when the VAA matched but no destination tx is present. `Pending` now means WormholeScan itself has no destination tx |
 | Enrichment | **Provider and background pass (A5b).** WormholeScan sits behind the `EnrichmentProvider` trait in `enrichment/`. A supervised worker re-enriches `Detected` and `Pending` rows on a schedule, so statuses converge without anyone calling `/analyse` |
-| WebSocket ingestion | **Always on (A8).** The ingester starts with the process, under a supervisor, whether or not anyone is connected to `/stream`. Still **lossy**: misses transactions, no measurement yet. Fix is Phase 4 (recall) |
+| WebSocket ingestion | **Always on (A8).** The ingester starts with the process, under a supervisor, whether or not anyone is connected to `/stream`. Still **lossy**, and the `reconcile` tool measures it (4a); the baseline run and the fix are Phase 4 |
 | CI | `cargo fmt --check`, `clippy -D warnings` and `cargo test` on every PR and on `main` (Phase 0) |
 | Deploy | Manual (`git clone` + `cargo run` on EC2, Postgres on RDS). Automated in Phase 2 |
 
@@ -266,7 +266,7 @@ bridgeIndexer/
 │   ├── shutdown.rs                     # SIGTERM / Ctrl+C
 │   ├── bin/
 │   │   ├── replay.rs                   # replay the last N signatures, compare with WormholeScan (1e)
-│   │   └── reconcile.rs                # (planned) stream recall vs getSignaturesForAddress (Phase 4)
+│   │   └── reconcile.rs                # stream recall vs getSignaturesForAddress (Phase 4, 4a)
 │   ├── domain/                         # types only, no IO
 │   │   ├── bridge.rs
 │   │   ├── bridge_transfer.rs
@@ -314,6 +314,7 @@ bridgeIndexer/
 │   │   ├── token_metadata.rs
 │   │   ├── detect.rs                   # chain-first detection and WormholeScan enrichment (pure)
 │   │   ├── read_through.rs             # caches, single-flight, stale-while-revalidate
+│   │   ├── reconcile.rs                # pure window, diff, recall, miss clustering and lag (4a)
 │   │   └── replay.rs                   # pure compare/summary for the replay tool
 │   ├── db/
 │   │   ├── connection.rs
@@ -498,10 +499,40 @@ registry from `DATABASE_URL`, writes nothing. Exits 1 when agreement on transfer
 older than `--min-age-secs` (default 900) is below `--min-agreement` (default 99).
 `cargo run` alone still starts the server (`default-run = "bridge"`).
 
+### Running reconcile
+
+```bash
+cargo run --bin reconcile -- --window-hours 2 --precision-sample 20
+```
+
+Measures the WebSocket ingester's recall and the classifier's precision for every
+registered program over `--window-hours` (default 2), ending `--end-offset-secs`
+(default 600) ago so the ingester had a chance to see the window. Ground truth is
+`getSignaturesForAddress`: failed transactions are dropped, signatures already in
+`bridge_transfers` are subtracted before any `getTransaction`, and only the
+remainder goes through the pipeline's own fetch/preload path and adapter
+classifier, offline. It writes nothing to Postgres or Redis.
+
+Per program it prints the missed count and missed %, recall (a lower bound when
+`--max-fetch`, default 2000, was hit; the cap counts signatures fetched with
+`getTransaction`, not Helius calls, so retries are not counted separately),
+ingestion lag p50/p99/max from block time
+(`transactions.timestamp`) to `bridge_transfers.created_at`, rejection counts by
+reason, and every missed signature flagged `same_slot` (suspect 1), `gap` (no
+persisted transfer within `--gap-secs`, suspects 3–5) or `other`.
+`--precision-sample N` re-runs up to N persisted transactions through `analyse_tx`
+and compares their status with WormholeScan, reusing the replay comparison.
+`--json` prints the same report machine-readable. Exits 1 when recall is below
+`--min-recall` (default 99.9) and the cap was not hit.
+
 ### Config notes
 
 * `HELIUS_LIVE_URL` (optional, falls back to `HELIUS_URL`) is the endpoint for the
   live pipeline.
+* `HELIUS_RECONCILE_URL` (optional, falls back to `HELIUS_URL`) and `RECONCILE_RPS`
+  (default 3) are the `reconcile` tool's own Helius lane. Its limiter is built
+  separately from the API's and the live pipeline's, so a reconciliation run cannot
+  starve ingestion.
 * Ingestion is always on (A8), all settings optional: `INGEST_ENABLED` (default on, `0` is a
   kill switch), `LIVE_BACKFILL` (default **on**, was off), `INGEST_BACKFILL_MAX` (5000),
   `INGEST_BACKFILL_PACE_MS` (150) and `INGEST_DEDUPE_TTL_SECS` (3600, `0` disables).
@@ -728,7 +759,7 @@ Known suspects, most likely first:
 
 Work items:
 
-* \[ ] 4a. `reconcile` bin: per-program recall, classification precision, and baseline over 24 h
+* \[ ] 4a. `reconcile` bin: per-program recall, classification precision, and baseline over 24 h. The bin and its pure tests are built; the 24 h baseline is the remaining exit criterion
 * \[ ] 4b. Rewind the checkpoint a few slots on reconnect and dedupe by signature (persistence is already idempotent)
 * \[ ] 4c. Backfill as a separate task, concurrent with live reads
 * \[ ] 4d. Ping/pong keepalive and a no-message watchdog that forces a reconnect
@@ -975,3 +1006,8 @@ control is one pass each. Methodology:
 | --- | --- | --- | --- | --- | --- | --- |
 | v0 | baseline | — | — | — | — | — |
 | | | | | | | |
+
+The `v0` row is filled in after the 24 h baseline: run
+`cargo run --bin reconcile -- --window-hours 24 --json` for `S-recall`, missed and
+p99 lag, then a run with `--precision-sample 200` for `S-precision`. Both runs
+write nothing.
