@@ -514,7 +514,9 @@ remainder goes through the pipeline's own fetch/preload path and adapter
 classifier, offline. It writes nothing to Postgres or Redis.
 
 Per program it prints the missed count and missed %, recall (a lower bound when
-`--max-fetch`, default 2000, was hit), ingestion lag p50/p99/max from block time
+`--max-fetch`, default 2000, was hit; the cap counts signatures fetched with
+`getTransaction`, not Helius calls, so retries are not counted separately),
+ingestion lag p50/p99/max from block time
 (`transactions.timestamp`) to `bridge_transfers.created_at`, rejection counts by
 reason, and every missed signature flagged `same_slot` (suspect 1), `gap` (no
 persisted transfer within `--gap-secs`, suspects 3–5) or `other`.

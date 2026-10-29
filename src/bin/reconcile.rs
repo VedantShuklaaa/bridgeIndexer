@@ -16,18 +16,18 @@
 
 use bridge::chain_adapters::setup::build_registry;
 use bridge::chains::ChainRegistry;
+use bridge::clients::helius;
 use bridge::clients::limiter::call_upstream;
-use bridge::clients::{helius, wormhole};
 use bridge::config::AppConfig;
 use bridge::db;
 use bridge::db::repository;
 use bridge::protocols::{Classification, Protocol, SolanaTx};
-use bridge::services::analyzer::{analyse_tx, load_solana_tx};
+use bridge::services::analyzer::load_solana_tx;
+use bridge::services::precision::{PrecisionReport, precision_pass};
 use bridge::services::reconcile::{
     ClassificationTally, Diff, FetchOutcome, LagStats, MissCluster, PersistedTransaction, Recall,
     Signature, SignatureScan, Window, cluster, diff, lag_stats, recall, sample_evenly,
 };
-use bridge::services::replay::{Outcome as ReplayOutcome, Summary, compare};
 use bridge::state::AppState;
 use reqwest::Client;
 use rustls::crypto::ring;
@@ -49,7 +49,9 @@ const USAGE: &str = "usage: reconcile [--window-hours H] [--end-offset-secs S] [
                      (default 0, off)
   --program          program ID to reconcile (default: every registered program)
   --json             machine-readable output on stdout
-  --max-fetch        hard cap on getTransaction calls (default 2000)
+  --max-fetch        hard cap on signatures fetched with getTransaction; counts
+                     signatures, not Helius calls, so retries are not counted
+                     separately (default 2000)
   --min-recall       exit 1 below this percentage, unless the cap was hit
                      (default 99.9)
 
@@ -123,11 +125,6 @@ enum Fetched {
     View(SolanaTx),
     Unreadable,
     Failed(String),
-}
-
-struct PrecisionReport {
-    sampled: usize,
-    summary: Summary,
 }
 
 struct ProgramReport {
@@ -250,7 +247,10 @@ async fn main() -> anyhow::Result<()> {
                 let n = args.precision_sample.min(remaining).min(hashes.len());
                 let sample: Vec<&str> = sample_evenly(&hashes, n).into_iter().copied().collect();
                 eprintln!("precision pass over {} transactions ...", sample.len());
-                Some(precision_pass(&state, &sample, &mut fetched).await)
+                // One getTransaction per sampled signature, charged to the same
+                // budget before the pass runs.
+                fetched += sample.len();
+                Some(precision_pass(&state, &sample).await)
             }
         } else {
             None
@@ -442,64 +442,6 @@ fn classify(state: &AppState, protocols: &[Protocol], fetched: &Fetched) -> Fetc
     }
 }
 
-/// Re-runs the persisted transactions through `analyse_tx` and compares their
-/// status with WormholeScan, reusing the replay tool's comparison.
-async fn precision_pass(state: &AppState, hashes: &[&str], fetched: &mut usize) -> PrecisionReport {
-    let mut summary = Summary::default();
-
-    for hash in hashes {
-        *fetched += 1;
-        let started = Instant::now();
-        let result = analyse_tx(state, "solana", hash).await;
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-
-        match result {
-            Ok(analysed) => match analysed.tx.bridge_transfer {
-                Some(transfer) => {
-                    let theirs = call_upstream(&state.wormhole_limiter, || {
-                        wormhole::get_destination_tx(
-                            &state.http_client,
-                            &state.config.wormhole_url,
-                            &transfer.message_id,
-                        )
-                    })
-                    .await;
-                    match theirs {
-                        Ok(destination) => {
-                            let verdict = compare(
-                                &transfer.status,
-                                transfer.destination_tx_hash.as_deref(),
-                                destination.as_deref(),
-                            );
-                            summary.record(
-                                &ReplayOutcome::Transfer {
-                                    status: transfer.status,
-                                    verdict,
-                                    settled: true,
-                                },
-                                elapsed_ms,
-                            );
-                        }
-                        Err(error) => {
-                            let kind = format!("reference:{}", error.code());
-                            summary.record(&ReplayOutcome::Error(kind), elapsed_ms);
-                        }
-                    }
-                }
-                None => summary.record(&ReplayOutcome::NoTransfer, elapsed_ms),
-            },
-            Err(error) => {
-                summary.record(&ReplayOutcome::Error(error.code().to_string()), elapsed_ms)
-            }
-        }
-    }
-
-    PrecisionReport {
-        sampled: hashes.len(),
-        summary,
-    }
-}
-
 fn timestamp(secs: i64) -> String {
     chrono::DateTime::from_timestamp(secs, 0).map_or_else(
         || secs.to_string(),
@@ -530,12 +472,19 @@ fn print_report(report: &ProgramReport, args: &Args) {
         .collect();
     println!("\nprogram {} ({})", report.program, protocols.join(", "));
     println!(
-        "  signatures: {} successful in window ({} failed, {} too recent, {} too old, {} unplaceable)",
+        "  signatures: {} successful in window ({} failed, {} too recent, {} unplaceable)",
         report.scan.signatures.len(),
         report.scan.failed,
         report.scan.too_recent,
-        report.scan.too_old,
         report.scan.unplaceable
+    );
+    println!(
+        "  scan stop marker: {} (one signature older than the window ended the scan; not a count)",
+        if report.scan.scan_stop_marker {
+            "yes"
+        } else {
+            "no"
+        }
     );
     println!(
         "  persisted: {} transfer(s) in {} transaction(s)",
@@ -628,7 +577,7 @@ fn report_json(report: &ProgramReport) -> Value {
         "signatures": report.scan.signatures.len(),
         "failed": report.scan.failed,
         "too_recent": report.scan.too_recent,
-        "too_old": report.scan.too_old,
+        "scan_stop_marker": report.scan.scan_stop_marker,
         "unplaceable": report.scan.unplaceable,
         "persisted": report.diff.persisted.len(),
         "persisted_transactions": report.recall.persisted,

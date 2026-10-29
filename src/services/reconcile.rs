@@ -48,8 +48,9 @@ pub struct SignatureScan {
     pub failed: u64,
     /// Too new: the ingester could not have seen them before `end`.
     pub too_recent: u64,
-    /// Older than `start`. Reaching one means the next page cannot help either.
-    pub too_old: u64,
+    /// A marker, not a count: set when one signature older than `start` ended the
+    /// paged scan. Only that one is seen, and the next page could not help either.
+    pub scan_stop_marker: bool,
     /// Entries without a signature, slot or block time.
     pub unplaceable: u64,
     seen: BTreeSet<String>,
@@ -80,7 +81,7 @@ impl SignatureScan {
                 continue;
             }
             if block_time < window.start {
-                self.too_old += 1;
+                self.scan_stop_marker = true;
                 self.done = true;
                 break;
             }
@@ -424,7 +425,9 @@ mod tests {
         assert!(scan.is_done());
         assert_eq!(scan.signatures, vec![signature("ok", 28, 8000)]);
         assert_eq!(scan.too_recent, 1);
-        assert_eq!(scan.too_old, 1);
+        // The marker records only the signature that ended the scan, not how many
+        // older ones the page held.
+        assert!(scan.scan_stop_marker);
         assert_eq!(scan.failed, 1);
         assert_eq!(scan.unplaceable, 0);
     }
