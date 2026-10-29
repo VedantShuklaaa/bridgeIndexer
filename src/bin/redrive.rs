@@ -15,6 +15,7 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use redis::Value;
 use redis::aio::MultiplexedConnection;
+use rustls::crypto::ring;
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -541,6 +542,10 @@ async fn run(args: &Args) -> Result<()> {
 
 #[tokio::main]
 async fn main() {
+    ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     let args = match parse_args() {
         Ok(args) => args,
         Err(error) => {
