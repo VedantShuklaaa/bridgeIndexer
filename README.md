@@ -449,6 +449,7 @@ Symbol and decimals come from one Helius `getAsset` per mint, cached per mint (2
   `REENRICH_MIN_AGE_SECS` are left to the normal pipeline, a row is not asked again
   within `REENRICH_RETRY_SECS`, and rows older than `REENRICH_MAX_AGE_SECS` are given up
   on. A pass ends early after three provider outages in a row.
+* **Helius token wait.** The API sheds a request after 2 s without a token (`Overloaded`, 503). Live workers wait up to 20 s, so a burst or a redrive queues in the stream instead of landing in the dead-letter stream. The wait must stay well below the stream's reclaim idle time (5 min).
 
 ## API
 

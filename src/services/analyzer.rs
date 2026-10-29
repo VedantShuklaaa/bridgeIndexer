@@ -1,4 +1,4 @@
-use crate::clients::limiter::{acquire_token, call_upstream, call_upstream_after_token};
+use crate::clients::limiter::{acquire_token_within, call_upstream, call_upstream_after_token};
 use crate::clients::{helius, wormhole};
 use crate::domain::analysis::{Analysis, DecodedTransfer};
 use crate::domain::bridge_transfer::BridgeMessageId;
@@ -25,7 +25,7 @@ pub async fn analyse_tx(state: &AppState, chain: &str, hash: &str) -> Result<Ana
     // times out here must not spend a WormholeScan call whose result is then
     // discarded. The token pays for the first getTransaction attempt below.
     let first_attempt_paid = if chain == "solana" {
-        acquire_token(&state.helius_limiter).await?;
+        acquire_token_within(&state.helius_limiter, state.helius_wait).await?;
         true
     } else {
         false
