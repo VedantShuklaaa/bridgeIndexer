@@ -17,11 +17,19 @@ fn is_retryable(e: &AppError) -> bool {
     )
 }
 
-/// Takes one token from the limiter, failing fast with `Overloaded` instead of
-/// queueing forever. Lets a caller pay for an upstream call before starting any
-/// other work that would be wasted if the wait times out.
+/// How long an API request waits for a Helius token before it is shed.
+pub const API_TOKEN_WAIT: Duration = Duration::from_secs(2);
+
+/// Takes one token from the limiter, failing fast with `Overloaded` after the API
+/// wait instead of queueing forever.
 pub async fn acquire_token(limiter: &Limiter) -> Result<(), AppError> {
-    tokio::time::timeout(Duration::from_secs(2), limiter.until_ready())
+    acquire_token_within(limiter, API_TOKEN_WAIT).await
+}
+
+/// Same, with the caller's own patience: the API sheds quickly, a background worker
+/// can wait for its turn because its message stays in the stream meanwhile.
+pub async fn acquire_token_within(limiter: &Limiter, max_wait: Duration) -> Result<(), AppError> {
+    tokio::time::timeout(max_wait, limiter.until_ready())
         .await
         .map_err(|_| AppError::Overloaded)?;
     Ok(())
@@ -164,5 +172,19 @@ mod tests {
             "the paid first attempt waited {:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn a_longer_wait_gets_the_token_a_short_one_would_miss() {
+        let limiter =
+            RateLimiter::direct(governor::Quota::with_period(Duration::from_millis(300)).unwrap());
+        limiter.check().expect("the burst token is free");
+
+        let short = acquire_token_within(&limiter, Duration::from_millis(50)).await;
+        assert!(matches!(short, Err(AppError::Overloaded)));
+
+        acquire_token_within(&limiter, Duration::from_secs(2))
+            .await
+            .expect("the next token arrives within the wait");
     }
 }

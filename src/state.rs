@@ -1,5 +1,6 @@
 use crate::chain_adapters::registry::AdapterRegistry;
 use crate::chains::ChainRegistry;
+use crate::clients::limiter::API_TOKEN_WAIT;
 use crate::config::AppConfig;
 use crate::enrichment::EnrichmentProvider;
 use crate::enrichment::wormholescan::WormholeScanProvider;
@@ -14,12 +15,15 @@ use reqwest::Client;
 use sqlx::PgPool;
 use std::num::NonZeroU32;
 use std::ops::Deref;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::broadcast;
 
 const BROADCAST_CAPACITY: usize = 1024;
 
 pub type Limiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock>;
+/// How long a live worker waits for a Helius token. Its message stays in the
+/// stream while it waits, so a burst queues instead of being dead-lettered.
+const LIVE_TOKEN_WAIT: Duration = Duration::from_secs(20);
 
 /// The shared state itself. Kept behind a single `Arc` in [`AppState`] so cloning
 /// the state is one refcount bump instead of one per field.
@@ -36,6 +40,7 @@ pub struct Inner {
     pub helius_limiter: Arc<Limiter>,
     pub wormhole_limiter: Arc<Limiter>,
     pub enrichment: Arc<dyn EnrichmentProvider>,
+    pub helius_wait: Duration,
 }
 
 #[derive(Clone)]
@@ -92,6 +97,7 @@ impl AppState {
                 helius_limiter,
                 wormhole_limiter,
                 enrichment,
+                helius_wait: API_TOKEN_WAIT,
             }),
         })
     }
@@ -113,6 +119,7 @@ impl AppState {
                 config: Arc::new(config),
                 registry: Arc::new(registry),
                 helius_limiter,
+                helius_wait: LIVE_TOKEN_WAIT,
                 ..(*self.inner).clone()
             }),
         }
