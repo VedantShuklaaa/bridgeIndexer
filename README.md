@@ -420,11 +420,21 @@ Symbol and decimals come from one Helius `getAsset` per mint, cached per mint (2
   guarantees at-least-once delivery; Postgres upserts on `hash` and
   `(protocol, message_key)` absorb redelivery, so a crash mid-batch can never
   double-write, for every protocol.
-* **Dead-letter queue.** Transactions that fail analysis or persistence after
-  retries move to `bridge:transactions:failed` instead of blocking the stream
-  or being silently dropped.
+* **Dead-letter queue, for permanent failures.** A transaction that fails
+  analysis or persistence *and cannot fix itself* (malformed data, a
+  normalisation failure, a provider answer that cannot change on retry such as
+  invalid params or method not found) moves to `bridge:transactions:failed`
+  instead of blocking the stream or being silently dropped.
+* **Transient failures stay pending, bounded.** A rate limit, timeout, 5xx,
+  limiter shed (`Overloaded`) or database outage neither acks nor dead-letters:
+  the message stays in the pending list and recovery redelivers it after its
+  idle time. Every delivery is counted (`XPENDING` times-delivered), and past
+  `WORKER_MAX_DELIVERIES` (default 10) the message is dead-lettered with the
+  reason recorded, so nothing is retried forever.
 * **Self-healing recovery.** A dedicated worker reclaims messages abandoned by
-  a crashed consumer via `XAUTOCLAIM` every 30s.
+  a crashed consumer via `XAUTOCLAIM`, every `WORKER_RECLAIM_INTERVAL_SECS`
+  (30) and after `WORKER_RECLAIM_IDLE_MS` (5 min). Recovery runs the same
+  handler as first delivery, so it classifies a failure the same way.
 * **Graceful shutdown.** SIGTERM/Ctrl+C stops new work being picked up, lets
   in-flight messages finish, and drains open HTTP/WS connections before exit.
 * **Upstream protection on the read path.** Per-provider rate limiters, retries
@@ -440,17 +450,22 @@ Symbol and decimals come from one Helius `getAsset` per mint, cached per mint (2
 * **Enrichment never gates persistence.** A transfer decoded from Solana data is stored
   as `Detected` even if WormholeScan is down, rate-limited or has no VAA yet, and a status
   never moves backwards.
-* **Account preloads are best effort.** The accounts adapters ask for (the posted VAA of a
-  redeem) are read in one `getMultipleAccounts` call through the Helius limiter. When the call
-  fails the adapters see the accounts as missing and reject what needs them as `Unsupported`,
-  the failure is logged, and the WormholeScan path still runs.
+* **Account preloads fail loud on the live path.** The accounts adapters ask for
+  (the posted VAA of a redeem) are read in one `getMultipleAccounts` call through
+  the Helius limiter. A live message whose preload fails transiently is left
+  pending and retried, because a redeem without its VAA account is only reported
+  `Unsupported` and then falls onto the WormholeScan path, which can store a row
+  with the wrong source wallet (or dead-letter the redeem when WormholeScan is
+  down). A permanent preload error, and every preload in the read-only
+  `reconcile` tool, stays best effort: the failure is logged and the WormholeScan
+  path still runs.
 * **Open transfers converge on their own.** A supervised worker re-enriches `Detected`
   and `Pending` rows every `REENRICH_INTERVAL_SECS`, oldest attempt first, through the
   WormholeScan limiter (it never touches Helius). Rows younger than
   `REENRICH_MIN_AGE_SECS` are left to the normal pipeline, a row is not asked again
   within `REENRICH_RETRY_SECS`, and rows older than `REENRICH_MAX_AGE_SECS` are given up
   on. A pass ends early after three provider outages in a row.
-* **Helius token wait.** The API sheds a request after 2 s without a token (`Overloaded`, 503). Live workers wait up to 20 s, so a burst or a redrive queues in the stream instead of landing in the dead-letter stream. The wait must stay well below the stream's reclaim idle time (5 min).
+* **Helius token wait.** The API sheds a request after 2 s without a token (`Overloaded`, 503). Live workers wait up to `HELIUS_LIVE_TOKEN_WAIT_MS` (20 s) for the first token of a message, but that patience is no longer what keeps a burst out of the dead-letter stream: an `Overloaded` is transient, so the message stays pending and recovery redelivers it. The wait must stay well below the reclaim idle time (5 min), or a message would be reclaimed while it is still waiting.
 
 ## API
 
@@ -535,10 +550,22 @@ and compares their status with WormholeScan, reusing the replay comparison.
   starve ingestion.
 * Ingestion is always on (A8), all settings optional: `INGEST_ENABLED` (default on, `0` is a
   kill switch), `LIVE_BACKFILL` (default **on**, was off), `INGEST_BACKFILL_MAX` (5000),
-  `INGEST_BACKFILL_PACE_MS` (150) and `INGEST_DEDUPE_TTL_SECS` (3600, `0` disables).
+  `INGEST_BACKFILL_PACE_MS` (750) and `INGEST_DEDUPE_TTL_SECS` (7200, `0` disables).
   `LIVE_IDLE_GRACE_SECS` is gone, nothing stops the ingester any more. Backfill is skipped
   while there is no checkpoint (a fresh database), so a first start never walks the whole
   history of the program.
+  The pace is 750 ms because one backfilled message costs up to three live Helius calls and
+  the live limiter drains 4 tokens/s, so anything faster than about one message per 750 ms
+  lets the backfill outrun the limiter (the old 150 ms did). A full 5000-signature run
+  therefore takes about 62 minutes instead of about 12, which is also why the dedupe TTL is
+  now two hours: a full backfill outlives the old one-hour window.
+* Live worker patience and retry budget (all optional): `HELIUS_LIVE_TOKEN_WAIT_MS` (20000)
+  is how long a worker waits for the first Helius token of a message;
+  `WORKER_MAX_DELIVERIES` (10) is how many times a transiently failing message may be
+  redelivered before it is dead-lettered; `WORKER_RECLAIM_IDLE_MS` (300000) is how long a
+  message must sit unacknowledged before recovery reclaims it; `WORKER_RECLAIM_INTERVAL_SECS`
+  (30) is how often recovery sweeps. The token wait must stay well below the reclaim idle
+  time.
 * `SOLANA_TOKEN_BRIDGE_PROGRAM` is a single address and is still the only program
   setting `config.rs` reads. `protocols::registry` already has a parser for
   `SOLANA_BRIDGE_PROGRAMS` (a `protocol:program_id` CSV), but nothing reads that
@@ -874,6 +901,15 @@ unnecessarily entering the dead-letter stream.
 - **Validation limitation:** Only a few messages arrived after deployment. This is evidence of normal-load behavior, not proof that a large burst or 400-entry redrive will succeed.
 
 Link to the detailed notes: [`docs/3e-worker-patience.md`](docs/3e-worker-patience.md).
+
+**Postscript.** The 20 s wait only covered the first Helius token of a message;
+every retry and the account preload still shed after a hardcoded 2 s. On the
+29 Oct restart backfill that was not enough — workers logged `error=Overloaded`
+and dead-lettered 41 of about 467 backfilled transactions. The wait is now
+`HELIUS_LIVE_TOKEN_WAIT_MS`, and `Overloaded` is no longer a dead-letter reason at
+all: it is transient, so the message stays pending and recovery redelivers it,
+bounded by the delivery budget (`WORKER_MAX_DELIVERIES`). Backfill also publishes
+no faster than the live limiter drains (`INGEST_BACKFILL_PACE_MS`, now 750 ms).
 
 ### perf-1: mimalloc allocator
 

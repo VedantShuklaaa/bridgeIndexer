@@ -107,6 +107,8 @@ impl TokenMetadataLookup {
             Some(CachedMetadata::Failed(message)) => Err(AppError::UpstreamProvider {
                 provider: "token-metadata",
                 message,
+                // Cached for a minute; the next lookup may well succeed.
+                retryable: true,
             }),
         }
     }
@@ -159,6 +161,7 @@ mod tests {
                 Outcome::Failed => Err(AppError::UpstreamProvider {
                     provider: "fake",
                     message: "boom".into(),
+                    retryable: true,
                 }),
             }
         }

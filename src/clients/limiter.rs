@@ -13,7 +13,10 @@ fn is_retryable(e: &AppError) -> bool {
         e,
         AppError::UpstreamRateLimited(_)
             | AppError::UpstreamTimeout(_)
-            | AppError::UpstreamProvider { .. }
+            | AppError::UpstreamProvider {
+                retryable: true,
+                ..
+            }
     )
 }
 

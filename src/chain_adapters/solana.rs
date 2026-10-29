@@ -44,6 +44,7 @@ impl SolanaAdapter {
             return Err(AppError::UpstreamProvider {
                 provider: self.name,
                 message: err.to_string(),
+                retryable: crate::clients::helius::json_rpc_error_is_retryable(err),
             });
         }
 

@@ -1,7 +1,6 @@
 //! The A2 schema: protocol-agnostic `bridge_transfers`, `wormhole_messages`, raw chain
 //! references with optional resolution, and the migration of rows that already exist.
 
-#[allow(dead_code)]
 mod common;
 
 use bridge::chains::{ChainRegistry, RawChainRef};

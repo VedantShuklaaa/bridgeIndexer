@@ -51,6 +51,7 @@ impl Neg {
             Neg::Provider => AppError::UpstreamProvider {
                 provider: "cached",
                 message: "recent upstream failure".to_string(),
+                retryable: true,
             },
         }
     }

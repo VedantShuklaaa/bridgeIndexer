@@ -8,12 +8,11 @@
 //! counts and the `created_at`, `updated_at` and `analysis` columns on the seeded
 //! rows, and would catch an insert just as well.
 
-#[allow(dead_code)]
 mod common;
 
 use bridge::chain_adapters::setup::build_registry;
 use bridge::chains::ChainRegistry;
-use bridge::config::{AppConfig, IngestConfig, ReenrichConfig};
+use bridge::config::{AppConfig, IngestConfig, ReenrichConfig, WorkerConfig};
 use bridge::db::repository;
 use bridge::domain::bridge_transfer::ChainId;
 use bridge::services::precision::precision_pass;
@@ -21,90 +20,7 @@ use bridge::state::AppState;
 use reqwest::Client;
 use serde_json::Value;
 use sqlx::PgPool;
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-
-/// Kills the fake upstream when the test ends, including on panic.
-struct FakeUpstream {
-    child: Child,
-    base_url: String,
-}
-
-impl Drop for FakeUpstream {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn spawn_fake_upstream(port: u16) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_fake_upstream"))
-        .env("FAKE_PORT", port.to_string())
-        .env("FAKE_LATENCY_MS", "0")
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn fake_upstream")
-}
-
-async fn start_fake_upstream() -> FakeUpstream {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind a free port")
-        .local_addr()
-        .expect("local address")
-        .port();
-    // The guard owns the child from here, so the panic below still kills it.
-    let fake = FakeUpstream {
-        child: spawn_fake_upstream(port),
-        base_url: format!("http://127.0.0.1:{port}"),
-    };
-
-    let client = Client::builder()
-        .timeout(Duration::from_millis(500))
-        .build()
-        .expect("health-check client");
-    for _ in 0..100 {
-        if client
-            .get(format!("{}/stats", fake.base_url))
-            .send()
-            .await
-            .is_ok()
-        {
-            return fake;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("fake_upstream did not answer on {}", fake.base_url);
-}
-
-/// Signatures whose fixture makes the classifier produce a transfer, so the pass
-/// exercises the path that would persist if it were allowed to.
-async fn transfer_signatures(base_url: &str, count: usize) -> Vec<String> {
-    let client = Client::new();
-    let mut found = Vec::new();
-    for i in 0..500 {
-        let hash = format!("precision-read-only-{i}");
-        let body: Value = client
-            .get(format!("{base_url}/debug/fixture/{hash}"))
-            .send()
-            .await
-            .expect("debug fixture request")
-            .json()
-            .await
-            .expect("debug fixture body");
-        let status = body["status"].as_str().unwrap_or_default();
-        if status != "NoTransfer" && status != "Malformed" {
-            found.push(hash);
-            if found.len() == count {
-                return found;
-            }
-        }
-    }
-    panic!(
-        "the fixtures only hold {} transfer transactions",
-        found.len()
-    );
-}
 
 async fn get_transactions(base_url: &str) -> u64 {
     let body: Value = Client::new()
@@ -150,6 +66,7 @@ fn test_config(database_url: &str, upstream_url: &str) -> AppConfig {
         wormhole_url: upstream_url.to_string(),
         helius_api_rps: 20,
         helius_live_rps: 20,
+        helius_live_token_wait: Duration::from_secs(20),
         reconcile_rps: 20,
         wormhole_rps: 20,
         upstream_permits: 4,
@@ -172,14 +89,19 @@ fn test_config(database_url: &str, upstream_url: &str) -> AppConfig {
             retry_secs: 0,
             max_age_secs: 1,
         },
+        worker: WorkerConfig {
+            max_deliveries: 10,
+            reclaim_idle_ms: 300_000,
+            reclaim_interval_secs: 30,
+        },
         chain_registry_refresh_secs: 60,
     }
 }
 
 #[tokio::test]
 async fn the_precision_pass_leaves_every_table_untouched() {
-    let fake = start_fake_upstream().await;
-    let hashes = transfer_signatures(&fake.base_url, 3).await;
+    let fake = common::start_fake_upstream().await;
+    let hashes = common::transfer_signatures(&fake.base_url, 3).await;
 
     let db = common::test_db().await;
 

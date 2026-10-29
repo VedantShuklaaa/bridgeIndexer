@@ -1,10 +1,19 @@
+// Each test binary compiles its own copy of this module and uses a different slice of
+// it, so an item unused here is still used somewhere.
+#![allow(dead_code)]
+
 use bridge::domain::bridge_transfer::{BridgeMessageId, BridgeStatus, BridgeTransfer, ChainId};
 use bridge::domain::transaction::{Chain, NormalisedTransaction, TxStatus};
+use reqwest::Client;
+use serde_json::Value;
 use sqlx::{PgPool, postgres::PgConnectOptions};
 use std::borrow::Cow;
+use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
+use std::time::Duration;
 use testcontainers_modules::{
     postgres::Postgres,
+    redis::Redis,
     testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner},
 };
 
@@ -154,4 +163,129 @@ async fn fresh_database(base_url: &str) -> PgPool {
     PgPool::connect_with(admin_options.database(&name))
         .await
         .expect("failed to connect to test database")
+}
+
+/// `XAUTOCLAIM`, which the recovery worker relies on, needs Redis 6.2+.
+const REDIS_TAG: &str = "7";
+
+pub struct TestRedis {
+    pub url: String,
+    // Held so the container lives as long as the test.
+    _container: Option<ContainerAsync<Redis>>,
+}
+
+/// A Redis with no streams, on its own container (or `TEST_REDIS_URL` when set).
+pub async fn test_redis() -> TestRedis {
+    if let Ok(url) = std::env::var("TEST_REDIS_URL") {
+        return TestRedis {
+            url,
+            _container: None,
+        };
+    }
+
+    let container = Redis::default()
+        .with_tag(REDIS_TAG)
+        .start()
+        .await
+        .expect("failed to start redis container");
+    let port = container
+        .get_host_port_ipv4(6379)
+        .await
+        .expect("failed to get mapped port");
+
+    TestRedis {
+        url: format!("redis://127.0.0.1:{port}"),
+        _container: Some(container),
+    }
+}
+
+/// Kills the fake upstream when the test ends, including on panic.
+pub struct FakeUpstream {
+    child: Child,
+    pub base_url: String,
+}
+
+impl Drop for FakeUpstream {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_fake_upstream(port: u16, envs: &[(&str, &str)]) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fake_upstream"));
+    command
+        .env("FAKE_PORT", port.to_string())
+        .env("FAKE_LATENCY_MS", "0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command.spawn().expect("spawn fake_upstream")
+}
+
+pub async fn start_fake_upstream() -> FakeUpstream {
+    start_fake_upstream_with(&[]).await
+}
+
+/// Starts the fake upstream with extra environment, for tests that need injected
+/// latency or 429s. The defaults keep it instant and always answering.
+pub async fn start_fake_upstream_with(envs: &[(&str, &str)]) -> FakeUpstream {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind a free port")
+        .local_addr()
+        .expect("local address")
+        .port();
+    // The guard owns the child from here, so the panic below still kills it.
+    let fake = FakeUpstream {
+        child: spawn_fake_upstream(port, envs),
+        base_url: format!("http://127.0.0.1:{port}"),
+    };
+
+    let client = Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .expect("health-check client");
+    for _ in 0..100 {
+        if client
+            .get(format!("{}/stats", fake.base_url))
+            .send()
+            .await
+            .is_ok()
+        {
+            return fake;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("fake_upstream did not answer on {}", fake.base_url);
+}
+
+/// Signatures whose fixture makes the classifier produce a transfer, so a test
+/// exercises the path that decodes and persists rather than a no-transfer tx.
+pub async fn transfer_signatures(base_url: &str, count: usize) -> Vec<String> {
+    let client = Client::new();
+    let mut found = Vec::new();
+    for i in 0..500 {
+        let hash = format!("precision-read-only-{i}");
+        let body: Value = client
+            .get(format!("{base_url}/debug/fixture/{hash}"))
+            .send()
+            .await
+            .expect("debug fixture request")
+            .json()
+            .await
+            .expect("debug fixture body");
+        let status = body["status"].as_str().unwrap_or_default();
+        if status != "NoTransfer" && status != "Malformed" {
+            found.push(hash);
+            if found.len() == count {
+                return found;
+            }
+        }
+    }
+    panic!(
+        "the fixtures only hold {} transfer transactions",
+        found.len()
+    );
 }

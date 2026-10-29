@@ -15,6 +15,7 @@ pub async fn get_operation_by_tx_hash(
         return Err(AppError::UpstreamProvider {
             provider: "wormhole",
             message: format!("status {}", resp.status()),
+            retryable: crate::clients::helius::status_is_retryable(resp.status()),
         });
     }
 
@@ -45,6 +46,7 @@ pub async fn get_destination_tx(
         return Err(AppError::UpstreamProvider {
             provider: "wormhole",
             message: format!("status {}", resp.status()),
+            retryable: crate::clients::helius::status_is_retryable(resp.status()),
         });
     }
 
