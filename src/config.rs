@@ -40,6 +40,9 @@ pub struct AppConfig {
     /// Helius endpoint for the live pipeline (backfill + consumer workers).
     /// Falls back to `helius_url` when `HELIUS_LIVE_URL` is unset.
     pub helius_live_url: String,
+    /// Helius endpoint for the read-only `reconcile` tool. Falls back to
+    /// `helius_url` when `HELIUS_RECONCILE_URL` is unset.
+    pub helius_reconcile_url: String,
     pub wormhole_url: String,
     /// Helius requests/sec for the GET API. Helius free plan: 10 requests/sec per key.
     /// The API and the live pipeline share one key until Phase 2 gives each its own,
@@ -47,6 +50,9 @@ pub struct AppConfig {
     pub helius_api_rps: u32,
     /// Helius requests/sec for the live pipeline (backfill + consumer workers).
     pub helius_live_rps: u32,
+    /// Helius requests/sec for the `reconcile` tool, on its own lane so a
+    /// reconciliation run cannot starve the running pipeline.
+    pub reconcile_rps: u32,
     /// WormholeScan requests/sec, shared by the GET API and enrichment.
     pub wormhole_rps: u32,
     /// Most upstream fetches one cold `/analyse` may run at once.
@@ -93,10 +99,12 @@ impl AppConfig {
             database_url: required("DATABASE_URL")?,
             redis_url: required("REDIS_URL")?,
             helius_live_url: optional("HELIUS_LIVE_URL", &helius_url),
+            helius_reconcile_url: optional("HELIUS_RECONCILE_URL", &helius_url),
             helius_url,
             wormhole_url: optional("WORMHOLE_URL", "https://api.wormholescan.io"),
             helius_api_rps: number("HELIUS_API_RPS", 6u32).max(1),
             helius_live_rps: number("HELIUS_LIVE_RPS", 4u32).max(1),
+            reconcile_rps: number("RECONCILE_RPS", 3u32).max(1),
             wormhole_rps: number("WORMHOLE_RPS", 20u32).max(1),
             upstream_permits: number("UPSTREAM_PERMITS", 16usize).max(1),
             port: std::env::var("PORT")

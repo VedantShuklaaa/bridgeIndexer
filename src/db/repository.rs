@@ -360,6 +360,48 @@ pub async fn list_open_transfers(
         .collect())
 }
 
+/// One persisted transfer in a block-time window, for the read-only `reconcile`
+/// tool. `block_time` is the chain's `blockTime` (`transactions.timestamp`);
+/// `stored_at` is when the `bridge_transfers` row was written.
+#[derive(Debug, sqlx::FromRow)]
+pub struct PersistedTransferRow {
+    pub observed_tx_hash: String,
+    pub slot: i64,
+    pub block_time: i64,
+    pub stored_at: i64,
+}
+
+/// Persisted transfers of one protocol whose transaction was in
+/// `[start, end]` (Unix seconds, inclusive). Read-only.
+pub async fn persisted_transfers_in_window(
+    pool: &PgPool,
+    protocol: &str,
+    start: i64,
+    end: i64,
+) -> Result<Vec<PersistedTransferRow>> {
+    let rows: Vec<PersistedTransferRow> = sqlx::query_as(
+        r#"
+        SELECT bt.observed_tx_hash,
+               t.slot,
+               EXTRACT(EPOCH FROM t.timestamp)::bigint AS block_time,
+               EXTRACT(EPOCH FROM bt.created_at)::bigint AS stored_at
+        FROM bridge_transfers bt
+        JOIN transactions t ON t.id = bt.transaction_id
+        WHERE bt.observed_tx_hash IS NOT NULL
+          AND bt.protocol = $1
+          AND t.timestamp >= to_timestamp($2::double precision)
+          AND t.timestamp <= to_timestamp($3::double precision)
+        ORDER BY t.timestamp, bt.event_index
+        "#,
+    )
+    .bind(protocol)
+    .bind(start as f64)
+    .bind(end as f64)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// A stored analysis plus whether it is still fresh.
 pub struct CachedAnalysis {
     pub analysis: serde_json::Value,
