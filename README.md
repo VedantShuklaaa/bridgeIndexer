@@ -24,7 +24,7 @@ but not stored yet. The [Roadmap](#roadmap) tracks the move.
 | Protocol core | `BridgeAdapter`, `ProtocolRegistry`, `compose`, pure `SolanaTx` and the Wormhole Token Bridge adapter are **wired into `analyse_tx`** through `AppState.protocols`. Sends and redeems are decoded and stored (A7). A redeem needs the posted VAA account (A1b): the adapter asks for it through `required_accounts` and the fetch step preloads it with `getMultipleAccounts`. The other Wormhole programs (A4) are not decoded yet |
 | Read path (`/analyse`) | Working, cache-hit throughput measured (see [Results](#results)) |
 | Destination tx resolution | **Fixed (A5b).** Read from the `/operations` payload (`targetChain.transaction.txHash`, legacy paths as fallback), then `/global-tx` through the WormholeScan limiter when the VAA matched but no destination tx is present. `Pending` now means WormholeScan itself has no destination tx |
-| Enrichment | **Provider and background pass (A5b).** WormholeScan sits behind the `EnrichmentProvider` trait in `enrichment/`. A supervised worker re-enriches `Detected` and `Pending` rows on a schedule and fills the missing origin tx of completed inbound rows, so statuses converge without anyone calling `/analyse` |
+| Enrichment | **Provider and background pass (A5b).** WormholeScan sits behind the `EnrichmentProvider` trait in `enrichment/`. A supervised worker re-enriches `Detected` and `Pending` rows on a schedule and fills the missing origin tx of completed inbound rows, so statuses converge without anyone calling `/analyse`. The origin tx comes from `/operations` when that record names one, otherwise from the message-key `/vaas` record |
 | WebSocket ingestion | **Always on (A8).** The ingester starts with the process, under a supervisor, whether or not anyone is connected to `/stream`. Still **lossy**, and the `reconcile` tool measures it (4a); the baseline run and the fix are Phase 4 |
 | CI | `cargo fmt --check`, `clippy -D warnings` and `cargo test` on every PR and on `main` (Phase 0) |
 | Deploy | Manual (`git clone` + `cargo run` on EC2, Postgres on RDS). Automated in Phase 2 |
@@ -131,10 +131,17 @@ Implemented so far:
   adapters reject a failed tx, so a decoded redeem has happened). The origin tx is filled in
   by enrichment: when WormholeScan's operation matches the on-chain message, its
   `sourceChain.transaction.txHash` becomes `source_tx_hash`, and a later analysis that
-  could not reach WormholeScan never erases it. A completed inbound row that still has no
-  origin tx is revisited by the background re-enrichment pass (`enrichment::reenrich`)
-  until WormholeScan names it, so a re-analysis is not the only way it is filled. A row
-  is one per `(protocol, message_key)`, so a redeem is never stored twice.
+  could not reach WormholeScan never erases it. `/operations` is keyed by a transaction
+  signature, which for a redeem is the destination side, so its response can be empty or
+  carry no source tx. The fallback is the message-key record:
+  `/api/v1/vaas/{emitterChain}/{emitterAddress}/{sequence}`, whose `data.txHash` is the
+  origin tx. EVM hashes arrive as bare hex and get the `0x` prefix from the chain
+  registry; other chains keep their encoding. The fallback fills only a missing
+  `source_tx_hash` and its explorer URL, never the status or a field that is already set. A
+  completed inbound row that still has no origin tx is revisited by the background
+  re-enrichment pass (`enrichment::reenrich`) until one of the two routes names it, so a
+  re-analysis is not the only way it is filled. A row is one per
+  `(protocol, message_key)`, so a redeem is never stored twice.
   `BridgeTransfer::direction()` derives the direction (destination Solana, source not
   Solana), so stored analyses keep their shape. In the
   frozen `/api/v1` response `source_tx_hash` is now nullable, and it is null only for a
@@ -311,7 +318,7 @@ bridgeIndexer/
 │   │   └── db.rs                       # load_snapshot from Postgres
 │   ├── enrichment/                     # counterpart and status providers (Phase A)
 │   │   ├── mod.rs                      # EnrichmentProvider trait, EnrichInput, EnrichOutcome
-│   │   ├── wormholescan.rs             # WormholeScan: /operations VAA, then /global-tx destination tx
+│   │   ├── wormholescan.rs             # WormholeScan: /operations VAA, /global-tx destination tx, /vaas origin-tx fallback
 │   │   └── reenrich.rs                 # background pass over open rows and missing inbound origin txs
 │   ├── ingestion/                      # Solana WS listener + backfill, always on (A8)
 │   │   ├── solana.rs
@@ -478,8 +485,11 @@ Symbol and decimals come from one Helius `getAsset` per mint, cached per mint (2
   within `REENRICH_RETRY_SECS`, and rows older than `REENRICH_MAX_AGE_SECS` are given up
   on. The same pass then backfills the origin tx of `Completed` inbound rows whose
   `source_tx_hash` is still NULL, up to `REENRICH_BATCH` of them; `REENRICH_MAX_AGE_SECS`
-  does not apply to those, because the origin tx may become known at any time. A pass
-  ends early after three provider outages in a row.
+  does not apply to those, because the origin tx may become known at any time. When
+  `/operations` is empty or carries no source tx, the pass falls back to the message-key
+  `/vaas` record (`data.txHash`) and normalises the hash per chain (EVM gets `0x`); only
+  the missing origin fields are filled. A pass ends early after three provider outages in
+  a row.
 * **Helius token wait.** The API sheds a request after 2 s without a token (`Overloaded`, 503). Live workers wait up to `HELIUS_LIVE_TOKEN_WAIT_MS` (20 s) for the first token of a message, but that patience is no longer what keeps a burst out of the dead-letter stream: an `Overloaded` is transient, so the message stays pending and recovery redelivers it. The wait must stay well below the reclaim idle time (5 min), or a message would be reclaimed while it is still waiting.
 
 ## API
@@ -626,7 +636,7 @@ cargo test
   against WormholeScan (message key, chains, amount, token, destination wallet).
   Without the account they are asserted `Unsupported`.
 * Unit tests in `src/ingestion/backfill.rs`: no backfill without a checkpoint, only signatures newer than the checkpoint, stop at the checkpoint slot, failed transactions and entries without a slot or signature skipped, the `INGEST_BACKFILL_MAX` cap, and the empty page. The Redis dedupe has no automated test (no Redis container in the suite yet).
-* A7 in `tests/bridge_transfers_schema.rs`: a redeem is stored as one `Inbound`, `Completed` row with the redeem as destination tx and no origin tx, enrichment fills the origin tx and a later analysis without enrichment keeps it, a completed inbound row whose origin tx is still missing is due for the background backfill while one that learned it (and an outbound send) is not, and the repair migration turns rows stored like sends around (and leaves real sends alone). The source-wallet repair is covered there too: an inbound row with a wallet loses it and its cached analysis, an outbound row and an inbound row that is already NULL are untouched, and a second run is a no-op. In `tests/golden_fixtures.rs`, the captured redeems become `Completed` inbound transfers and the matched WormholeScan operation supplies exactly the origin tx WormholeScan reports. Unit tests in `src/services/detect.rs` cover the mapping, the origin tx rules (only for a matching operation, never overwritten, never for a send) and the legacy-path fix, and `src/domain/bridge_transfer.rs` the derived direction.
+* A7 in `tests/bridge_transfers_schema.rs`: a redeem is stored as one `Inbound`, `Completed` row with the redeem as destination tx and no origin tx, enrichment fills the origin tx and a later analysis without enrichment keeps it, a completed inbound row whose origin tx is still missing is due for the background backfill while one that learned it (and an outbound send) is not, and the repair migration turns rows stored like sends around (and leaves real sends alone). The source-wallet repair is covered there too: an inbound row with a wallet loses it and its cached analysis, an outbound row and an inbound row that is already NULL are untouched, and a second run is a no-op. In `tests/golden_fixtures.rs`, the captured redeems become `Completed` inbound transfers and the matched WormholeScan operation supplies exactly the origin tx WormholeScan reports. Unit tests in `src/services/detect.rs` cover the mapping, the origin tx rules (only for a matching operation, never overwritten, never for a send, EVM `0x` normalisation) and the legacy-path fix; unit tests in `src/enrichment/wormholescan.rs` cover the `/vaas` fallback (empty operations fill the origin, EVM hashes get `0x`, a VAA 404 leaves the row unchanged, a known origin is not asked for again), and `src/domain/bridge_transfer.rs` the derived direction.
 * `tests/persistence_idempotency.rs` — real Postgres 18 container (via `testcontainers`,
   needs Docker): redelivering the same transaction, the scenario `XAUTOCLAIM` recovery
   guarantees will happen, never produces a duplicate row in `transactions`,

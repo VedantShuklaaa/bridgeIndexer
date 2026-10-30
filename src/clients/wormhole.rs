@@ -54,6 +54,47 @@ pub async fn get_destination_tx(
     Ok(destination_tx_from_global_tx(&payload))
 }
 
+/// The origin tx of a message, keyed by its Wormhole message id. `/operations` is keyed
+/// by a transaction signature and does not know a redeem's Solana signature, but the VAA
+/// itself is keyed by the message and carries the tx that emitted it.
+pub async fn get_vaa_source_tx(
+    client: &Client,
+    base_url: &str,
+    id: &BridgeMessageId,
+) -> Result<Option<String>, AppError> {
+    let url = format!(
+        "{base_url}/api/v1/vaas/{}/{}/{}",
+        id.emitter_chain, id.emitter_address, id.sequence
+    );
+    let resp = client.get(&url).send().await?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(AppError::UpstreamProvider {
+            provider: "wormhole",
+            message: format!("status {}", resp.status()),
+            retryable: crate::clients::helius::status_is_retryable(resp.status()),
+        });
+    }
+
+    let payload: Value = resp.json().await?;
+    Ok(source_tx_from_vaa(&payload))
+}
+
+/// Pure: reads `data.txHash` from a `vaas` payload. EVM chains return bare hex here;
+/// `detect::apply_source_tx` adds the `0x` prefix from the chain registry.
+pub fn source_tx_from_vaa(payload: &Value) -> Option<String> {
+    payload
+        .get("data")?
+        .get("txHash")?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
 /// Pure: reads `destinationTx.txHash` from a `global-tx` payload.
 pub fn destination_tx_from_global_tx(payload: &Value) -> Option<String> {
     payload
@@ -85,6 +126,24 @@ mod tests {
             json!({"destinationTx": {"txHash": "  "}}),
         ] {
             assert_eq!(destination_tx_from_global_tx(&p), None);
+        }
+    }
+
+    #[test]
+    fn reads_the_vaa_source_tx() {
+        let p = json!({"data": {"txHash": "715b25c9bba7"}});
+        assert_eq!(source_tx_from_vaa(&p).as_deref(), Some("715b25c9bba7"));
+    }
+
+    #[test]
+    fn a_vaa_without_a_source_tx_is_none() {
+        for p in [
+            json!({}),
+            json!({"data": {}}),
+            json!({"data": {"txHash": ""}}),
+            json!({"data": {"txHash": "  "}}),
+        ] {
+            assert_eq!(source_tx_from_vaa(&p), None);
         }
     }
 }
