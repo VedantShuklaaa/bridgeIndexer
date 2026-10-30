@@ -620,3 +620,149 @@ Two runs per config. Fixtures are synthetic, so absolute numbers describe the
 fake upstream, not Helius. `R-mix` uses `--disable-keepalive` and is not
 comparable with `R-hit`. Earlier `R-mix` numbers are not comparable with these.
 
+
+## How to run the 3g list benchmarks
+
+`GET /api/v2/transfers` has no cache: every request goes to Postgres. The three
+workloads are first page, deep cursor page and filtered page. Each is run twice
+(run 1 cold, run 2 warm) and the two are kept separate; they are not averaged.
+
+1. Seed a throwaway database with one million rows. Never use production.
+
+   ```bash
+   docker run --rm -d --name bridge-seed-3g \
+     -e POSTGRES_USER=bridge -e POSTGRES_PASSWORD=bridge \
+     -e POSTGRES_DB=bridge_seed -p 55432:5432 postgres:18
+
+   SEED_DATABASE_URL='postgres://bridge:bridge@127.0.0.1:55432/bridge_seed' \
+     cargo run --release --bin seed_transfers -- --yes
+   ```
+
+   `src/bin/seed_transfers.rs` refuses without `--yes` and refuses when
+   `SEED_DATABASE_URL` equals `DATABASE_URL`. Here the database is local; for a
+   remote seed, change the host in `SEED_DATABASE_URL` only.
+
+2. Point the API server at the seeded database. On the API host:
+
+   ```bash
+   DATABASE_URL='postgres://bridge:bridge@127.0.0.1:55432/bridge_seed' \
+     INGEST_ENABLED=0 RUST_LOG=warn ./target/release/bridge
+   ```
+
+   `INGEST_ENABLED=0` stops the indexer from writing while the run is in flight.
+
+3. Build the deep cursor at about 80% depth. The cursor is the URL-safe,
+   unpadded base64 of `{"created_at":"<RFC3339>","id":<i64>}`. Run this on the
+   seeded database host:
+
+   ```bash
+   psql "$SEED_DATABASE_URL" -At -c \
+     "SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US'), id
+      FROM bridge_transfers
+      ORDER BY created_at DESC, id DESC OFFSET 800000 LIMIT 1" |
+   python3 -c '
+   import sys, json, base64
+   ts, row_id = sys.stdin.read().strip().split("|")
+   print(base64.urlsafe_b64encode(
+       json.dumps({"created_at": ts + "Z", "id": int(row_id)}).encode()
+   ).decode().rstrip("="))'
+   ```
+
+   Use the printed value as `DEEP_CURSOR`. A deep cursor page that returns zero
+   items is rejected by the script: pick an offset that leaves rows below it.
+
+4. Run the benchmark from the load generator:
+
+   ```bash
+   BASE_URL='http://<api-host>:8080' \
+   SERVER_SHA="$(git rev-parse --short HEAD)" \
+   INSTANCE_TYPE='m7i-flex.large' \
+   LOADGEN_INSTANCE='c7i.xlarge' \
+   DEEP_CURSOR='<from step 3>' \
+   COLD_START=yes \
+     scripts/bench_list.sh
+   ```
+
+   The script pre-checks all three URLs with curl, runs 50 connections for 30 s
+   per workload, and writes one JSON file per workload and run under
+   `bench-results/<timestamp>/`. It prints one markdown row per run with
+   req/s, median, p99 and the 2xx/4xx/5xx split. Success is 2xx only.
+
+   `COLD_START=yes` records that you made run 1 cold (API and Postgres restarted
+   or the database page cache dropped). If you did not, use `COLD_START=no` and
+   label the entry accordingly: without a restart, run 1 is not cold, and the
+   entry must say so.
+
+## 3g — `GET /api/v2/transfers` (2026-10-31, results pending)
+
+Do not fill any row until the maintainer's EC2 runs exist. Local plans are in
+`docs/3g-list-endpoint.md` and are synthetic; they are not results.
+
+### Hypothesis
+
+Keyset pagination over `(created_at DESC, id DESC)` with at most one extra
+index keeps all three workloads inside 300 req/s and p99 < 150 ms, limited by
+the server's Postgres round trips rather than by sorting or a sequential scan.
+
+### Workload
+
+| Name | Request |
+| --- | --- |
+| list-first | `GET /api/v2/transfers?limit=50` |
+| list-deep | `GET /api/v2/transfers?limit=50&cursor=<about 80% depth>` |
+| list-filtered | `GET /api/v2/transfers?direction=Inbound&status=Completed&chain=ethereum&limit=50` |
+
+### Setup
+
+- Server: EC2 `<instance type>`, git `<sha>`.
+- Load generator: EC2 `<instance type>`.
+- Database: 1,000,000 rows from `src/bin/seed_transfers.rs`, throwaway.
+- oha, 50 connections, 30 s per run, keep-alive on, two runs per workload
+  (cold and warm) kept separate.
+- No cache on the list path; every request reads Postgres.
+
+### Before
+
+There was no list endpoint, so there is no before measurement. The comparison
+is against the targets below, and against the query plans in
+`docs/3g-list-endpoint.md`.
+
+### After
+
+| Workload | Run | Connections | req/s | median (ms) | p99 (ms) | 2xx | 4xx | 5xx | non-2xx |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| list-first | cold | 50 |  |  |  |  |  |  |  |
+| list-first | warm | 50 |  |  |  |  |  |  |  |
+| list-deep | cold | 50 |  |  |  |  |  |  |  |
+| list-deep | warm | 50 |  |  |  |  |  |  |  |
+| list-filtered | cold | 50 |  |  |  |  |  |  |  |
+| list-filtered | warm | 50 |  |  |  |  |  |  |  |
+
+Targets, applied to every row: 300 req/s, p99 < 150 ms, 2xx only counted as
+success.
+
+### Delta
+
+| Workload | Target req/s | Achieved req/s | Target p99 (ms) | Achieved p99 (ms) | Met |
+| --- | ---: | ---: | ---: | ---: | --- |
+| list-first | 300 |  | 150 |  |  |
+| list-deep | 300 |  | 150 |  |  |
+| list-filtered | 300 |  | 150 |  |  |
+
+### Runs
+
+- `bench-results/<timestamp>/meta.txt` (SHA, instance types, cold_start)
+- `bench-results/<timestamp>/01-first-cold.json` … `06-filtered-warm.json`
+- `commands.txt` holds the exact oha invocations.
+
+### Limited by
+
+Fill in from the run: server CPU, Postgres CPU or I/O, connection pool
+saturation, network, or the load generator. Do not guess; say what was measured.
+
+### Notes
+
+- If any workload misses, state which and why, and stop. Do not add a cache or
+  tune past the target without asking.
+- The plans in `docs/3g-list-endpoint.md` are synthetic and local. Do not copy
+  their millisecond values into this entry.

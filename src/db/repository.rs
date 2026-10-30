@@ -5,7 +5,7 @@ use crate::domain::transaction::{Chain, NormalisedTransaction, TxStatus};
 use crate::protocols::{MessageId, amount::RawAmount};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{PgPool, Postgres, QueryBuilder, Row, Transaction};
 
 pub async fn persist_transaction(pool: &PgPool, tx: &NormalisedTransaction) -> anyhow::Result<()> {
     persist_analysis(pool, tx, &[]).await
@@ -765,4 +765,133 @@ pub async fn get_transaction_with_transfers(
         transaction,
         transfers,
     }))
+}
+
+/// Filters and keyset position for [`list_transfers`]. Every `Option` is an omitted
+/// query parameter; the caller has already validated enum-like values.
+#[derive(Debug, Clone, Default)]
+pub struct TransferListQuery {
+    pub limit: i64,
+    /// Exclusive position: only rows strictly older than this `(created_at, id)` pair.
+    pub cursor: Option<(DateTime<Utc>, i64)>,
+    pub protocol: Option<String>,
+    pub direction: Option<String>,
+    pub status: Option<String>,
+    /// A resolved `chains.id`, matched against source or destination.
+    pub chain_id: Option<i16>,
+    pub token: Option<String>,
+    /// Inclusive lower bound on `created_at`.
+    pub from: Option<DateTime<Utc>>,
+    /// Exclusive upper bound on `created_at`.
+    pub to: Option<DateTime<Utc>>,
+}
+
+/// One row of the list, with the keyset columns the cursor is built from.
+pub struct ListedTransfer {
+    pub id: i64,
+    pub created_at: DateTime<Utc>,
+    pub transfer: StoredTransfer,
+}
+
+const LIST_SELECT: &str = r#"
+SELECT b.id, b.created_at,
+       b.protocol, b.direction, b.observed_tx_hash, b.event_index,
+       b.via, b.via_ref,
+       b.source_ref_protocol, b.source_ref_id, b.source_tx_hash,
+       b.source_wallet, b.source_explorer_url,
+       b.destination_ref_protocol, b.destination_ref_id, b.destination_wallet,
+       b.destination_tx_hash, b.destination_explorer_url,
+       b.token_ref_protocol, b.token_ref_id, b.token, b.token_symbol,
+       b.amount::text AS amount, b.amount_formatted,
+       b.status AS transfer_status,
+       w.emitter_chain, w.emitter_address, w.sequence::text AS sequence
+FROM bridge_transfers b
+LEFT JOIN wormhole_messages w ON w.transfer_id = b.id
+WHERE TRUE
+"#;
+
+/// One keyset page, newest first. Fetches `limit + 1` rows so the caller can tell
+/// whether another page exists without a count or an extra query.
+pub async fn list_transfers(
+    pool: &PgPool,
+    query: &TransferListQuery,
+) -> Result<Vec<ListedTransfer>> {
+    let mut sql = QueryBuilder::<Postgres>::new(LIST_SELECT);
+
+    if let Some((created_at, id)) = query.cursor {
+        sql.push(" AND (b.created_at, b.id) < (")
+            .push_bind(created_at)
+            .push(", ")
+            .push_bind(id)
+            .push(")");
+    }
+    if let Some(protocol) = &query.protocol {
+        sql.push(" AND b.protocol = ").push_bind(protocol.clone());
+    }
+    if let Some(direction) = &query.direction {
+        sql.push(" AND b.direction = ").push_bind(direction.clone());
+    }
+    if let Some(status) = &query.status {
+        sql.push(" AND b.status = ").push_bind(status.clone());
+    }
+    if let Some(chain_id) = query.chain_id {
+        sql.push(" AND (b.source_chain_id = ")
+            .push_bind(chain_id)
+            .push(" OR b.destination_chain_id = ")
+            .push_bind(chain_id)
+            .push(")");
+    }
+    if let Some(token) = &query.token {
+        sql.push(" AND b.token = ").push_bind(token.clone());
+    }
+    if let Some(from) = query.from {
+        sql.push(" AND b.created_at >= ").push_bind(from);
+    }
+    if let Some(to) = query.to {
+        sql.push(" AND b.created_at < ").push_bind(to);
+    }
+
+    sql.push(" ORDER BY b.created_at DESC, b.id DESC LIMIT ")
+        .push_bind(query.limit + 1);
+
+    let rows = sql.build().fetch_all(pool).await?;
+
+    let mut listed = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let transfer = StoredTransfer {
+            protocol: row.try_get("protocol")?,
+            direction: row.try_get("direction")?,
+            observed_tx_hash: row.try_get("observed_tx_hash")?,
+            event_index: row.try_get("event_index")?,
+            via: row.try_get("via")?,
+            via_ref: row.try_get("via_ref")?,
+            source_ref_protocol: row.try_get("source_ref_protocol")?,
+            source_ref_id: row.try_get("source_ref_id")?,
+            source_tx_hash: row.try_get("source_tx_hash")?,
+            source_wallet: row.try_get("source_wallet")?,
+            source_explorer_url: row.try_get("source_explorer_url")?,
+            destination_ref_protocol: row.try_get("destination_ref_protocol")?,
+            destination_ref_id: row.try_get("destination_ref_id")?,
+            destination_wallet: row.try_get("destination_wallet")?,
+            destination_tx_hash: row.try_get("destination_tx_hash")?,
+            destination_explorer_url: row.try_get("destination_explorer_url")?,
+            token_ref_protocol: row.try_get("token_ref_protocol")?,
+            token_ref_id: row.try_get("token_ref_id")?,
+            token: row.try_get("token")?,
+            token_symbol: row.try_get("token_symbol")?,
+            amount: row.try_get("amount")?,
+            amount_formatted: row.try_get("amount_formatted")?,
+            status: row.try_get("transfer_status")?,
+            emitter_chain: row.try_get("emitter_chain")?,
+            emitter_address: row.try_get("emitter_address")?,
+            sequence: row.try_get("sequence")?,
+        };
+        listed.push(ListedTransfer {
+            id: row.try_get("id")?,
+            created_at: row.try_get("created_at")?,
+            transfer,
+        });
+    }
+
+    Ok(listed)
 }
