@@ -789,9 +789,9 @@ Known suspects, most likely first:
 1. Checkpoint is slot-granular and backfill stops at `slot <= checkpoint`, so other transactions in the checkpoint's slot are lost on any reconnect
 2. Backfill runs before the read loop with a 150 ms sleep per signature, so live notifications queue up behind it
 3. No keepalive or watchdog: a silently dead socket produces neither errors nor data
-4. A rejected `logsSubscribe` is swallowed (the check is unreachable), and any publish error tears down the connection
-5. The ingester is not under `spawn_supervised`, so a panic stops it permanently
-6. The checkpoint is written on every message and can move backwards on out-of-order slots
+4. ~~A rejected `logsSubscribe` is swallowed (the check is unreachable)~~ — fixed in 4e: the reply is awaited before the read loop and a rejection or timeout is a failed connection. Any publish error still tears down the connection
+5. ~~The ingester is not under `spawn_supervised`, so a panic stops it permanently~~ — already handled by A8; the ingester starts under `spawn_supervised`
+6. ~~The checkpoint is written on every message and can move backwards on out-of-order slots~~ — fixed in 4e: the upsert uses `GREATEST`, so it only moves forward
 
 Work items:
 
@@ -799,7 +799,7 @@ Work items:
 * \[ ] 4b. Rewind the checkpoint a few slots on reconnect and dedupe by signature (persistence is already idempotent)
 * \[ ] 4c. Backfill as a separate task, concurrent with live reads
 * \[ ] 4d. Ping/pong keepalive and a no-message watchdog that forces a reconnect
-* \[ ] 4e. Surface subscribe errors, supervise the ingester, `GREATEST` on the checkpoint
+* \[x] 4e. Surface subscribe errors, supervise the ingester, `GREATEST` on the checkpoint. Supervision was already in place from A8; subscribe replies are awaited and surfaced, and the checkpoint upsert is monotonic
 * \[ ] 4f. Periodic reconciliation poll as a completeness guarantee: WebSocket is the low-latency path, polling is the safety net
 * \[ ] 4g. Evaluate Helius' other streaming options against current docs before building anything custom
 
