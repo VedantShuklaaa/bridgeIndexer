@@ -285,11 +285,15 @@ pub async fn get_last_ingested_slot(pool: &PgPool, chain: &str) -> Result<u64> {
     Ok(value.map(|v| v.parse()).transpose()?.unwrap_or(0))
 }
 
+/// Records the newest slot ingested for `chain`. The checkpoint only moves forward: log
+/// notifications can arrive out of slot order, and rewinding would make the next backfill
+/// replay (or skip past) work that was already done.
 pub async fn set_last_ingested_slot(pool: &PgPool, chain: &str, slot: u64) -> Result<()> {
     let key = format!("{chain}_last_ingested_slot");
     sqlx::query(
         "INSERT INTO indexer_state (key, value) VALUES ($1, $2)
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+         ON CONFLICT (key) DO UPDATE
+         SET value = GREATEST(indexer_state.value::bigint, EXCLUDED.value::bigint)::text",
     )
     .bind(&key)
     .bind(slot.to_string())
