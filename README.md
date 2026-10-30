@@ -143,6 +143,13 @@ Implemented so far:
   `Inbound` with the redeem as destination tx and `Completed`, and its cached analysis is
   dropped so the next read rebuilds it. There is no down migration: snapshot the database
   before deploying.
+* The inbound source-wallet repair (`20261030120000_repair_inbound_source_wallet.sql`)
+  clears `source_wallet` on `Inbound` rows written by the old WormholeScan fallback, which
+  stored the redeem tx's Solana signer there; a redeem's sender is on the origin chain, so
+  an inbound row has no Solana source wallet. The cached `analysis` is dropped so the next
+  read rebuilds it. Outbound rows and inbound rows that are already NULL are untouched, and
+  a second run matches nothing. There is no down migration: snapshot the database before
+  deploying.
 * The A2 migration (`20261018120000_generalise_bridge_transfers.sql`) rewrites existing
   rows in place: every legacy row becomes `protocol = 'wormhole'`, `direction = 'Outbound'`,
   with the same message key `MessageId::key()` builds. Chains are stored as the protocol's
@@ -254,7 +261,8 @@ bridgeIndexer/
 │   ├── 20261002150000_analysis_and_read_indexes.sql
 │   ├── 20261017090000_chain_registry.sql
 │   ├── 20261018120000_generalise_bridge_transfers.sql
-│   └── 20261024120000_repair_inbound_rows.sql  # redeems stored like sends become inbound (A7)
+│   ├── 20261024120000_repair_inbound_rows.sql  # redeems stored like sends become inbound (A7)
+│   └── 20261030120000_repair_inbound_source_wallet.sql  # inbound rows lose the Solana source wallet
 ├── scripts/
 │   └── capture_fixtures.sh             # save Helius + WormholeScan fixtures (Phase 0)
 ├── src/
@@ -595,7 +603,7 @@ cargo test
   against WormholeScan (message key, chains, amount, token, destination wallet).
   Without the account they are asserted `Unsupported`.
 * Unit tests in `src/ingestion/backfill.rs`: no backfill without a checkpoint, only signatures newer than the checkpoint, stop at the checkpoint slot, failed transactions and entries without a slot or signature skipped, the `INGEST_BACKFILL_MAX` cap, and the empty page. The Redis dedupe has no automated test (no Redis container in the suite yet).
-* A7 in `tests/bridge_transfers_schema.rs`: a redeem is stored as one `Inbound`, `Completed` row with the redeem as destination tx and no origin tx, enrichment fills the origin tx and a later analysis without enrichment keeps it, and the repair migration turns rows stored like sends around (and leaves real sends alone). In `tests/golden_fixtures.rs`, the captured redeems become `Completed` inbound transfers and the matched WormholeScan operation supplies exactly the origin tx WormholeScan reports. Unit tests in `src/services/detect.rs` cover the mapping, the origin tx rules (only for a matching operation, never overwritten, never for a send) and the legacy-path fix, and `src/domain/bridge_transfer.rs` the derived direction.
+* A7 in `tests/bridge_transfers_schema.rs`: a redeem is stored as one `Inbound`, `Completed` row with the redeem as destination tx and no origin tx, enrichment fills the origin tx and a later analysis without enrichment keeps it, and the repair migration turns rows stored like sends around (and leaves real sends alone). The source-wallet repair is covered there too: an inbound row with a wallet loses it and its cached analysis, an outbound row and an inbound row that is already NULL are untouched, and a second run is a no-op. In `tests/golden_fixtures.rs`, the captured redeems become `Completed` inbound transfers and the matched WormholeScan operation supplies exactly the origin tx WormholeScan reports. Unit tests in `src/services/detect.rs` cover the mapping, the origin tx rules (only for a matching operation, never overwritten, never for a send) and the legacy-path fix, and `src/domain/bridge_transfer.rs` the derived direction.
 * `tests/persistence_idempotency.rs` — real Postgres 18 container (via `testcontainers`,
   needs Docker): redelivering the same transaction, the scenario `XAUTOCLAIM` recovery
   guarantees will happen, never produces a duplicate row in `transactions`,

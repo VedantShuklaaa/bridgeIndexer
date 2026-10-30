@@ -12,6 +12,8 @@ use sqlx::PgPool;
 const A2: i64 = 20261018120000;
 /// The A7 repair of redeems that were stored like sends.
 const A7: i64 = 20261024120000;
+/// The repair of inbound rows that stored the Solana redeemer as `source_wallet`.
+const REPAIR_INBOUND_SOURCE_WALLET: i64 = 20261030120000;
 
 async fn sql_resolve(pool: &PgPool, protocol: &str, id: &str) -> Option<i16> {
     sqlx::query_scalar("SELECT resolve_chain($1, $2)")
@@ -613,4 +615,108 @@ async fn redeems_stored_like_sends_are_turned_around_by_the_repair() {
         assert_eq!(row.4, "Pending", "{hash}");
         assert!(row.5.is_some(), "{hash}: analysis untouched");
     }
+}
+
+/// (observed tx, direction, source wallet, analysis, updated_at) for every row.
+type Snapshot = Vec<(
+    String,
+    String,
+    Option<String>,
+    Option<serde_json::Value>,
+    String,
+)>;
+
+async fn snapshot(pool: &PgPool) -> Snapshot {
+    sqlx::query_as(
+        "SELECT observed_tx_hash, direction, source_wallet, analysis, updated_at::text
+         FROM bridge_transfers ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn the_source_wallet_repair_clears_inbound_rows_only_and_is_idempotent() {
+    let db = common::empty_db().await;
+    let pool = &db.pool;
+    common::migrate_before(pool, REPAIR_INBOUND_SOURCE_WALLET).await;
+
+    // (hash, direction, source tx, source wallet): as the WormholeScan fallback wrote them,
+    // a redeem stored with the Solana signer of the redeem tx as its source wallet.
+    let rows: [(&str, &str, Option<&str>, Option<&str>); 3] = [
+        ("redeem-bad", "Inbound", None, Some("SolanaRedeemer")),
+        (
+            "send-good",
+            "Outbound",
+            Some("send-good"),
+            Some("SolanaSender"),
+        ),
+        ("redeem-clean", "Inbound", None, None),
+    ];
+    for (i, (hash, direction, source_tx, source_wallet)) in rows.iter().enumerate() {
+        let transaction_id: i64 = sqlx::query_scalar(
+            "INSERT INTO transactions (hash, chain, status, slot, fee_lamports)
+             VALUES ($1, 1, 'Success', 1, 5000) RETURNING id",
+        )
+        .bind(hash)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO bridge_transfers
+                 (transaction_id, protocol, message_key, direction, observed_tx_hash,
+                  source_tx_hash, source_wallet, source_ref_protocol, source_ref_id,
+                  destination_ref_protocol, destination_ref_id, status, analysis)
+             VALUES ($1, 'wormhole', $2, $3, $4, $5, $6, 'wormhole', '2',
+                     'wormhole', '1', 'Completed', '{\"cached\": true}')",
+        )
+        .bind(transaction_id)
+        .bind(format!("2/aa/{i}"))
+        .bind(direction)
+        .bind(hash)
+        .bind(source_tx)
+        .bind(source_wallet)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    common::migrate_all(pool).await;
+
+    let after_first = snapshot(pool).await;
+    assert_eq!(after_first.len(), 3, "no row may be lost");
+
+    let bad = &after_first[0];
+    assert_eq!(bad.0, "redeem-bad");
+    assert_eq!(bad.1, "Inbound");
+    assert_eq!(bad.2, None, "the Solana redeemer is not an origin sender");
+    assert_eq!(bad.3, None, "the stale cached analysis is dropped");
+
+    let send = &after_first[1];
+    assert_eq!(send.1, "Outbound");
+    assert_eq!(
+        send.2.as_deref(),
+        Some("SolanaSender"),
+        "an outbound row keeps its source wallet"
+    );
+    assert!(send.3.is_some(), "an outbound row keeps its analysis");
+
+    let clean = &after_first[2];
+    assert_eq!(clean.1, "Inbound");
+    assert_eq!(clean.2, None);
+    assert!(
+        clean.3.is_some(),
+        "an inbound row that is already NULL is untouched"
+    );
+
+    // The second run matches no row: same values, and no row's updated_at moves.
+    sqlx::query(include_str!(
+        "../migrations/20261030120000_repair_inbound_source_wallet.sql"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_eq!(snapshot(pool).await, after_first, "a second run is a no-op");
 }
