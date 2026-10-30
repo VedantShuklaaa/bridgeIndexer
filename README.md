@@ -508,7 +508,8 @@ cp .env.example .env   # fill in RPC URLs and the bridge program address
 cargo run
 ```
 
-Migrations run on startup.
+Migrations run on startup. They are embedded at compile time (`sqlx::migrate!`),
+so a change that touches only files under `migrations/` now forces a rebuild.
 
 ### Replay against WormholeScan
 
@@ -794,7 +795,7 @@ Known suspects, most likely first:
 
 Work items:
 
-* \[ ] 4a. `reconcile` bin: per-program recall, classification precision, and baseline over 24 h. The bin and its pure tests are built; the 24 h baseline is the remaining exit criterion
+* \[x] 4a. `reconcile` bin: per-program recall, classification precision, and baseline over 24 h. The bin and its pure tests are built; the 24 h baseline is recorded in [Phase 4 — stream](#phase-4--stream)
 * \[ ] 4b. Rewind the checkpoint a few slots on reconnect and dedupe by signature (persistence is already idempotent)
 * \[ ] 4c. Backfill as a separate task, concurrent with live reads
 * \[ ] 4d. Ping/pong keepalive and a no-message watchdog that forces a reconnect
@@ -1049,9 +1050,14 @@ control is one pass each. Methodology:
 | Version | Change | Program | `S-recall` | `S-precision` | Missed | p99 lag |
 | --- | --- | --- | --- | --- | --- | --- |
 | v0 | baseline | — | — | — | — | — |
-| | | | | | | |
+| ee1a2a6 | 24 h baseline | Token Bridge | 100% (1101/1101) | 50/50 (39 `both_completed`, 11 `both_open`) | 0 | 5092 s |
 
-The `v0` row is filled in after the 24 h baseline: run
-`cargo run --bin reconcile -- --window-hours 24 --json` for `S-recall`, missed and
-p99 lag, then a run with `--precision-sample 200` for `S-precision`. Both runs
-write nothing.
+**24 h baseline, `ee1a2a6`.** Window `2026-10-29T10:06Z` to `2026-10-30T09:06Z`
+(23 h) on EC2, Token Bridge program: 1101 of 1101 successful signatures
+persisted, 0 missed (recall 100%). 45 failed signatures were excluded. Precision
+was 50/50 against WormholeScan. Ingestion lag p50 1 s, p99 5092 s, max 5463 s.
+
+The p99 comes from a planned 91-minute service stop (07:13 to 08:44 UTC on
+Oct 30) that the restart's backfill recovered, which is why it is not counted as
+missed. Every other hour of the window was fully live: rows were stored under
+60 s after block time.
