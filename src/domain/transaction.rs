@@ -44,12 +44,39 @@ impl Chain {
             _ => None,
         }
     }
+
+    /// The inverse of [`Chain::wormhole_id`] for the chains this enum knows.
+    pub fn from_wormhole_id(id: u16) -> Option<Self> {
+        match id {
+            1 => Some(Chain::Solana),
+            2 => Some(Chain::Ethereum),
+            4 => Some(Chain::Bsc),
+            5 => Some(Chain::Polygon),
+            6 => Some(Chain::Avalanche),
+            23 => Some(Chain::Arbitrum),
+            24 => Some(Chain::Optimism),
+            25 => Some(Chain::Gnosis),
+            30 => Some(Chain::Base),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum TxStatus {
     Success,
     Failed,
+}
+
+impl TxStatus {
+    /// Rebuilds the enum from the label stored in `transactions.status`.
+    pub fn parse(label: &str) -> Option<Self> {
+        match label {
+            "Success" => Some(Self::Success),
+            "Failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

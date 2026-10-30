@@ -273,7 +273,8 @@ bridgeIndexer/
 │   ├── 20261018120000_generalise_bridge_transfers.sql
 │   ├── 20261024120000_repair_inbound_rows.sql  # redeems stored like sends become inbound (A7)
 │   ├── 20261030120000_repair_inbound_source_wallet.sql  # inbound rows lose the Solana source wallet
-│   └── 20261030130000_index_missing_origin.sql  # partial index for the origin-tx backfill (A7)
+│   ├── 20261030130000_index_missing_origin.sql  # partial index for the origin-tx backfill (A7)
+│   └── 20261030140000_origin_attempt_marker.sql  # backfill attempt marker and rotated index (A7)
 ├── scripts/
 │   └── capture_fixtures.sh             # save Helius + WormholeScan fixtures (Phase 0)
 ├── src/
@@ -484,12 +485,17 @@ Symbol and decimals come from one Helius `getAsset` per mint, cached per mint (2
   `REENRICH_MIN_AGE_SECS` are left to the normal pipeline, a row is not asked again
   within `REENRICH_RETRY_SECS`, and rows older than `REENRICH_MAX_AGE_SECS` are given up
   on. The same pass then backfills the origin tx of `Completed` inbound rows whose
-  `source_tx_hash` is still NULL, up to `REENRICH_BATCH` of them; `REENRICH_MAX_AGE_SECS`
-  does not apply to those, because the origin tx may become known at any time. When
-  `/operations` is empty or carries no source tx, the pass falls back to the message-key
-  `/vaas` record (`data.txHash`) and normalises the hash per chain (EVM gets `0x`); only
-  the missing origin fields are filled. A pass ends early after three provider outages in
-  a row.
+  `source_tx_hash` is still NULL. `REENRICH_ORIGIN_SHARE` (40% by default) reserves that
+  share of each `REENRICH_BATCH` for the backfill, so a backlog of open rows cannot
+  starve it; `REENRICH_MAX_AGE_SECS` does not apply to those, because the origin tx may
+  become known at any time. The backfill records `last_enrich_attempt_at` for every
+  attempt, whatever the outcome (including a provider outage), and orders by it NULLS
+  FIRST, so the queue rotates instead of re-selecting the same rows forever. A row whose
+  cached `analysis` a repair migration dropped is rebuilt from its stored columns before
+  enrichment. When `/operations` is empty or carries no source tx, the pass falls back
+  to the message-key `/vaas` record (`data.txHash`) and normalises the hash per chain
+  (EVM gets `0x`); only the missing origin fields are filled. A pass ends early after
+  three provider outages in a row.
 * **Helius token wait.** The API sheds a request after 2 s without a token (`Overloaded`, 503). Live workers wait up to `HELIUS_LIVE_TOKEN_WAIT_MS` (20 s) for the first token of a message, but that patience is no longer what keeps a burst out of the dead-letter stream: an `Overloaded` is transient, so the message stays pending and recovery redelivers it. The wait must stay well below the reclaim idle time (5 min), or a message would be reclaimed while it is still waiting.
 
 ## API
@@ -600,9 +606,11 @@ and compares their status with WormholeScan, reusing the replay comparison.
   registry reloads from Postgres, so a manual `INSERT` or `UPDATE` takes effect without a restart.
 * Re-enrichment (all optional): `REENRICH_ENABLED` (default on, `0` disables),
   `REENRICH_INTERVAL_SECS` (30), `REENRICH_BATCH` (50), `REENRICH_MIN_AGE_SECS` (60),
-  `REENRICH_RETRY_SECS` (120) and `REENRICH_MAX_AGE_SECS` (7 days). The pass also fills
-  missing origin txs of completed inbound rows, up to `REENRICH_BATCH` in addition to the
-  open rows; `REENRICH_MAX_AGE_SECS` does not bound those.
+  `REENRICH_RETRY_SECS` (120), `REENRICH_MAX_AGE_SECS` (7 days) and
+  `REENRICH_ORIGIN_SHARE` (40, the percent of each batch reserved for the missing-origin
+  backfill; `0` disables the reservation, `100` gives the whole batch to it). The pass
+  also fills missing origin txs of completed inbound rows; `REENRICH_MAX_AGE_SECS` does
+  not bound those, and the retry window uses `last_enrich_attempt_at`.
 * `GET /health` reports `status` (`ok` or `degraded`), `postgres_ok`, `redis_ok`,
   `ingest_age_secs`, `stream_lag` and `stream_pending` (from `XINFO GROUPS
   bridge:transactions`), and `dead_letter_len` (`XLEN bridge:transactions:failed`).
@@ -676,7 +684,13 @@ cargo test
   and the re-enrichment decision (advanced, unchanged but persisted, unreachable provider
   persists nothing). The due-rows queries are covered in `tests/bridge_transfers_schema.rs`:
   a completed inbound row without an origin tx is due, the retry window and a learned
-  origin tx take it out of the queue, and an outbound send stays on the open queue.
+  origin tx take it out of the queue, and an outbound send stays on the open queue. The
+  same file covers queue rotation (more due rows than a batch are all attempted by
+  successive passes, and an attempted row stays out of the retry window) and a repaired
+  row whose cached analysis was dropped being rebuilt from its stored columns.
+  `tests/reenrich_backfill.rs` runs the pass against the fake upstream: a twenty-row open
+  backlog still leaves half of a six-row batch to the backfill, and the next pass reaches
+  the remaining origin rows.
 
 ***
 
@@ -727,7 +741,7 @@ only real adapter. Phases B and later add one protocol each.
 * \[ ] A4. All Wormhole programs on Solana, not only the Token Bridge (Token Bridge, NTT and others, each after its program ID and layouts are verified against official docs or source). One `logsSubscribe` per program ID, since `mentions` accepts a single address, with a checkpoint per program. `SOLANA_TOKEN_BRIDGE_PROGRAM` is replaced by a configured list
 * \[x] A5. Chain-first detection: a transfer is persisted as `Detected` from Helius data alone. WormholeScan is an enrichment that fills the status and no longer gates persistence. Done for Wormhole outbound in `analyse_tx` (`services::detect`), cross-checked against the on-chain message ID. Done (A5b): the destination tx fix, the WormholeScan lookups behind an `EnrichmentProvider` in `enrichment/`, and a background re-enrichment pass (`enrichment::reenrich`) that moves `Detected` and `Pending` rows forward and backfills missing inbound origin txs. Several transfers per tx are decoded but only the first is stored until the v2 model
 * \[ ] A6. Composition: one transfer per message identity, the outer protocol or router recorded as `via`, and a test that an outer and an underlying adapter seeing the same tx produce one row... Partly done (#3): `compose()` with unit tests. The end-to-end outer+underlying test waits for a second adapter
-* \[x] A7. Direction: Solana-outbound sends and Solana-inbound redeems both indexed. Done: `analyse_tx` stores redeems as `Inbound` rows (`Completed` at detection, the redeem tx as destination tx, `source_tx_hash` NULL until WormholeScan's matched operation names it), `source_tx_hash` is nullable in `/api/v1`, and a migration repairs redeems the old path stored like sends. The re-enrichment pass now also revisits completed inbound rows whose origin tx is still NULL, so it is filled once WormholeScan names it without waiting for another `/analyse` (served by the partial index `idx_bt_missing_origin`)
+* \[x] A7. Direction: Solana-outbound sends and Solana-inbound redeems both indexed. Done: `analyse_tx` stores redeems as `Inbound` rows (`Completed` at detection, the redeem tx as destination tx, `source_tx_hash` NULL until WormholeScan's matched operation names it), `source_tx_hash` is nullable in `/api/v1`, and a migration repairs redeems the old path stored like sends. The re-enrichment pass now also revisits completed inbound rows whose origin tx is still NULL, so it is filled once WormholeScan names it without waiting for another `/analyse` (served by the partial index `idx_bt_missing_origin`). The backfill records every attempt in `last_enrich_attempt_at`, orders by it NULLS FIRST, keeps a guaranteed share of each batch (`REENRICH_ORIGIN_SHARE`) and rebuilds rows whose cached analysis a repair migration dropped
 * \[x] A8. Ingestion is always on, in this phase and every later one, and no longer tied to `/stream` clients, so the database is a complete record of what the programs emitted. Done: the ingester starts with the process under `spawn_supervised`, `on_demand` and the `/stream` client counter are gone, and the Helius spend is bounded by an ingestion budget: backfill on by default but skipped without a checkpoint, capped at `INGEST_BACKFILL_MAX` signatures and paced by `INGEST_BACKFILL_PACE_MS`, and a Redis `SET NX EX` dedupe so a signature seen by both the backfill and the live feed (or twice after a reconnect) is published once. Workers still read through the live Helius limiter (4/s on the free plan), so a burst queues in the Redis stream instead of being dropped. A real per-key budget comes with the provider lanes (1c)
 * \[x] A9. Fixtures captured from real txs (outbound, inbound, admin/attest rejected, unsupported variant) and golden tests per adapter. Inbound fixtures also carry the captured posted VAA account (`account_<name>_vaa.json`), and the golden tests decode redeems from it (A1b)
 * \[x] A10. API versioning: `/api/v2` serves the generalised model (protocol, direction, via, chain references, all transfers of a tx). `/api/v1` keeps its current Wormhole-shaped response through a compatibility mapper until it is retired. Amounts are stored as `NUMERIC` so volume can be aggregated. Done: `/api/v2/transactions/analyse` reads every stored transfer of a tx with raw and resolved chain references, and `/api/v1` is the compatibility mapper over the same response, pinned byte for byte by fixture snapshots; the WebSocket stream is unchanged. Every decoded transfer is persisted with its `event_index`

@@ -5,9 +5,10 @@ mod common;
 
 use bridge::chains::{ChainRegistry, RawChainRef};
 use bridge::db::repository::{
-    list_missing_origin_transfers, list_open_transfers, persist_transaction,
+    list_missing_origin_transfers, list_open_transfers, persist_transaction, record_origin_attempt,
 };
 use bridge::domain::bridge_transfer::{BridgeStatus, ChainId};
+use bridge::domain::transaction::{Chain, TxStatus};
 use sqlx::PgPool;
 
 /// The A2 migration. Everything older is the schema existing rows were written under.
@@ -541,11 +542,19 @@ async fn a_completed_inbound_row_without_an_origin_tx_is_due_for_origin_backfill
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].observed_tx_hash, "sig-origin-missing");
 
-    // The attempt was just now, so the retry window keeps it out of the next pass.
+    // The attempt was just now, so the retry window keeps it out of the next pass even
+    // though the attempt itself wrote nothing but the marker.
+    record_origin_attempt(pool, due[0].id).await.unwrap();
     let due = list_missing_origin_transfers(pool, 0, 3600, 10)
         .await
         .unwrap();
     assert!(due.is_empty());
+
+    // Once the window passes the row is due again: an unresolvable origin is retried,
+    // not dropped.
+    let due = list_missing_origin_transfers(pool, 0, 0, 10).await.unwrap();
+    assert_eq!(due.len(), 1);
+    record_origin_attempt(pool, due[0].id).await.unwrap();
 
     // Once enrichment knows the origin tx the row leaves the queue.
     persist_transaction(
@@ -568,6 +577,87 @@ async fn a_completed_inbound_row_without_an_origin_tx_is_due_for_origin_backfill
     assert!(open.iter().any(|row| row.observed_tx_hash == "sig-send"));
     let due = list_missing_origin_transfers(pool, 0, 0, 10).await.unwrap();
     assert!(due.is_empty());
+}
+
+#[tokio::test]
+async fn successive_passes_cover_every_missing_origin_row() {
+    let db = common::test_db().await;
+    let pool = &db.pool;
+
+    for index in 0..7u64 {
+        persist_transaction(
+            pool,
+            &common::sample_redeem_tx(
+                &format!("sig-origin-{index}"),
+                100 + index,
+                ChainId::Ethereum,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    // More due rows than the batch: each pass attempts the oldest-attempted rows first
+    // and records the attempt, so the next pass moves on instead of re-selecting them.
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..3 {
+        let due = list_missing_origin_transfers(pool, 0, 3600, 3)
+            .await
+            .unwrap();
+        assert!(due.len() <= 3, "the batch limit is respected");
+        for row in due {
+            assert!(
+                seen.insert(row.observed_tx_hash.clone()),
+                "{} was selected twice inside the retry window",
+                row.observed_tx_hash
+            );
+            record_origin_attempt(pool, row.id).await.unwrap();
+        }
+    }
+
+    assert_eq!(seen.len(), 7, "three passes of three covered every row");
+    let due = list_missing_origin_transfers(pool, 0, 3600, 3)
+        .await
+        .unwrap();
+    assert!(due.is_empty(), "the retry window holds every attempted row");
+}
+
+#[tokio::test]
+async fn a_repaired_row_without_its_cached_analysis_is_rebuilt_for_backfill() {
+    let db = common::test_db().await;
+    let pool = &db.pool;
+
+    persist_transaction(
+        pool,
+        &common::sample_redeem_tx("sig-repaired", 11, ChainId::Ethereum, None),
+    )
+    .await
+    .unwrap();
+    // What the A7 repair migrations left behind: the cached analysis was dropped.
+    sqlx::query("UPDATE bridge_transfers SET analysis = NULL")
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let due = list_missing_origin_transfers(pool, 0, 0, 10).await.unwrap();
+    assert_eq!(due.len(), 1, "a row without analysis is still due");
+    let row = due.into_iter().next().unwrap();
+    let tx = row
+        .transaction()
+        .expect("the transaction is rebuilt from the stored row");
+
+    assert_eq!(tx.hash, "sig-repaired");
+    assert!(matches!(tx.chain, Chain::Solana));
+    assert!(matches!(tx.status, TxStatus::Success));
+    let transfer = tx.bridge_transfer.expect("the transfer is rebuilt");
+    assert_eq!(transfer.source_chain, ChainId::Ethereum);
+    assert_eq!(transfer.destination_chain, ChainId::Solana);
+    assert_eq!(transfer.source_tx_hash, None);
+    assert_eq!(transfer.message_id.emitter_chain, 2);
+    assert_eq!(transfer.message_id.emitter_address, "emitter-addr");
+    assert_eq!(transfer.message_id.sequence, 11);
+    assert!(matches!(transfer.status, BridgeStatus::Completed));
 }
 
 #[tokio::test]

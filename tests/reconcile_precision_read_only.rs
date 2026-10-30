@@ -88,6 +88,7 @@ fn test_config(database_url: &str, upstream_url: &str) -> AppConfig {
             min_age_secs: 0,
             retry_secs: 0,
             max_age_secs: 1,
+            origin_share_percent: 40,
         },
         worker: WorkerConfig {
             max_deliveries: 10,

@@ -8,17 +8,22 @@
 //! A redeem is stored `Completed` at detection; WormholeScan's matched operation fills
 //! `source_tx_hash` when it learns it, and that can be after the first analysis. Those
 //! rows get no `max_age_secs`: the origin tx may become known at any time, and without
-//! the backfill the row would stay incomplete forever.
+//! the backfill the row would stay incomplete forever. The backfill keeps a guaranteed
+//! share of the batch (`REENRICH_ORIGIN_SHARE`) so open rows cannot starve it.
 //!
-//! `updated_at` doubles as the last-attempt marker: every answered attempt is persisted,
-//! which bumps it, so a row is not asked again before `retry_secs` have passed. An
-//! attempt where the provider was unreachable persists nothing and the row stays first
-//! in line. The upsert never moves a status backwards.
+//! `last_enrich_attempt_at` is the backfill's last-attempt marker. It is written for
+//! every attempt, including an unreachable provider and an unchanged outcome, so the
+//! row moves out of the retry window and the queue rotates. It starts NULL, so rows
+//! whose cached analysis a repair migration dropped are tried first; the transaction is
+//! rebuilt from the stored row before enrichment. Open rows still use `updated_at`,
+//! which every answered attempt bumps by persisting. The upsert never moves a status
+//! backwards.
 
 use super::{EnrichInput, EnrichOutcome, Enriched, Prefetch};
 use crate::config::ReenrichConfig;
 use crate::db::repository::{
     DueTransfer, list_missing_origin_transfers, list_open_transfers, persist_transaction,
+    record_origin_attempt,
 };
 use crate::domain::bridge_transfer::{BridgeStatus, BridgeTransfer};
 use crate::domain::transaction::NormalisedTransaction;
@@ -82,12 +87,11 @@ fn settle(
 }
 
 /// One attempt. Returns the step and whether the attempt filled a missing origin tx.
-async fn reenrich_one(
-    state: &AppState,
-    observed_tx_hash: &str,
-    analysis: serde_json::Value,
-) -> anyhow::Result<(Step, bool)> {
-    let mut tx: NormalisedTransaction = serde_json::from_value(analysis)?;
+async fn reenrich_one(state: &AppState, row: DueTransfer) -> anyhow::Result<(Step, bool)> {
+    let observed_tx_hash = row.observed_tx_hash.clone();
+    let Some(mut tx) = row.transaction() else {
+        anyhow::bail!("no usable analysis to re-enrich");
+    };
     let Some(mut transfer) = tx.bridge_transfer.take() else {
         return Ok((Step::Unchanged, false));
     };
@@ -99,7 +103,7 @@ async fn reenrich_one(
         .enrichment
         .enrich(
             EnrichInput {
-                source_tx_hash: observed_tx_hash,
+                source_tx_hash: &observed_tx_hash,
                 prefetch: Prefetch::None,
             },
             &mut transfer,
@@ -115,19 +119,29 @@ async fn reenrich_one(
 }
 
 /// Attempts every row in `rows`, updating `stats` and the provider-outage streak. Stops
-/// on shutdown or after too many outages in a row.
+/// on shutdown or after too many outages in a row. When `record_attempt` is set, the
+/// origin backfill's marker is written whatever the outcome, including an unreachable
+/// provider, so the row leaves the front of the queue.
 async fn attempt_rows(
     state: &AppState,
     rows: Vec<DueTransfer>,
     shutdown: &CancellationToken,
     stats: &mut PassStats,
     unavailable_streak: &mut u32,
+    record_attempt: bool,
 ) {
     for row in rows {
         if shutdown.is_cancelled() {
             return;
         }
-        match reenrich_one(state, &row.observed_tx_hash, row.analysis).await {
+        let transfer_id = row.id;
+        let observed_tx_hash = row.observed_tx_hash.clone();
+        let result = reenrich_one(state, row).await;
+        if record_attempt && let Err(error) = record_origin_attempt(&state.db, transfer_id).await {
+            tracing::warn!(transfer_id, %error, "could not record origin attempt");
+        }
+
+        match result {
             Ok((step, origin_filled)) => {
                 match step {
                     Step::Advanced => {
@@ -157,7 +171,7 @@ async fn attempt_rows(
             }
             Err(error) => {
                 stats.failed += 1;
-                tracing::warn!(signature = %row.observed_tx_hash, %error, "re-enrichment failed");
+                tracing::warn!(signature = %observed_tx_hash, %error, "re-enrichment failed");
             }
         }
     }
@@ -165,33 +179,51 @@ async fn attempt_rows(
 
 /// One pass: open transfers first, so a backlog of missing origin txs cannot delay the
 /// status convergence that existing rows need, then completed inbound rows whose origin
-/// tx is still unknown.
+/// tx is still unknown. The batch is split up front, so the backfill keeps a guaranteed
+/// share even when open rows are backlogged (`REENRICH_ORIGIN_SHARE`).
 pub async fn run_pass(
     state: &AppState,
     cfg: &ReenrichConfig,
     shutdown: &CancellationToken,
 ) -> anyhow::Result<PassStats> {
+    let (open_batch, origin_batch) = cfg.batch_split(cfg.batch);
     let rows = list_open_transfers(
         &state.db,
         cfg.min_age_secs,
         cfg.max_age_secs,
         cfg.retry_secs,
-        cfg.batch,
+        open_batch,
     )
     .await?;
 
     let mut stats = PassStats::default();
     let mut unavailable_streak = 0;
 
-    attempt_rows(state, rows, shutdown, &mut stats, &mut unavailable_streak).await;
-    if shutdown.is_cancelled() {
+    attempt_rows(
+        state,
+        rows,
+        shutdown,
+        &mut stats,
+        &mut unavailable_streak,
+        false,
+    )
+    .await;
+    if shutdown.is_cancelled() || origin_batch == 0 {
         return Ok(stats);
     }
 
     let rows =
-        list_missing_origin_transfers(&state.db, cfg.min_age_secs, cfg.retry_secs, cfg.batch)
+        list_missing_origin_transfers(&state.db, cfg.min_age_secs, cfg.retry_secs, origin_batch)
             .await?;
-    attempt_rows(state, rows, shutdown, &mut stats, &mut unavailable_streak).await;
+    attempt_rows(
+        state,
+        rows,
+        shutdown,
+        &mut stats,
+        &mut unavailable_streak,
+        true,
+    )
+    .await;
     Ok(stats)
 }
 
