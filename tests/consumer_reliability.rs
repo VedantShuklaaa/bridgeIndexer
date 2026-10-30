@@ -74,6 +74,7 @@ fn test_config(
             reclaim_interval_secs,
         },
         chain_registry_refresh_secs: 60,
+        health_max_ingest_age_secs: 3600,
     }
 }
 

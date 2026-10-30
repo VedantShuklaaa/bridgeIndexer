@@ -293,7 +293,10 @@ pub async fn set_last_ingested_slot(pool: &PgPool, chain: &str, slot: u64) -> Re
     sqlx::query(
         "INSERT INTO indexer_state (key, value) VALUES ($1, $2)
          ON CONFLICT (key) DO UPDATE
-         SET value = GREATEST(indexer_state.value::bigint, EXCLUDED.value::bigint)::text",
+         SET value = GREATEST(indexer_state.value::bigint, EXCLUDED.value::bigint)::text,
+             -- the value only moves forward, but the heartbeat tracks every handled
+             -- notification, including ones at or below the checkpoint (/health).
+             updated_at = NOW()",
     )
     .bind(&key)
     .bind(slot.to_string())
