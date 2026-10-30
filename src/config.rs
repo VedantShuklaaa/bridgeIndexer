@@ -14,6 +14,22 @@ pub struct ReenrichConfig {
     pub retry_secs: i64,
     /// Rows older than this are given up on (stale-while-revalidate can still refresh them).
     pub max_age_secs: i64,
+    /// Percent of each pass's batch reserved for the missing-origin backfill, so a
+    /// backlog of open rows cannot starve it. `0` disables the reservation.
+    pub origin_share_percent: u8,
+}
+
+impl ReenrichConfig {
+    /// Splits a pass's batch into `(open, origin)`. A configured share keeps at least
+    /// one slot for the backfill whenever the batch has room for it.
+    pub fn batch_split(&self, batch: i64) -> (i64, i64) {
+        let batch = batch.max(0);
+        let mut origin = (batch * i64::from(self.origin_share_percent) / 100).min(batch);
+        if origin == 0 && self.origin_share_percent > 0 && batch > 0 {
+            origin = 1;
+        }
+        (batch - origin, origin)
+    }
 }
 
 /// Stream consumer and recovery worker.
@@ -170,7 +186,38 @@ impl AppConfig {
                 min_age_secs: number("REENRICH_MIN_AGE_SECS", 60i64).max(0),
                 retry_secs: number("REENRICH_RETRY_SECS", 120i64).max(0),
                 max_age_secs: number("REENRICH_MAX_AGE_SECS", 7 * 24 * 3600i64).max(1),
+                origin_share_percent: number("REENRICH_ORIGIN_SHARE", 40u8).min(100),
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reenrich(origin_share_percent: u8) -> ReenrichConfig {
+        ReenrichConfig {
+            enabled: true,
+            interval_secs: 30,
+            batch: 50,
+            min_age_secs: 60,
+            retry_secs: 120,
+            max_age_secs: 3600,
+            origin_share_percent,
+        }
+    }
+
+    #[test]
+    fn the_default_split_reserves_a_share_for_the_backfill() {
+        assert_eq!(reenrich(40).batch_split(50), (30, 20));
+        assert_eq!(reenrich(0).batch_split(50), (50, 0));
+        assert_eq!(reenrich(100).batch_split(50), (0, 50));
+    }
+
+    #[test]
+    fn a_small_batch_still_reserves_one_origin_slot() {
+        assert_eq!(reenrich(40).batch_split(1), (0, 1));
+        assert_eq!(reenrich(40).batch_split(2), (1, 1));
     }
 }

@@ -1,7 +1,7 @@
 use crate::chains::{NS_WORMHOLE, RawChainRef};
 use crate::domain::analysis::DecodedTransfer;
-use crate::domain::bridge_transfer::BridgeTransfer;
-use crate::domain::transaction::NormalisedTransaction;
+use crate::domain::bridge_transfer::{BridgeMessageId, BridgeStatus, BridgeTransfer, ChainId};
+use crate::domain::transaction::{Chain, NormalisedTransaction, TxStatus};
 use crate::protocols::{MessageId, amount::RawAmount};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -323,8 +323,23 @@ pub async fn get_cached_analysis(pool: &PgPool, hash: &str) -> Result<Option<ser
 
 /// A transfer due for another enrichment attempt.
 pub struct DueTransfer {
+    pub id: i64,
     pub observed_tx_hash: String,
-    pub analysis: serde_json::Value,
+    /// The cached v1 body, when the row still has one.
+    pub analysis: Option<serde_json::Value>,
+    /// The same body rebuilt from the stored row, when a repair migration dropped the
+    /// cached analysis. `None` for every other due row.
+    pub rebuilt: Option<NormalisedTransaction>,
+}
+
+impl DueTransfer {
+    /// The transaction to re-enrich and persist, from the cached body or from the row.
+    pub fn transaction(self) -> Option<NormalisedTransaction> {
+        let cached = self
+            .analysis
+            .and_then(|value| serde_json::from_value(value).ok());
+        cached.or(self.rebuilt)
+    }
 }
 
 /// Open transfers that are old enough to leave to enrichment (`min_age_secs` since they
@@ -338,9 +353,9 @@ pub async fn list_open_transfers(
     retry_secs: i64,
     limit: i64,
 ) -> Result<Vec<DueTransfer>> {
-    let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+    let rows: Vec<(i64, String, serde_json::Value)> = sqlx::query_as(
         r#"
-        SELECT observed_tx_hash, analysis
+        SELECT id, observed_tx_hash, analysis
         FROM bridge_transfers
         WHERE status IN ('Detected', 'Pending')
           AND analysis IS NOT NULL
@@ -360,35 +375,70 @@ pub async fn list_open_transfers(
 
     Ok(rows
         .into_iter()
-        .map(|(observed_tx_hash, analysis)| DueTransfer {
+        .map(|(id, observed_tx_hash, analysis)| DueTransfer {
+            id,
             observed_tx_hash,
-            analysis,
+            analysis: Some(analysis),
+            rebuilt: None,
         })
         .collect())
 }
 
-/// Completed inbound rows whose origin tx is still unknown, due for another attempt.
-/// A redeem is stored `Completed` before WormholeScan has matched its operation, so the
-/// origin tx arrives later. Unlike open transfers there is no `max_age_secs`: the origin
-/// tx can become known at any time, and the row is otherwise terminal. Only `min_age_secs`
-/// and `retry_secs` apply. Served by `idx_bt_missing_origin`.
+/// Completed inbound Wormhole rows whose origin tx is still unknown, due for another
+/// attempt. A redeem is stored `Completed` before WormholeScan has matched its operation,
+/// so the origin tx arrives later. Unlike open transfers there is no `max_age_secs`: the
+/// origin tx can become known at any time, and the row is otherwise terminal.
+///
+/// The retry window uses `last_enrich_attempt_at`, which is written for every attempt
+/// whatever its outcome, so a row that learns nothing still moves to the back of the
+/// queue. Never-attempted rows come first. Rows whose cached analysis was dropped by a
+/// repair are still returned: [`DueTransfer::transaction`] rebuilds the body from the
+/// stored transaction, transfer and message columns. Served by `idx_bt_missing_origin`.
 pub async fn list_missing_origin_transfers(
     pool: &PgPool,
     min_age_secs: i64,
     retry_secs: i64,
     limit: i64,
 ) -> Result<Vec<DueTransfer>> {
-    let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+    let rows: Vec<MissingOriginRow> = sqlx::query_as(
         r#"
-        SELECT observed_tx_hash, analysis
-        FROM bridge_transfers
-        WHERE status = 'Completed'
-          AND direction = 'Inbound'
-          AND source_tx_hash IS NULL
-          AND analysis IS NOT NULL
-          AND created_at < NOW() - ($1::double precision * INTERVAL '1 second')
-          AND updated_at < NOW() - ($2::double precision * INTERVAL '1 second')
-        ORDER BY updated_at ASC
+        SELECT b.id,
+               b.observed_tx_hash,
+               b.analysis,
+               t.hash AS tx_hash,
+               t.chain AS tx_chain,
+               t.status AS tx_status,
+               t.slot,
+               t.timestamp,
+               t.fee_lamports,
+               t.signer,
+               b.source_ref_id,
+               b.source_tx_hash,
+               b.source_wallet,
+               b.source_explorer_url,
+               b.destination_ref_id,
+               b.destination_wallet,
+               b.destination_tx_hash,
+               b.destination_explorer_url,
+               b.token,
+               b.token_symbol,
+               b.amount::text AS amount,
+               b.amount_formatted,
+               b.status AS transfer_status,
+               w.emitter_chain,
+               w.emitter_address,
+               w.sequence::text AS sequence
+        FROM bridge_transfers b
+        JOIN transactions t ON t.id = b.transaction_id
+        LEFT JOIN wormhole_messages w ON w.transfer_id = b.id
+        WHERE b.protocol = 'wormhole'
+          AND b.status = 'Completed'
+          AND b.direction = 'Inbound'
+          AND b.source_tx_hash IS NULL
+          AND b.created_at < NOW() - ($1::double precision * INTERVAL '1 second')
+          AND (b.last_enrich_attempt_at IS NULL
+               OR b.last_enrich_attempt_at < NOW() - ($2::double precision * INTERVAL '1 second'))
+        ORDER BY b.last_enrich_attempt_at ASC NULLS FIRST, b.updated_at ASC
         LIMIT $3
         "#,
     )
@@ -400,11 +450,108 @@ pub async fn list_missing_origin_transfers(
 
     Ok(rows
         .into_iter()
-        .map(|(observed_tx_hash, analysis)| DueTransfer {
-            observed_tx_hash,
-            analysis,
+        .map(|row| {
+            let rebuilt = rebuild_missing_origin(&row);
+            let MissingOriginRow {
+                id,
+                observed_tx_hash,
+                analysis,
+                ..
+            } = row;
+            DueTransfer {
+                id,
+                observed_tx_hash,
+                analysis,
+                rebuilt,
+            }
         })
         .collect())
+}
+
+/// Records an origin-backfill attempt, whatever its outcome. The retry window and queue
+/// rotation use this marker, so an attempt that writes nothing still counts.
+pub async fn record_origin_attempt(pool: &PgPool, transfer_id: i64) -> Result<()> {
+    sqlx::query("UPDATE bridge_transfers SET last_enrich_attempt_at = NOW() WHERE id = $1")
+        .bind(transfer_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The stored columns needed to rebuild a `NormalisedTransaction` when a repair dropped
+/// the cached analysis.
+#[derive(Debug, sqlx::FromRow)]
+struct MissingOriginRow {
+    id: i64,
+    observed_tx_hash: String,
+    analysis: Option<serde_json::Value>,
+    tx_hash: String,
+    tx_chain: i16,
+    tx_status: String,
+    slot: i64,
+    timestamp: Option<DateTime<Utc>>,
+    fee_lamports: i64,
+    signer: Option<String>,
+    source_ref_id: String,
+    source_tx_hash: Option<String>,
+    source_wallet: Option<String>,
+    source_explorer_url: Option<String>,
+    destination_ref_id: String,
+    destination_wallet: Option<String>,
+    destination_tx_hash: Option<String>,
+    destination_explorer_url: Option<String>,
+    token: Option<String>,
+    token_symbol: Option<String>,
+    amount: Option<String>,
+    amount_formatted: Option<String>,
+    transfer_status: String,
+    emitter_chain: Option<i32>,
+    emitter_address: Option<String>,
+    sequence: Option<String>,
+}
+
+fn rebuild_missing_origin(row: &MissingOriginRow) -> Option<NormalisedTransaction> {
+    let chain = Chain::from_wormhole_id(u16::try_from(row.tx_chain).ok()?)?;
+    let tx_status = TxStatus::parse(&row.tx_status)?;
+    let status = match row.transfer_status.as_str() {
+        "Completed" => BridgeStatus::Completed,
+        "Pending" => BridgeStatus::Pending,
+        "Detected" => BridgeStatus::Detected,
+        _ => return None,
+    };
+    let source_chain = ChainId::from_wormhole_id(row.source_ref_id.parse().ok()?);
+    let destination_chain = ChainId::from_wormhole_id(row.destination_ref_id.parse().ok()?);
+
+    Some(NormalisedTransaction {
+        hash: row.tx_hash.clone(),
+        chain,
+        status: tx_status,
+        slot: u64::try_from(row.slot).ok()?,
+        timestamp: row.timestamp.map(|ts| ts.timestamp()),
+        fee_lamports: u64::try_from(row.fee_lamports).ok()?,
+        signer: row.signer.clone(),
+        bridge_event: None,
+        bridge_transfer: Some(BridgeTransfer {
+            source_chain,
+            source_tx_hash: row.source_tx_hash.clone(),
+            source_wallet: row.source_wallet.clone(),
+            source_explorer_url: row.source_explorer_url.clone(),
+            destination_chain,
+            destination_wallet: row.destination_wallet.clone(),
+            destination_tx_hash: row.destination_tx_hash.clone(),
+            destination_explorer_url: row.destination_explorer_url.clone(),
+            token: row.token.clone(),
+            token_symbol: row.token_symbol.clone(),
+            amount: row.amount.clone(),
+            amount_formatted: row.amount_formatted.clone(),
+            message_id: BridgeMessageId {
+                emitter_chain: u16::try_from(row.emitter_chain?).ok()?,
+                emitter_address: row.emitter_address.clone()?,
+                sequence: row.sequence.as_deref()?.parse().ok()?,
+            },
+            status,
+        }),
+    })
 }
 
 /// One persisted transfer in a block-time window, for the read-only `reconcile`
