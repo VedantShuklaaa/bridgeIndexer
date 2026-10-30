@@ -12,6 +12,7 @@
 //!                                           getMultipleAccounts, getSignaturesForAddress,
 //!                                           getAsset)
 //!   GET  /api/v1/operations?txHash=...      WormholeScan operations
+//!   GET  /api/v1/vaas/:chain/:emitter/:sequence
 //!   GET  /api/v1/global-tx/:chain/:emitter/:sequence
 //!   GET  /stats                             per-method calls, injected 429s, in-flight high-water
 //!   POST /stats/reset                       zero the counters
@@ -199,23 +200,37 @@ fn fixture_tx(fixture: &Fixture) -> Option<SolanaTx> {
     Some(tx)
 }
 
-/// The destination tx the fake's `/global-tx` route would return for this message.
-fn global_destination_tx(fixtures: &[Fixture], id: &BridgeMessageId) -> Option<String> {
+/// The captured WormholeScan operation for a message id, if a fixture has one.
+fn operation_for<'a>(
+    fixtures: &'a [Fixture],
+    chain: Option<u64>,
+    emitter: &str,
+    sequence: Option<u64>,
+) -> Option<&'a Value> {
     fixtures
         .iter()
         .filter_map(|fixture| fixture.wormhole.as_ref())
         .find(|operation| {
-            operation.get("emitterChain").and_then(Value::as_u64)
-                == Some(u64::from(id.emitter_chain))
+            operation.get("emitterChain").and_then(Value::as_u64) == chain
                 && operation
                     .get("emitterAddress")
                     .and_then(Value::as_str)
-                    .is_some_and(|address| address.eq_ignore_ascii_case(&id.emitter_address))
-                && operation.get("sequence").and_then(Value::as_u64) == Some(id.sequence)
+                    .is_some_and(|address| address.eq_ignore_ascii_case(emitter))
+                && operation.get("sequence").and_then(Value::as_u64) == sequence
         })
-        .and_then(|operation| operation.pointer("/targetChain/transaction/txHash"))
-        .and_then(Value::as_str)
-        .map(String::from)
+}
+
+/// The destination tx the fake's `/global-tx` route would return for this message.
+fn global_destination_tx(fixtures: &[Fixture], id: &BridgeMessageId) -> Option<String> {
+    operation_for(
+        fixtures,
+        Some(u64::from(id.emitter_chain)),
+        &id.emitter_address,
+        Some(id.sequence),
+    )
+    .and_then(|operation| operation.pointer("/targetChain/transaction/txHash"))
+    .and_then(Value::as_str)
+    .map(String::from)
 }
 
 /// Mirrors the app's status resolution: detection, then the captured WormholeScan
@@ -483,23 +498,37 @@ async fn global_tx(
 
     let chain: Option<u64> = chain.parse().ok();
     let sequence: Option<u64> = sequence.parse().ok();
-    let destination = state
-        .fixtures
-        .iter()
-        .filter_map(|fixture| fixture.wormhole.as_ref())
-        .find(|operation| {
-            operation.get("emitterChain").and_then(Value::as_u64) == chain
-                && operation
-                    .get("emitterAddress")
-                    .and_then(Value::as_str)
-                    .is_some_and(|address| address.eq_ignore_ascii_case(&emitter))
-                && operation.get("sequence").and_then(Value::as_u64) == sequence
-        })
+    let destination = operation_for(&state.fixtures, chain, &emitter, sequence)
         .and_then(|operation| operation.pointer("/targetChain/transaction/txHash"))
         .and_then(Value::as_str);
 
     match destination {
         Some(hash) => Json(json!({"destinationTx": {"txHash": hash}})).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
+    }
+}
+
+/// The message-key route the origin-tx fallback uses. Like the real API, it returns the
+/// source hash as bare hex (no `0x`); the app adds the prefix from the chain registry.
+async fn vaas(
+    State(state): State<Arc<FakeState>>,
+    Path((chain, emitter, sequence)): Path<(String, String, String)>,
+) -> Response {
+    let _in_flight = state.begin_call("wormhole:vaas");
+    state.delay().await;
+    if state.rate_limited("wormhole:vaas") {
+        return wormhole_rate_limited();
+    }
+
+    let chain: Option<u64> = chain.parse().ok();
+    let sequence: Option<u64> = sequence.parse().ok();
+    let source = operation_for(&state.fixtures, chain, &emitter, sequence)
+        .and_then(|operation| operation.pointer("/sourceChain/transaction/txHash"))
+        .and_then(Value::as_str)
+        .map(|hash| hash.strip_prefix("0x").unwrap_or(hash));
+
+    match source {
+        Some(hash) => Json(json!({"data": {"txHash": hash}})).into_response(),
         None => (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response(),
     }
 }
@@ -564,6 +593,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", post(json_rpc))
         .route("/api/v1/operations", get(operations))
+        .route("/api/v1/vaas/:chain/:emitter/:sequence", get(vaas))
         .route(
             "/api/v1/global-tx/:chain/:emitter/:sequence",
             get(global_tx),

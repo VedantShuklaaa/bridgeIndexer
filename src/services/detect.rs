@@ -184,17 +184,45 @@ pub fn apply_wormholescan(
     }
 
     // A redeem is stored without its origin tx. The matched operation names it.
-    if transfer.direction() == Direction::Inbound
-        && transfer.source_tx_hash.is_none()
-        && let Some(hash) = source_tx_from_operation(wh_raw)
-    {
-        transfer.source_explorer_url = chains.explorer_tx_url_for(
-            &RawChainRef::wormhole(transfer.source_chain.wormhole_id()),
-            &hash,
-        );
-        transfer.source_tx_hash = Some(hash);
+    if let Some(hash) = source_tx_from_operation(wh_raw) {
+        apply_source_tx(transfer, &hash, chains);
     }
     Enrichment::Applied
+}
+
+/// Fills the origin tx of an inbound redeem, which is stored without one. Only
+/// `source_tx_hash` and `source_explorer_url` are touched, and only while the origin tx is
+/// still unknown; the status never moves.
+pub fn apply_source_tx(transfer: &mut BridgeTransfer, hash: &str, chains: &Snapshot) -> bool {
+    let hash = hash.trim();
+    if hash.is_empty()
+        || transfer.direction() != Direction::Inbound
+        || transfer.source_tx_hash.is_some()
+    {
+        return false;
+    }
+    let hash = normalise_source_tx_hash(transfer.source_chain.wormhole_id(), hash, chains);
+    transfer.source_explorer_url = chains.explorer_tx_url_for(
+        &RawChainRef::wormhole(transfer.source_chain.wormhole_id()),
+        &hash,
+    );
+    transfer.source_tx_hash = Some(hash);
+    true
+}
+
+/// `/vaas` returns a bare hex hash for EVM chains while the rest of the app stores the
+/// explorer's `0x` form. Other chains already use their own encoding.
+fn normalise_source_tx_hash(wormhole_id: u16, hash: &str, chains: &Snapshot) -> String {
+    let evm = chains
+        .resolve(&RawChainRef::wormhole(wormhole_id))
+        .key()
+        .and_then(|key| chains.chain(key))
+        .is_some_and(|chain| chain.kind == "evm");
+    if evm && !hash.starts_with("0x") && !hash.starts_with("0X") {
+        format!("0x{hash}")
+    } else {
+        hash.to_string()
+    }
 }
 
 /// Destination tx inside a WormholeScan `/operations` item. Paths are tried in order;
@@ -483,11 +511,20 @@ mod tests {
     use crate::chains::{ChainRow, MappingRow, RegistryStatus};
 
     fn snap() -> Snapshot {
-        let chain = |id: i16, slug: &str| ChainRow {
+        snap_with_kinds("other", "other")
+    }
+
+    /// Chain 1 is Solana, chain 2 is an EVM chain, as the seeded registry has them.
+    fn evm_snap() -> Snapshot {
+        snap_with_kinds("solana", "evm")
+    }
+
+    fn snap_with_kinds(solana_kind: &str, ethereum_kind: &str) -> Snapshot {
+        let chain = |id: i16, slug: &str, kind: &str| ChainRow {
             id,
             slug: slug.into(),
             name: slug.into(),
-            kind: "other".into(),
+            kind: kind.into(),
             explorer_tx_url: Some(format!("https://{slug}.example/tx/{{hash}}")),
             status: RegistryStatus::Active,
         };
@@ -498,7 +535,10 @@ mod tests {
             status: RegistryStatus::Active,
         };
         Snapshot::build(
-            vec![chain(1, "solana"), chain(2, "ethereum")],
+            vec![
+                chain(1, "solana", solana_kind),
+                chain(2, "ethereum", ethereum_kind),
+            ],
             vec![mapping("1", 1), mapping("2", 2)],
         )
     }
@@ -620,6 +660,48 @@ mod tests {
 
         apply_wormholescan(&mut t, &op, &snap());
         assert_eq!(t.source_tx_hash.as_deref(), Some("sig"));
+    }
+
+    #[test]
+    fn apply_source_tx_fills_only_a_missing_inbound_origin() {
+        let mut t = inbound_transfer();
+        assert!(apply_source_tx(&mut t, "origin", &snap()));
+        assert_eq!(t.source_tx_hash.as_deref(), Some("origin"));
+        assert_eq!(
+            t.source_explorer_url.as_deref(),
+            Some("https://ethereum.example/tx/origin")
+        );
+        assert!(matches!(t.status, BridgeStatus::Completed));
+
+        assert!(!apply_source_tx(&mut t, "other", &snap()));
+        assert_eq!(t.source_tx_hash.as_deref(), Some("origin"));
+
+        let mut outbound = transfer();
+        assert!(!apply_source_tx(&mut outbound, "other", &snap()));
+        assert_eq!(outbound.source_tx_hash.as_deref(), Some("sig"));
+
+        let mut blank = inbound_transfer();
+        assert!(!apply_source_tx(&mut blank, "  ", &snap()));
+        assert_eq!(blank.source_tx_hash, None);
+    }
+
+    #[test]
+    fn an_evm_origin_hash_from_the_vaa_gets_the_0x_prefix() {
+        let mut t = inbound_transfer();
+        assert!(apply_source_tx(&mut t, "715b25c9bba7", &evm_snap()));
+        assert_eq!(t.source_tx_hash.as_deref(), Some("0x715b25c9bba7"));
+        assert_eq!(
+            t.source_explorer_url.as_deref(),
+            Some("https://ethereum.example/tx/0x715b25c9bba7")
+        );
+    }
+
+    #[test]
+    fn source_hash_normalisation_follows_the_registry_kind() {
+        assert_eq!(normalise_source_tx_hash(2, "abc", &evm_snap()), "0xabc");
+        assert_eq!(normalise_source_tx_hash(2, "0xabc", &evm_snap()), "0xabc");
+        assert_eq!(normalise_source_tx_hash(1, "abc", &evm_snap()), "abc");
+        assert_eq!(normalise_source_tx_hash(9999, "abc", &evm_snap()), "abc");
     }
 
     #[test]
