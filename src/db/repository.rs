@@ -321,8 +321,8 @@ pub async fn get_cached_analysis(pool: &PgPool, hash: &str) -> Result<Option<ser
     .await?)
 }
 
-/// An open (`Detected` or `Pending`) transfer due for another enrichment attempt.
-pub struct OpenTransfer {
+/// A transfer due for another enrichment attempt.
+pub struct DueTransfer {
     pub observed_tx_hash: String,
     pub analysis: serde_json::Value,
 }
@@ -337,7 +337,7 @@ pub async fn list_open_transfers(
     max_age_secs: i64,
     retry_secs: i64,
     limit: i64,
-) -> Result<Vec<OpenTransfer>> {
+) -> Result<Vec<DueTransfer>> {
     let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
         r#"
         SELECT observed_tx_hash, analysis
@@ -360,7 +360,47 @@ pub async fn list_open_transfers(
 
     Ok(rows
         .into_iter()
-        .map(|(observed_tx_hash, analysis)| OpenTransfer {
+        .map(|(observed_tx_hash, analysis)| DueTransfer {
+            observed_tx_hash,
+            analysis,
+        })
+        .collect())
+}
+
+/// Completed inbound rows whose origin tx is still unknown, due for another attempt.
+/// A redeem is stored `Completed` before WormholeScan has matched its operation, so the
+/// origin tx arrives later. Unlike open transfers there is no `max_age_secs`: the origin
+/// tx can become known at any time, and the row is otherwise terminal. Only `min_age_secs`
+/// and `retry_secs` apply. Served by `idx_bt_missing_origin`.
+pub async fn list_missing_origin_transfers(
+    pool: &PgPool,
+    min_age_secs: i64,
+    retry_secs: i64,
+    limit: i64,
+) -> Result<Vec<DueTransfer>> {
+    let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        r#"
+        SELECT observed_tx_hash, analysis
+        FROM bridge_transfers
+        WHERE status = 'Completed'
+          AND direction = 'Inbound'
+          AND source_tx_hash IS NULL
+          AND analysis IS NOT NULL
+          AND created_at < NOW() - ($1::double precision * INTERVAL '1 second')
+          AND updated_at < NOW() - ($2::double precision * INTERVAL '1 second')
+        ORDER BY updated_at ASC
+        LIMIT $3
+        "#,
+    )
+    .bind(min_age_secs)
+    .bind(retry_secs)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(observed_tx_hash, analysis)| DueTransfer {
             observed_tx_hash,
             analysis,
         })
