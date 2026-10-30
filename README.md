@@ -24,7 +24,7 @@ but not stored yet. The [Roadmap](#roadmap) tracks the move.
 | Protocol core | `BridgeAdapter`, `ProtocolRegistry`, `compose`, pure `SolanaTx` and the Wormhole Token Bridge adapter are **wired into `analyse_tx`** through `AppState.protocols`. Sends and redeems are decoded and stored (A7). A redeem needs the posted VAA account (A1b): the adapter asks for it through `required_accounts` and the fetch step preloads it with `getMultipleAccounts`. The other Wormhole programs (A4) are not decoded yet |
 | Read path (`/analyse`) | Working, cache-hit throughput measured (see [Results](#results)) |
 | Destination tx resolution | **Fixed (A5b).** Read from the `/operations` payload (`targetChain.transaction.txHash`, legacy paths as fallback), then `/global-tx` through the WormholeScan limiter when the VAA matched but no destination tx is present. `Pending` now means WormholeScan itself has no destination tx |
-| Enrichment | **Provider and background pass (A5b).** WormholeScan sits behind the `EnrichmentProvider` trait in `enrichment/`. A supervised worker re-enriches `Detected` and `Pending` rows on a schedule, so statuses converge without anyone calling `/analyse` |
+| Enrichment | **Provider and background pass (A5b).** WormholeScan sits behind the `EnrichmentProvider` trait in `enrichment/`. A supervised worker re-enriches `Detected` and `Pending` rows on a schedule and fills the missing origin tx of completed inbound rows, so statuses converge without anyone calling `/analyse` |
 | WebSocket ingestion | **Always on (A8).** The ingester starts with the process, under a supervisor, whether or not anyone is connected to `/stream`. Still **lossy**, and the `reconcile` tool measures it (4a); the baseline run and the fix are Phase 4 |
 | CI | `cargo fmt --check`, `clippy -D warnings` and `cargo test` on every PR and on `main` (Phase 0) |
 | Deploy | Manual (`git clone` + `cargo run` on EC2, Postgres on RDS). Automated in Phase 2 |
@@ -131,9 +131,12 @@ Implemented so far:
   adapters reject a failed tx, so a decoded redeem has happened). The origin tx is filled in
   by enrichment: when WormholeScan's operation matches the on-chain message, its
   `sourceChain.transaction.txHash` becomes `source_tx_hash`, and a later analysis that
-  could not reach WormholeScan never erases it. A row is one per `(protocol, message_key)`,
-  so a redeem is never stored twice. `BridgeTransfer::direction()` derives the direction
-  (destination Solana, source not Solana), so stored analyses keep their shape. In the
+  could not reach WormholeScan never erases it. A completed inbound row that still has no
+  origin tx is revisited by the background re-enrichment pass (`enrichment::reenrich`)
+  until WormholeScan names it, so a re-analysis is not the only way it is filled. A row
+  is one per `(protocol, message_key)`, so a redeem is never stored twice.
+  `BridgeTransfer::direction()` derives the direction (destination Solana, source not
+  Solana), so stored analyses keep their shape. In the
   frozen `/api/v1` response `source_tx_hash` is now nullable, and it is null only for a
   redeem whose origin tx is not known yet. A redeem that still goes through the
   WormholeScan-driven path (its VAA account could not be loaded) is turned around the same
@@ -262,7 +265,8 @@ bridgeIndexer/
 │   ├── 20261017090000_chain_registry.sql
 │   ├── 20261018120000_generalise_bridge_transfers.sql
 │   ├── 20261024120000_repair_inbound_rows.sql  # redeems stored like sends become inbound (A7)
-│   └── 20261030120000_repair_inbound_source_wallet.sql  # inbound rows lose the Solana source wallet
+│   ├── 20261030120000_repair_inbound_source_wallet.sql  # inbound rows lose the Solana source wallet
+│   └── 20261030130000_index_missing_origin.sql  # partial index for the origin-tx backfill (A7)
 ├── scripts/
 │   └── capture_fixtures.sh             # save Helius + WormholeScan fixtures (Phase 0)
 ├── src/
@@ -308,7 +312,7 @@ bridgeIndexer/
 │   ├── enrichment/                     # counterpart and status providers (Phase A)
 │   │   ├── mod.rs                      # EnrichmentProvider trait, EnrichInput, EnrichOutcome
 │   │   ├── wormholescan.rs             # WormholeScan: /operations VAA, then /global-tx destination tx
-│   │   └── reenrich.rs                 # background pass over Detected and Pending rows
+│   │   └── reenrich.rs                 # background pass over open rows and missing inbound origin txs
 │   ├── ingestion/                      # Solana WS listener + backfill, always on (A8)
 │   │   ├── solana.rs
 │   │   ├── backfill.rs                 # pure backfill planning: checkpoint cut-off, failed txs, cap (A8)
@@ -472,7 +476,10 @@ Symbol and decimals come from one Helius `getAsset` per mint, cached per mint (2
   WormholeScan limiter (it never touches Helius). Rows younger than
   `REENRICH_MIN_AGE_SECS` are left to the normal pipeline, a row is not asked again
   within `REENRICH_RETRY_SECS`, and rows older than `REENRICH_MAX_AGE_SECS` are given up
-  on. A pass ends early after three provider outages in a row.
+  on. The same pass then backfills the origin tx of `Completed` inbound rows whose
+  `source_tx_hash` is still NULL, up to `REENRICH_BATCH` of them; `REENRICH_MAX_AGE_SECS`
+  does not apply to those, because the origin tx may become known at any time. A pass
+  ends early after three provider outages in a row.
 * **Helius token wait.** The API sheds a request after 2 s without a token (`Overloaded`, 503). Live workers wait up to `HELIUS_LIVE_TOKEN_WAIT_MS` (20 s) for the first token of a message, but that patience is no longer what keeps a burst out of the dead-letter stream: an `Overloaded` is transient, so the message stays pending and recovery redelivers it. The wait must stay well below the reclaim idle time (5 min), or a message would be reclaimed while it is still waiting.
 
 ## API
@@ -583,7 +590,9 @@ and compares their status with WormholeScan, reusing the replay comparison.
   registry reloads from Postgres, so a manual `INSERT` or `UPDATE` takes effect without a restart.
 * Re-enrichment (all optional): `REENRICH_ENABLED` (default on, `0` disables),
   `REENRICH_INTERVAL_SECS` (30), `REENRICH_BATCH` (50), `REENRICH_MIN_AGE_SECS` (60),
-  `REENRICH_RETRY_SECS` (120) and `REENRICH_MAX_AGE_SECS` (7 days).
+  `REENRICH_RETRY_SECS` (120) and `REENRICH_MAX_AGE_SECS` (7 days). The pass also fills
+  missing origin txs of completed inbound rows, up to `REENRICH_BATCH` in addition to the
+  open rows; `REENRICH_MAX_AGE_SECS` does not bound those.
 * `GET /health` reports `status` (`ok` or `degraded`), `postgres_ok`, `redis_ok`,
   `ingest_age_secs`, `stream_lag` and `stream_pending` (from `XINFO GROUPS
   bridge:transactions`), and `dead_letter_len` (`XLEN bridge:transactions:failed`).
@@ -617,7 +626,7 @@ cargo test
   against WormholeScan (message key, chains, amount, token, destination wallet).
   Without the account they are asserted `Unsupported`.
 * Unit tests in `src/ingestion/backfill.rs`: no backfill without a checkpoint, only signatures newer than the checkpoint, stop at the checkpoint slot, failed transactions and entries without a slot or signature skipped, the `INGEST_BACKFILL_MAX` cap, and the empty page. The Redis dedupe has no automated test (no Redis container in the suite yet).
-* A7 in `tests/bridge_transfers_schema.rs`: a redeem is stored as one `Inbound`, `Completed` row with the redeem as destination tx and no origin tx, enrichment fills the origin tx and a later analysis without enrichment keeps it, and the repair migration turns rows stored like sends around (and leaves real sends alone). The source-wallet repair is covered there too: an inbound row with a wallet loses it and its cached analysis, an outbound row and an inbound row that is already NULL are untouched, and a second run is a no-op. In `tests/golden_fixtures.rs`, the captured redeems become `Completed` inbound transfers and the matched WormholeScan operation supplies exactly the origin tx WormholeScan reports. Unit tests in `src/services/detect.rs` cover the mapping, the origin tx rules (only for a matching operation, never overwritten, never for a send) and the legacy-path fix, and `src/domain/bridge_transfer.rs` the derived direction.
+* A7 in `tests/bridge_transfers_schema.rs`: a redeem is stored as one `Inbound`, `Completed` row with the redeem as destination tx and no origin tx, enrichment fills the origin tx and a later analysis without enrichment keeps it, a completed inbound row whose origin tx is still missing is due for the background backfill while one that learned it (and an outbound send) is not, and the repair migration turns rows stored like sends around (and leaves real sends alone). The source-wallet repair is covered there too: an inbound row with a wallet loses it and its cached analysis, an outbound row and an inbound row that is already NULL are untouched, and a second run is a no-op. In `tests/golden_fixtures.rs`, the captured redeems become `Completed` inbound transfers and the matched WormholeScan operation supplies exactly the origin tx WormholeScan reports. Unit tests in `src/services/detect.rs` cover the mapping, the origin tx rules (only for a matching operation, never overwritten, never for a send) and the legacy-path fix, and `src/domain/bridge_transfer.rs` the derived direction.
 * `tests/persistence_idempotency.rs` — real Postgres 18 container (via `testcontainers`,
   needs Docker): redelivering the same transaction, the scenario `XAUTOCLAIM` recovery
   guarantees will happen, never produces a duplicate row in `transactions`,
@@ -655,8 +664,9 @@ cargo test
   (destination tx completes, mismatched VAA and missing VAA change nothing, "not found" is
   an answer while other errors are not, a `Completed` transfer is never moved backwards)
   and the re-enrichment decision (advanced, unchanged but persisted, unreachable provider
-  persists nothing). The due-rows query itself is checked by hand against a migrated
-  database, there is no automated test for it.
+  persists nothing). The due-rows queries are covered in `tests/bridge_transfers_schema.rs`:
+  a completed inbound row without an origin tx is due, the retry window and a learned
+  origin tx take it out of the queue, and an outbound send stays on the open queue.
 
 ***
 
@@ -705,9 +715,9 @@ only real adapter. Phases B and later add one protocol each.
 * \[x] A2. Generalised domain model and schema: `protocol`, optional `via`, `direction`, source and destination chain references, a protocol-specific message identity with a unique key per protocol, `Detected`/`Pending`/`Completed` plus `Failed`/`Refunded`, `NUMERIC` amounts. `bridge_transfers` (protocol-agnostic) is split from `wormhole_messages`. Existing rows are migrated in place and tested on staged legacy data
 * \[x] A3. DB-backed chain registry: canonical `chains` table plus a `(protocol, protocol_chain_id) -> chain` mapping table, seeded with the current 10 chains, replacing the `ChainId` enum and `from_wormhole_id`. Unknown IDs are stored as `unresolved(protocol, id)`, never dropped and never a crash. The registry carries the status and provenance needed for the later LLM-proposal upgrade, which is not built in this phase... Done: tables, seed, `load_snapshot`, DB tests (#4), SQL `resolve_chain`, and unresolved IDs persisted on transfers (A2). Remaining: move callers off `ChainId` and `from_wormhole_id`, wire the snapshot refresh task
 * \[ ] A4. All Wormhole programs on Solana, not only the Token Bridge (Token Bridge, NTT and others, each after its program ID and layouts are verified against official docs or source). One `logsSubscribe` per program ID, since `mentions` accepts a single address, with a checkpoint per program. `SOLANA_TOKEN_BRIDGE_PROGRAM` is replaced by a configured list
-* \[x] A5. Chain-first detection: a transfer is persisted as `Detected` from Helius data alone. WormholeScan is an enrichment that fills the status and no longer gates persistence. Done for Wormhole outbound in `analyse_tx` (`services::detect`), cross-checked against the on-chain message ID. Done (A5b): the destination tx fix, the WormholeScan lookups behind an `EnrichmentProvider` in `enrichment/`, and a background re-enrichment pass (`enrichment::reenrich`) that moves `Detected` and `Pending` rows forward. Several transfers per tx are decoded but only the first is stored until the v2 model
+* \[x] A5. Chain-first detection: a transfer is persisted as `Detected` from Helius data alone. WormholeScan is an enrichment that fills the status and no longer gates persistence. Done for Wormhole outbound in `analyse_tx` (`services::detect`), cross-checked against the on-chain message ID. Done (A5b): the destination tx fix, the WormholeScan lookups behind an `EnrichmentProvider` in `enrichment/`, and a background re-enrichment pass (`enrichment::reenrich`) that moves `Detected` and `Pending` rows forward and backfills missing inbound origin txs. Several transfers per tx are decoded but only the first is stored until the v2 model
 * \[ ] A6. Composition: one transfer per message identity, the outer protocol or router recorded as `via`, and a test that an outer and an underlying adapter seeing the same tx produce one row... Partly done (#3): `compose()` with unit tests. The end-to-end outer+underlying test waits for a second adapter
-* \[x] A7. Direction: Solana-outbound sends and Solana-inbound redeems both indexed. Done: `analyse_tx` stores redeems as `Inbound` rows (`Completed` at detection, the redeem tx as destination tx, `source_tx_hash` NULL until WormholeScan's matched operation names it), `source_tx_hash` is nullable in `/api/v1`, and a migration repairs redeems the old path stored like sends. Not done: re-enriching an inbound row whose origin tx could not be fetched the first time (the re-enrichment pass only looks at `Detected` and `Pending` rows, so it stays NULL until the transfer is analysed again)
+* \[x] A7. Direction: Solana-outbound sends and Solana-inbound redeems both indexed. Done: `analyse_tx` stores redeems as `Inbound` rows (`Completed` at detection, the redeem tx as destination tx, `source_tx_hash` NULL until WormholeScan's matched operation names it), `source_tx_hash` is nullable in `/api/v1`, and a migration repairs redeems the old path stored like sends. The re-enrichment pass now also revisits completed inbound rows whose origin tx is still NULL, so it is filled once WormholeScan names it without waiting for another `/analyse` (served by the partial index `idx_bt_missing_origin`)
 * \[x] A8. Ingestion is always on, in this phase and every later one, and no longer tied to `/stream` clients, so the database is a complete record of what the programs emitted. Done: the ingester starts with the process under `spawn_supervised`, `on_demand` and the `/stream` client counter are gone, and the Helius spend is bounded by an ingestion budget: backfill on by default but skipped without a checkpoint, capped at `INGEST_BACKFILL_MAX` signatures and paced by `INGEST_BACKFILL_PACE_MS`, and a Redis `SET NX EX` dedupe so a signature seen by both the backfill and the live feed (or twice after a reconnect) is published once. Workers still read through the live Helius limiter (4/s on the free plan), so a burst queues in the Redis stream instead of being dropped. A real per-key budget comes with the provider lanes (1c)
 * \[x] A9. Fixtures captured from real txs (outbound, inbound, admin/attest rejected, unsupported variant) and golden tests per adapter. Inbound fixtures also carry the captured posted VAA account (`account_<name>_vaa.json`), and the golden tests decode redeems from it (A1b)
 * \[x] A10. API versioning: `/api/v2` serves the generalised model (protocol, direction, via, chain references, all transfers of a tx). `/api/v1` keeps its current Wormhole-shaped response through a compatibility mapper until it is retired. Amounts are stored as `NUMERIC` so volume can be aggregated. Done: `/api/v2/transactions/analyse` reads every stored transfer of a tx with raw and resolved chain references, and `/api/v1` is the compatibility mapper over the same response, pinned byte for byte by fixture snapshots; the WebSocket stream is unchanged. Every decoded transfer is persisted with its `event_index`

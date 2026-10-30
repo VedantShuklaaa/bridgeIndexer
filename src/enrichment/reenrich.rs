@@ -4,6 +4,12 @@
 //! stay stale. Each pass picks open rows that are old enough, asks the enrichment
 //! provider again and persists the result.
 //!
+//! The same pass also revisits completed inbound rows whose origin tx is still unknown.
+//! A redeem is stored `Completed` at detection; WormholeScan's matched operation fills
+//! `source_tx_hash` when it learns it, and that can be after the first analysis. Those
+//! rows get no `max_age_secs`: the origin tx may become known at any time, and without
+//! the backfill the row would stay incomplete forever.
+//!
 //! `updated_at` doubles as the last-attempt marker: every answered attempt is persisted,
 //! which bumps it, so a row is not asked again before `retry_secs` have passed. An
 //! attempt where the provider was unreachable persists nothing and the row stays first
@@ -11,9 +17,12 @@
 
 use super::{EnrichInput, EnrichOutcome, Enriched, Prefetch};
 use crate::config::ReenrichConfig;
-use crate::db::repository::{list_open_transfers, persist_transaction};
+use crate::db::repository::{
+    DueTransfer, list_missing_origin_transfers, list_open_transfers, persist_transaction,
+};
 use crate::domain::bridge_transfer::{BridgeStatus, BridgeTransfer};
 use crate::domain::transaction::NormalisedTransaction;
+use crate::protocols::Direction;
 use crate::state::AppState;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -25,6 +34,9 @@ const MAX_UNAVAILABLE_STREAK: u32 = 3;
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PassStats {
     pub advanced: u32,
+    /// Inbound rows that learned their origin tx, counted in addition to
+    /// `advanced`/`unchanged`.
+    pub origin_filled: u32,
     pub unchanged: u32,
     pub unavailable: u32,
     pub failed: u32,
@@ -69,16 +81,19 @@ fn settle(
     step
 }
 
+/// One attempt. Returns the step and whether the attempt filled a missing origin tx.
 async fn reenrich_one(
     state: &AppState,
     observed_tx_hash: &str,
     analysis: serde_json::Value,
-) -> anyhow::Result<Step> {
+) -> anyhow::Result<(Step, bool)> {
     let mut tx: NormalisedTransaction = serde_json::from_value(analysis)?;
     let Some(mut transfer) = tx.bridge_transfer.take() else {
-        return Ok(Step::Unchanged);
+        return Ok((Step::Unchanged, false));
     };
 
+    let origin_missing =
+        transfer.direction() == Direction::Inbound && transfer.source_tx_hash.is_none();
     let status_before = rank(&transfer.status);
     let enriched = state
         .enrichment
@@ -91,14 +106,66 @@ async fn reenrich_one(
         )
         .await;
 
+    let origin_filled = origin_missing && transfer.source_tx_hash.is_some();
     let step = settle(&mut tx, transfer, status_before, enriched);
     if step != Step::Unavailable {
         persist_transaction(&state.db, &tx).await?;
     }
-    Ok(step)
+    Ok((step, origin_filled))
 }
 
-/// One pass over the open rows that are due.
+/// Attempts every row in `rows`, updating `stats` and the provider-outage streak. Stops
+/// on shutdown or after too many outages in a row.
+async fn attempt_rows(
+    state: &AppState,
+    rows: Vec<DueTransfer>,
+    shutdown: &CancellationToken,
+    stats: &mut PassStats,
+    unavailable_streak: &mut u32,
+) {
+    for row in rows {
+        if shutdown.is_cancelled() {
+            return;
+        }
+        match reenrich_one(state, &row.observed_tx_hash, row.analysis).await {
+            Ok((step, origin_filled)) => {
+                match step {
+                    Step::Advanced => {
+                        stats.advanced += 1;
+                        *unavailable_streak = 0;
+                    }
+                    Step::Unchanged => {
+                        stats.unchanged += 1;
+                        *unavailable_streak = 0;
+                    }
+                    Step::Unavailable => {
+                        stats.unavailable += 1;
+                        *unavailable_streak += 1;
+                        if *unavailable_streak >= MAX_UNAVAILABLE_STREAK {
+                            tracing::warn!(
+                                provider = state.enrichment.name(),
+                                "provider unavailable, ending the pass early"
+                            );
+                            return;
+                        }
+                        continue;
+                    }
+                }
+                if origin_filled {
+                    stats.origin_filled += 1;
+                }
+            }
+            Err(error) => {
+                stats.failed += 1;
+                tracing::warn!(signature = %row.observed_tx_hash, %error, "re-enrichment failed");
+            }
+        }
+    }
+}
+
+/// One pass: open transfers first, so a backlog of missing origin txs cannot delay the
+/// status convergence that existing rows need, then completed inbound rows whose origin
+/// tx is still unknown.
 pub async fn run_pass(
     state: &AppState,
     cfg: &ReenrichConfig,
@@ -116,36 +183,15 @@ pub async fn run_pass(
     let mut stats = PassStats::default();
     let mut unavailable_streak = 0;
 
-    for row in rows {
-        if shutdown.is_cancelled() {
-            break;
-        }
-        match reenrich_one(state, &row.observed_tx_hash, row.analysis).await {
-            Ok(Step::Advanced) => {
-                stats.advanced += 1;
-                unavailable_streak = 0;
-            }
-            Ok(Step::Unchanged) => {
-                stats.unchanged += 1;
-                unavailable_streak = 0;
-            }
-            Ok(Step::Unavailable) => {
-                stats.unavailable += 1;
-                unavailable_streak += 1;
-                if unavailable_streak >= MAX_UNAVAILABLE_STREAK {
-                    tracing::warn!(
-                        provider = state.enrichment.name(),
-                        "provider unavailable, ending the pass early"
-                    );
-                    break;
-                }
-            }
-            Err(error) => {
-                stats.failed += 1;
-                tracing::warn!(signature = %row.observed_tx_hash, %error, "re-enrichment failed");
-            }
-        }
+    attempt_rows(state, rows, shutdown, &mut stats, &mut unavailable_streak).await;
+    if shutdown.is_cancelled() {
+        return Ok(stats);
     }
+
+    let rows =
+        list_missing_origin_transfers(&state.db, cfg.min_age_secs, cfg.retry_secs, cfg.batch)
+            .await?;
+    attempt_rows(state, rows, shutdown, &mut stats, &mut unavailable_streak).await;
     Ok(stats)
 }
 
@@ -168,6 +214,7 @@ pub async fn run(state: AppState, shutdown: CancellationToken) -> anyhow::Result
             Ok(stats) if stats != PassStats::default() => {
                 tracing::info!(
                     advanced = stats.advanced,
+                    origin_filled = stats.origin_filled,
                     unchanged = stats.unchanged,
                     unavailable = stats.unavailable,
                     failed = stats.failed,

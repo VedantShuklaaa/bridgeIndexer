@@ -4,7 +4,9 @@
 mod common;
 
 use bridge::chains::{ChainRegistry, RawChainRef};
-use bridge::db::repository::persist_transaction;
+use bridge::db::repository::{
+    list_missing_origin_transfers, list_open_transfers, persist_transaction,
+};
 use bridge::domain::bridge_transfer::{BridgeStatus, ChainId};
 use sqlx::PgPool;
 
@@ -521,6 +523,51 @@ async fn enrichment_fills_the_origin_tx_of_a_redeem_and_it_sticks() {
     assert_eq!(count, 1, "the redeem is one row, however often it is seen");
     assert_eq!(source.as_deref(), Some("0xorigin"));
     assert_eq!(status, "Completed");
+}
+
+#[tokio::test]
+async fn a_completed_inbound_row_without_an_origin_tx_is_due_for_origin_backfill() {
+    let db = common::test_db().await;
+    let pool = &db.pool;
+
+    persist_transaction(
+        pool,
+        &common::sample_redeem_tx("sig-origin-missing", 9, ChainId::Ethereum, None),
+    )
+    .await
+    .unwrap();
+
+    let due = list_missing_origin_transfers(pool, 0, 0, 10).await.unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].observed_tx_hash, "sig-origin-missing");
+
+    // The attempt was just now, so the retry window keeps it out of the next pass.
+    let due = list_missing_origin_transfers(pool, 0, 3600, 10)
+        .await
+        .unwrap();
+    assert!(due.is_empty());
+
+    // Once enrichment knows the origin tx the row leaves the queue.
+    persist_transaction(
+        pool,
+        &common::sample_redeem_tx("sig-origin-missing", 9, ChainId::Ethereum, Some("0xorigin")),
+    )
+    .await
+    .unwrap();
+    let due = list_missing_origin_transfers(pool, 0, 0, 10).await.unwrap();
+    assert!(due.is_empty());
+
+    // An outbound send is an open transfer, never an origin-backfill row.
+    persist_transaction(
+        pool,
+        &common::sample_tx("sig-send", 10, ChainId::Ethereum, Some("1000")),
+    )
+    .await
+    .unwrap();
+    let open = list_open_transfers(pool, 0, 3600, 0, 10).await.unwrap();
+    assert!(open.iter().any(|row| row.observed_tx_hash == "sig-send"));
+    let due = list_missing_origin_transfers(pool, 0, 0, 10).await.unwrap();
+    assert!(due.is_empty());
 }
 
 #[tokio::test]
