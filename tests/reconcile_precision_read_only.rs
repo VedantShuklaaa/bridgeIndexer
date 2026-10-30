@@ -95,6 +95,7 @@ fn test_config(database_url: &str, upstream_url: &str) -> AppConfig {
             reclaim_interval_secs: 30,
         },
         chain_registry_refresh_secs: 60,
+        health_max_ingest_age_secs: 3600,
     }
 }
 

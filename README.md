@@ -584,6 +584,19 @@ and compares their status with WormholeScan, reusing the replay comparison.
 * Re-enrichment (all optional): `REENRICH_ENABLED` (default on, `0` disables),
   `REENRICH_INTERVAL_SECS` (30), `REENRICH_BATCH` (50), `REENRICH_MIN_AGE_SECS` (60),
   `REENRICH_RETRY_SECS` (120) and `REENRICH_MAX_AGE_SECS` (7 days).
+* `GET /health` reports `status` (`ok` or `degraded`), `postgres_ok`, `redis_ok`,
+  `ingest_age_secs`, `stream_lag` and `stream_pending` (from `XINFO GROUPS
+  bridge:transactions`), and `dead_letter_len` (`XLEN bridge:transactions:failed`).
+  It never calls Helius or WormholeScan. `ingest_age_secs` is the age of
+  `indexer_state.updated_at` for `solana_last_ingested_slot`, which the ingester
+  bumps on every parsed notification, transfers or not. The answer is cached in
+  memory for 15 s (Upstash bills per command) and concurrent polls share one
+  measurement. `HEALTH_MAX_INGEST_AGE_SECS` (optional, default 3600, minimum 1) is
+  the age past which the heartbeat is stale; the default is deliberate, quiet
+  25-minute gaps have happened in production. The endpoint answers 503 only when
+  Postgres or Redis is down, or `ingest_age_secs` is *greater than* the threshold
+  (exactly at it is still 200). A missing heartbeat (fresh database, or ingestion
+  never started) is `degraded` with 200.
 * The database is Postgres 18. Tests and CI run against 18, not older.
 
 ## Testing
@@ -746,7 +759,8 @@ Exit: ≥ 99% agreement on transfers older than 15 minutes; `Pending` only when 
 * \[ ] `ROLE=api|stream|all`. `api` serves `/analyse`; `stream` runs ingester, workers, recovery and `/stream`. Shared Postgres and Redis
 * \[ ] Hostnames `api.<domain>` and `stream.<domain>`, each process with its own Helius key
 * \[ ] CI builds the release binary; CD over SSH on merge to `main`: deploy key, one systemd unit per role, health check, rollback to previous binary
-* \[ ] `/health` (Postgres and Redis ping) and metrics: request latency histogram, cache hit/miss counters, limiter wait time, stream lag
+* \[x] `GET /health`: Postgres and Redis ping, ingest heartbeat age, stream lag and pending, dead-letter depth. 200 normally, 503 on a dependency outage or stale ingest; cached 15 s
+* \[ ] Metrics: request latency histogram, cache hit/miss counters, limiter wait time, stream lag
 * \[ ] Hardening: compose publishes Postgres/Redis on `127.0.0.1` only, no default credentials on a public box, security group allows only 80/443 and SSH from a fixed IP
 * \[x] Load generator on a second instance in the same VPC, larger than the `t3.micro` used for v0
 

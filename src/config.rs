@@ -87,6 +87,9 @@ pub struct AppConfig {
     pub worker: WorkerConfig,
     /// How often the in-memory chain registry reloads from Postgres.
     pub chain_registry_refresh_secs: u64,
+    /// `/health` answers 503 once the ingest heartbeat is older than this. Generous on
+    /// purpose: quiet 25-minute gaps have happened in production.
+    pub health_max_ingest_age_secs: i64,
 }
 
 impl AppConfig {
@@ -157,6 +160,7 @@ impl AppConfig {
                 reclaim_interval_secs: number("WORKER_RECLAIM_INTERVAL_SECS", 30u64).max(1),
             },
             chain_registry_refresh_secs: number("CHAIN_REGISTRY_REFRESH_SECS", 60u64).max(5),
+            health_max_ingest_age_secs: number("HEALTH_MAX_INGEST_AGE_SECS", 3600i64).max(1),
             reenrich: ReenrichConfig {
                 enabled: std::env::var("REENRICH_ENABLED")
                     .map(|v| v != "0")

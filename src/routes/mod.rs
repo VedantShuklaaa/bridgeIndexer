@@ -3,8 +3,10 @@ mod v2;
 
 use axum::Router;
 use axum::http::{HeaderValue, Method};
+use axum::routing::get;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
+use crate::handler::health::health_handler;
 use crate::state::AppState;
 
 fn build_cors(allowed_origins: &[String]) -> CorsLayer {
@@ -23,6 +25,7 @@ pub fn build_router(state: AppState) -> Router {
     let cors = build_cors(&state.config.allowed_origins);
 
     Router::new()
+        .route("/health", get(health_handler))
         .nest("/api/v1", v1::router())
         .nest("/api/v2", v2::router())
         .layer(cors)
