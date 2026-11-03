@@ -143,6 +143,15 @@ impl Snapshot {
         self.chain(key).map(|c| c.slug.as_str())
     }
 
+    /// The active chain with this canonical key. An unknown or inactive slug is `None`,
+    /// never an error: the caller decides how to report it.
+    pub fn chain_id_by_slug(&self, slug: &str) -> Option<ChainKey> {
+        self.chains
+            .values()
+            .find(|chain| chain.slug == slug)
+            .map(|chain| ChainKey(chain.id))
+    }
+
     pub fn explorer_tx_url(&self, key: ChainKey, tx_hash: &str) -> Option<String> {
         self.chain(key)?
             .explorer_tx_url

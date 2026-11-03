@@ -274,9 +274,15 @@ bridgeIndexer/
 │   ├── 20261024120000_repair_inbound_rows.sql  # redeems stored like sends become inbound (A7)
 │   ├── 20261030120000_repair_inbound_source_wallet.sql  # inbound rows lose the Solana source wallet
 │   ├── 20261030130000_index_missing_origin.sql  # partial index for the origin-tx backfill (A7)
-│   └── 20261030140000_origin_attempt_marker.sql  # backfill attempt marker and rotated index (A7)
+│   ├── 20261030140000_origin_attempt_marker.sql  # backfill attempt marker and rotated index (A7)
+│   └── 20261031120000_list_endpoint_token_index.sql  # token filter index for the list endpoint (3g)
+├── docs/
+│   ├── 3e-worker-patience.md            # live token wait notes (3e)
+│   ├── 3g-list-endpoint.md              # list contract, synthetic plans, known limits (3g)
+│   └── scaling-log.md                   # measured before/after entries
 ├── scripts/
-│   └── capture_fixtures.sh             # save Helius + WormholeScan fixtures (Phase 0)
+│   ├── bench_list.sh                    # first/deep/filtered list benchmark (3g)
+│   └── capture_fixtures.sh              # save Helius + WormholeScan fixtures (Phase 0)
 ├── src/
 │   ├── main.rs                         # wiring, supervised workers, HTTP server
 │   ├── lib.rs
@@ -286,7 +292,8 @@ bridgeIndexer/
 │   ├── shutdown.rs                     # SIGTERM / Ctrl+C
 │   ├── bin/
 │   │   ├── replay.rs                   # replay the last N signatures, compare with WormholeScan (1e)
-│   │   └── reconcile.rs                # stream recall vs getSignaturesForAddress (Phase 4, 4a)
+│   │   ├── reconcile.rs                # stream recall vs getSignaturesForAddress (Phase 4, 4a)
+│   │   └── seed_transfers.rs           # 1M throwaway rows for list plans and benchmarks (3g)
 │   ├── domain/                         # types only, no IO
 │   │   ├── bridge.rs
 │   │   ├── bridge_transfer.rs
@@ -335,17 +342,22 @@ bridgeIndexer/
 │   │   ├── detect.rs                   # chain-first detection and WormholeScan enrichment (pure)
 │   │   ├── read_through.rs             # caches, single-flight, stale-while-revalidate
 │   │   ├── reconcile.rs                # pure window, diff, recall, miss clustering and lag (4a)
-│   │   └── replay.rs                   # pure compare/summary for the replay tool
+│   │   ├── replay.rs                   # pure compare/summary for the replay tool
+│   │   └── transfers.rs                # list query validation, cursor, one keyset page (3g)
 │   ├── db/
 │   │   ├── connection.rs
 │   │   └── repository.rs
 │   ├── handler/                        # HTTP and WS handlers
 │   │   ├── analyse.rs
-│   │   └── stream.rs
+│   │   ├── stream.rs
+│   │   └── transfers.rs                # GET /api/v2/transfers (3g)
 │   └── routes/
 │       ├── mod.rs                      # router + CORS
-│       └── v1/
-│           ├── mod.rs
+│       ├── v1/
+│       │   ├── mod.rs
+│       │   └── transactions.rs
+│       └── v2/
+│           ├── mod.rs                  # /transactions/analyse and /transfers
 │           └── transactions.rs
 ├── tests/
 │   ├── bridge_transfers_schema.rs      # A2 schema and migration of existing rows (needs Docker)
@@ -354,6 +366,7 @@ bridgeIndexer/
 │   ├── decode_unit.rs                  # pure decode tests (Phase 0)
 │   ├── fixtures_decode.rs              # decoders over captured fixtures (Phase 0)
 │   ├── golden_fixtures.rs              # Wormhole adapter over captured fixtures, sends and redeems, checked against WormholeScan (A9, A1b)
+│   ├── list_transfers.rs               # keyset paging, filters, cursor/limit validation (3g, needs Docker)
 │   ├── persistence_idempotency.rs      # testcontainers Postgres
 │   └── fixtures/                       # helius_<name>.json, wormhole_<name>.json, account_<name>_vaa.json (captured, see tests/fixtures)
 ├── benches/                            # (planned) criterion: pure decode (Phase 1)
@@ -502,6 +515,8 @@ Symbol and decimals come from one Helius `getAsset` per mint, cached per mint (2
 
 ```
 GET /api/v1/transactions/analyse?transaction_hash=<hash>&chain=solana
+GET /api/v2/transactions/analyse?transaction_hash=<hash>&chain=solana
+GET /api/v2/transfers
 WS  /api/v1/transactions/stream
 ```
 
@@ -518,6 +533,50 @@ chain; anything else returns `422 NORMALISATION_FAILED`.
 | 502 / 504 | `UPSTREAM_ERROR`, `UPSTREAM_TIMEOUT` | A provider failed or timed out after retries. |
 | 503 | `OVERLOADED` | The service is shedding load (limiter or permit wait exceeded 2 s). Sends `Retry-After: 1`. |
 | 500 | `INTERNAL_ERROR` | Unexpected error. |
+
+### List transfers (`GET /api/v2/transfers`)
+
+Lists stored transfers newest first, one page per request. `items` uses the same
+transfer object as `/api/v2/transactions/analyse`, so field names are identical.
+There is deliberately no total count: it needs a full scan of the filtered set.
+Page until `next_cursor` is `null`.
+
+```
+GET /api/v2/transfers?limit=50&direction=Inbound&status=Completed&chain=ethereum
+```
+
+| Parameter | Meaning | Rules |
+| --- | --- | --- |
+| `limit` | page size | default 50, 1 to 200 |
+| `cursor` | position from the previous `next_cursor` | opaque; strictly after the last returned row |
+| `protocol` | exact stored protocol | non-empty |
+| `direction` | `Outbound` or `Inbound` | case-sensitive |
+| `status` | `Detected`, `Pending`, `Completed`, `Failed`, `Refunded` | — |
+| `chain` | canonical chain slug from `chains.slug` | matches source **or** destination |
+| `token` | exact stored token address | no token-chain key |
+| `from` | inclusive lower bound on `created_at` | RFC3339 |
+| `to` | exclusive upper bound on `created_at` | RFC3339; must be after `from` |
+
+Pagination is keyset over `(created_at DESC, id DESC)`: there is no `OFFSET`, and
+rows with identical `created_at` are still visited exactly once. `next_cursor`
+encodes the last returned row; send it back as `cursor`. The ordering key is the
+time the indexer stored the row, not the chain's block time, so a backfilled
+transfer appears where it was inserted. `from`/`to` combine with the cursor as
+additional bounds.
+
+| Status | Code | Meaning |
+| --- | --- | --- |
+| 200 | | One page. `next_cursor` is `null` on the last page. |
+| 400 | `BAD_REQUEST` | Invalid `limit`, cursor or timestamp; unknown chain, direction or status; `from >= to`. |
+| 500 | `INTERNAL_ERROR` | Database or serialization failure. |
+
+There is no cache on this path; every request reads Postgres. Query plans and
+the one index it adds are in [docs/3g-list-endpoint.md](docs/3g-list-endpoint.md).
+
+The v2 transfer model still has one `message_id` shape, `wormhole`, so a page
+that contains a row for another protocol fails with `422 NORMALISATION_FAILED`.
+That matches `/analyse`; it is a model limitation, not a query one, and it goes
+away when the adapter for that protocol gets a `MessageId` variant.
 
 CORS is origin-allowlisted via `ALLOWED_ORIGINS` — nothing is permitted by
 default.
@@ -649,6 +708,13 @@ cargo test
   needs Docker): redelivering the same transaction, the scenario `XAUTOCLAIM` recovery
   guarantees will happen, never produces a duplicate row in `transactions`,
   `bridge_transfers` or `wormhole_messages`.
+* `tests/list_transfers.rs` — real Postgres 18 container (needs Docker): keyset paging
+  visits every row exactly once when `created_at` repeats across page boundaries, every
+  filter and filter combination selects the expected rows, `from` is inclusive and `to`
+  exclusive, the cursor combines with the range, limit and cursor errors are 400s, the
+  last page has no cursor, and an empty database is an empty page. Unit tests in
+  `src/services/transfers.rs` cover the opaque cursor round trip, limit bounds, direction
+  and status validation, chain slugs, timestamp parsing and empty values without Docker.
 * `tests/bridge_transfers_schema.rs` — the A2 schema on Postgres 18: legacy rows are
   staged under the old schema and migrated (known and unknown chains, `u128::MAX`,
   non-integer amounts, analysis kept), new writes land in the protocol-agnostic shape,
@@ -878,6 +944,9 @@ as ingestion targets. This replaces the earlier multi-chain ingestion phase
 | `S-precision` | of transactions persisted as transfers, share confirmed by an independent source, plus rejections by reason | `reconcile` bin |
 | `D-decode` | pure classify/decode path, ns per operation | `criterion` |
 | `C-agree` | status agreement with WormholeScan over the last N signatures | `replay` bin |
+| `L-first` | `GET /api/v2/transfers?limit=50`, 1M seeded rows | `bench_list.sh` |
+| `L-deep` | the same at about 80% depth with the cursor | `bench_list.sh` |
+| `L-filtered` | `direction=Inbound&status=Completed&chain=ethereum`, limit 50 | `bench_list.sh` |
 
 Reproducing `R-hit`: build a file with one URL per line (valid Solana
 signatures only), then run it twice. The first run fills the cache, the second
@@ -886,6 +955,13 @@ is the warm number.
 ```bash
 oha -z 30s -c 50 --urls-from-file urls.txt
 ```
+
+Reproducing the list workloads: seed a throwaway database with
+`src/bin/seed_transfers.rs`, build the deep cursor from it, then run
+`scripts/bench_list.sh`. The steps, including the cursor derivation, are under
+"How to run the 3g list benchmarks" in [docs/scaling-log.md](docs/scaling-log.md).
+Each workload is run cold and warm, kept separate, and every row records the
+server SHA and instance type.
 
 ## Results
 
@@ -1067,6 +1143,27 @@ Caveats: 200 and 400 connections have two runs per version; this covers
 `R-hit` only, so nothing is known about the cold path or writes; the `/api/v1`
 control is one pass each. Methodology:
 [docs/scaling-log.md](docs/scaling-log.md).
+
+### 3g — list endpoint (pending EC2 run)
+
+Version: branch `feat/3g-list-endpoint` (2026-10-31). Change:
+`GET /api/v2/transfers`, keyset pagination over `(created_at DESC, id DESC)`,
+one added index (`idx_bt_token_created`), no cache. Plans:
+[docs/3g-list-endpoint.md](docs/3g-list-endpoint.md).
+
+Exit criteria, for every workload: 300 req/s and p99 < 150 ms on the EC2 box,
+2xx only counted as success.
+
+| Workload | Before | After | Result |
+| --- | --- | --- | --- |
+| `L-first` | endpoint did not exist | target 300 req/s, p99 < 150 ms | pending EC2 run |
+| `L-deep` | endpoint did not exist | target 300 req/s, p99 < 150 ms | pending EC2 run |
+| `L-filtered` | endpoint did not exist | target 300 req/s, p99 < 150 ms | pending EC2 run |
+
+No numbers are stated here yet. The local `EXPLAIN (ANALYZE, BUFFERS)` plans are
+synthetic and are not results. The run instructions and the entry template are
+in [docs/scaling-log.md](docs/scaling-log.md); the roadmap item stays unticked
+until the EC2 numbers exist.
 
 ### Phase 1 — correctness
 

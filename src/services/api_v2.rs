@@ -93,7 +93,12 @@ pub fn from_v1(tx: &NormalisedTransaction, chains: &Snapshot) -> TransactionResp
     }
 }
 
-fn transfer_view(row: &StoredTransfer, chains: &Snapshot) -> Result<TransferView, AppError> {
+/// One stored row as the v2 transfer model. Shared by the analyse response and the
+/// `/api/v2/transfers` list so the two cannot drift.
+pub(crate) fn transfer_view(
+    row: &StoredTransfer,
+    chains: &Snapshot,
+) -> Result<TransferView, AppError> {
     let direction = match row.direction.as_str() {
         "Outbound" => Direction::Outbound,
         "Inbound" => Direction::Inbound,

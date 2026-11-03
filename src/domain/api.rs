@@ -103,3 +103,13 @@ impl TransferStatus {
         }
     }
 }
+
+/// One page of the `/api/v2/transfers` list. Items use the same [`TransferView`]
+/// the analyse response carries, so field names match. There is deliberately no
+/// total count: it would require a full scan of the filtered set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferListResponse {
+    pub items: Vec<TransferView>,
+    /// `None` on the last page. Opaque to clients: echo it back as `cursor`.
+    pub next_cursor: Option<String>,
+}
