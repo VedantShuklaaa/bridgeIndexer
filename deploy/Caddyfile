@@ -1,0 +1,10 @@
+# No health_uri on purpose: /health returns 503 on stale ingest, which would
+# make Caddy stop proxying the whole API (single upstream).
+
+api.example.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8080
+	log {
+		format json
+	}
+}
