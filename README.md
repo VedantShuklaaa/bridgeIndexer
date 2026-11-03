@@ -264,6 +264,8 @@ bridgeIndexer/
 │   └── workflows/
 │       └── ci.yml                      # fmt, clippy, test (Phase 0)
 ├── .sqlx/                              # offline query data
+├── deploy/
+│   └── Caddyfile                       # host-installed TLS reverse proxy in front of the API
 ├── migrations/
 │   ├── 20260912071405_create_bridge_transfers.sql
 │   ├── 20260912162718_create_indexer_state.sql
@@ -593,6 +595,46 @@ cargo run
 Migrations run on startup. They are embedded at compile time (`sqlx::migrate!`),
 so a change that touches only files under `migrations/` now forces a rebuild.
 
+### HTTPS with Caddy (host install)
+
+`deploy/Caddyfile` puts a host-installed Caddy in front of the API: it terminates
+TLS, serves HTTP/2, compresses responses, proxies everything to `127.0.0.1:8080`
+and writes access logs as JSON. No Docker; it does not touch `docker-compose.yml`.
+
+Install Caddy from the [official apt instructions](https://caddyserver.com/docs/install#debian-ubuntu-raspbian):
+
+```bash
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https curl
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+  | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+  | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo apt update && sudo apt install caddy
+```
+
+Install the site config, replacing the domain with your own:
+
+```bash
+sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
+sudo sed -i 's/api\.example\.com/api.yourdomain.com/' /etc/caddy/Caddyfile
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+curl -fsS https://api.yourdomain.com/health
+```
+
+`/health` returns 200 normally and 503 on a dependency outage or stale ingest, so
+the `curl -fsS` check fails loudly when the stack is not healthy.
+
+Notes:
+
+* Point a DNS `A` record for the site at the box before reloading; Caddy needs it
+  to obtain the certificate.
+* Security group: allow inbound `80` and `443`, keep `8080` closed. The app binds
+  `0.0.0.0`, so Caddy is what makes that port reachable from the internet.
+* WebSockets are proxied automatically; `/stream` needs no extra Caddy config.
+* CORS stays in the app (`src/routes/mod.rs`). Do not add CORS headers in Caddy,
+  or preflight responses will carry duplicates.
+
 ### Replay against WormholeScan
 
 ```bash
@@ -861,6 +903,7 @@ Exit: ≥ 99% agreement on transfers older than 15 minutes; `Pending` only when 
 * \[ ] CI builds the release binary; CD over SSH on merge to `main`: deploy key, one systemd unit per role, health check, rollback to previous binary
 * \[x] `GET /health`: Postgres and Redis ping, ingest heartbeat age, stream lag and pending, dead-letter depth. 200 normally, 503 on a dependency outage or stale ingest; cached 15 s
 * \[ ] Metrics: request latency histogram, cache hit/miss counters, limiter wait time, stream lag
+* \[x] Host-installed Caddy in front of the API: TLS, HTTP/2 and compression in `deploy/Caddyfile`; 8080 stays closed and WebSocket and CORS pass through unchanged
 * \[ ] Hardening: compose publishes Postgres/Redis on `127.0.0.1` only, no default credentials on a public box, security group allows only 80/443 and SSH from a fixed IP
 * \[x] Load generator on a second instance in the same VPC, larger than the `t3.micro` used for v0
 
