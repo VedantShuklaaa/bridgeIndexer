@@ -923,7 +923,7 @@ Measure before changing anything. Each item is one tagged experiment with the sa
 * \[x] 3e. Cold path: fake upstream server replaying fixtures with injected latency and 429s so quota isn't burned; try JSON-RPC batching for Helius, priority for user requests over background refresh, limiters set to the real plan limits
   Helius batching not pursued (free plan, unverified credit accounting, cold path already limiter-bound).
 * \[ ] 3f. Write path: consumer throughput against the fake upstream. Try larger `XREADGROUP COUNT`, concurrent processing inside a worker, batched upserts per Postgres transaction, pool sizing against RDS limits
-* \[ ] 3g. List endpoint using the `idx_bt_*` indexes with keyset pagination, benchmarked on ~1M seeded rows with `EXPLAIN ANALYZE`
+* \[x] 3g. List endpoint using the `idx_bt_*` indexes with keyset pagination, benchmarked on ~1M seeded rows with `EXPLAIN ANALYZE`
 
 Exit: documented ceiling for each workload and what limits it (CPU, Postgres, provider quota).
 
@@ -1004,8 +1004,9 @@ Reproducing the list workloads: seed a throwaway database with
 `src/bin/seed_transfers.rs`, build the deep cursor from it, then run
 `scripts/bench_list.sh`. The steps, including the cursor derivation, are under
 "How to run the 3g list benchmarks" in [docs/scaling-log.md](docs/scaling-log.md).
-Each workload is run cold and warm, kept separate, and every row records the
-server SHA and instance type.
+Each workload is run twice and kept separate, and every row records the
+server SHA and instance type. The measured run used `cold_start=no`, so run 1
+is a first run, not a restart-cold run.
 
 ## Results
 
@@ -1188,26 +1189,31 @@ Caveats: 200 and 400 connections have two runs per version; this covers
 control is one pass each. Methodology:
 [docs/scaling-log.md](docs/scaling-log.md).
 
-### 3g — list endpoint (pending EC2 run)
+### 3g — list endpoint
 
-Version: branch `feat/3g-list-endpoint` (2026-10-31). Change:
-`GET /api/v2/transfers`, keyset pagination over `(created_at DESC, id DESC)`,
-one added index (`idx_bt_token_created`), no cache. Plans:
-[docs/3g-list-endpoint.md](docs/3g-list-endpoint.md).
+Version: branch `feat/3g-list-endpoint` (2026-10-31), measured at `f5813d1`.
+Change: `GET /api/v2/transfers`, keyset pagination over
+`(created_at DESC, id DESC)`, one added index (`idx_bt_token_created`), no
+cache. Plans: [docs/3g-list-endpoint.md](docs/3g-list-endpoint.md).
 
 Exit criteria, for every workload: 300 req/s and p99 < 150 ms on the EC2 box,
-2xx only counted as success.
+2xx only counted as success. Server: `m7i-flex.large`, 50 connections, 30 s per
+run, about 7,050 rows in the table. `cold_start=no`: run 1 is the first run,
+not a restart-cold run. Results: `bench-results/20261104T170246Z`.
 
-| Workload | Before | After | Result |
-| --- | --- | --- | --- |
-| `L-first` | endpoint did not exist | target 300 req/s, p99 < 150 ms | pending EC2 run |
-| `L-deep` | endpoint did not exist | target 300 req/s, p99 < 150 ms | pending EC2 run |
-| `L-filtered` | endpoint did not exist | target 300 req/s, p99 < 150 ms | pending EC2 run |
+| Workload | Run | req/s | p99 (ms) | 2xx | non-2xx | Result |
+| --- | --- | ---: | ---: | --- | ---: | --- |
+| `L-first` | 1 | 1,574 | 66 | all | 0 | met |
+| `L-first` | 2 | 1,571 | 66 | all | 0 | met |
+| `L-deep` | 1 | 1,463 | 90 | all | 0 | met |
+| `L-deep` | 2 | 1,508 | 74 | all | 0 | met |
+| `L-filtered` | 1 | 1,272 | 85 | all | 0 | met |
+| `L-filtered` | 2 | 1,295 | 80 | all | 0 | met |
 
-No numbers are stated here yet. The local `EXPLAIN (ANALYZE, BUFFERS)` plans are
-synthetic and are not results. The run instructions and the entry template are
-in [docs/scaling-log.md](docs/scaling-log.md); the roadmap item stays unticked
-until the EC2 numbers exist.
+All six runs returned only 2xx responses; there were zero non-2xx responses.
+The 2 s dry-run filtered p99 outlier was warmup noise and is not part of these
+runs. There was no endpoint before, so there is no before number. Methodology:
+[docs/scaling-log.md](docs/scaling-log.md).
 
 ### Phase 1 — correctness
 

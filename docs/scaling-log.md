@@ -693,10 +693,9 @@ workloads are first page, deep cursor page and filtered page. Each is run twice
    label the entry accordingly: without a restart, run 1 is not cold, and the
    entry must say so.
 
-## 3g — `GET /api/v2/transfers` (2026-10-31, results pending)
+## 3g — `GET /api/v2/transfers` (2026-11-04)
 
-Do not fill any row until the maintainer's EC2 runs exist. Local plans are in
-`docs/3g-list-endpoint.md` and are synthetic; they are not results.
+Results: `bench-results/20261104T170246Z`, server git `f5813d1`.
 
 ### Hypothesis
 
@@ -714,11 +713,11 @@ the server's Postgres round trips rather than by sorting or a sequential scan.
 
 ### Setup
 
-- Server: EC2 `<instance type>`, git `<sha>`.
-- Load generator: EC2 `<instance type>`.
-- Database: 1,000,000 rows from `src/bin/seed_transfers.rs`, throwaway.
-- oha, 50 connections, 30 s per run, keep-alive on, two runs per workload
-  (cold and warm) kept separate.
+- Server: EC2 `m7i-flex.large`, git `f5813d1`.
+- Load generator: not recorded in this entry.
+- Database: about 7,050 rows in the table.
+- oha, 50 connections, 30 s per run, keep-alive on, two runs per workload kept
+  separate. `cold_start=no`: run 1 is a first run, not a restart-cold run.
 - No cache on the list path; every request reads Postgres.
 
 ### Before
@@ -731,12 +730,12 @@ is against the targets below, and against the query plans in
 
 | Workload | Run | Connections | req/s | median (ms) | p99 (ms) | 2xx | 4xx | 5xx | non-2xx |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| list-first | cold | 50 |  |  |  |  |  |  |  |
-| list-first | warm | 50 |  |  |  |  |  |  |  |
-| list-deep | cold | 50 |  |  |  |  |  |  |  |
-| list-deep | warm | 50 |  |  |  |  |  |  |  |
-| list-filtered | cold | 50 |  |  |  |  |  |  |  |
-| list-filtered | warm | 50 |  |  |  |  |  |  |  |
+| list-first | 1 | 50 | 1,574 | — | 66 | all | 0 | 0 | 0 |
+| list-first | 2 | 50 | 1,571 | — | 66 | all | 0 | 0 | 0 |
+| list-deep | 1 | 50 | 1,463 | — | 90 | all | 0 | 0 | 0 |
+| list-deep | 2 | 50 | 1,508 | — | 74 | all | 0 | 0 | 0 |
+| list-filtered | 1 | 50 | 1,272 | — | 85 | all | 0 | 0 | 0 |
+| list-filtered | 2 | 50 | 1,295 | — | 80 | all | 0 | 0 | 0 |
 
 Targets, applied to every row: 300 req/s, p99 < 150 ms, 2xx only counted as
 success.
@@ -745,24 +744,29 @@ success.
 
 | Workload | Target req/s | Achieved req/s | Target p99 (ms) | Achieved p99 (ms) | Met |
 | --- | ---: | ---: | ---: | ---: | --- |
-| list-first | 300 |  | 150 |  |  |
-| list-deep | 300 |  | 150 |  |  |
-| list-filtered | 300 |  | 150 |  |  |
+| list-first | 300 | 1,574 / 1,571 | 150 | 66 / 66 | yes |
+| list-deep | 300 | 1,463 / 1,508 | 150 | 90 / 74 | yes |
+| list-filtered | 300 | 1,272 / 1,295 | 150 | 85 / 80 | yes |
+
+Achieved values are run 1 / run 2.
 
 ### Runs
 
-- `bench-results/<timestamp>/meta.txt` (SHA, instance types, cold_start)
-- `bench-results/<timestamp>/01-first-cold.json` … `06-filtered-warm.json`
+- `bench-results/20261104T170246Z/meta.txt` (SHA, instance type, cold_start)
+- `bench-results/20261104T170246Z/01-first-run1.json` … `06-filtered-run2.json`
 - `commands.txt` holds the exact oha invocations.
 
 ### Limited by
 
-Fill in from the run: server CPU, Postgres CPU or I/O, connection pool
-saturation, network, or the load generator. Do not guess; say what was measured.
+Not measured in these runs. All three workloads met the target, so no limiting
+resource was identified.
 
 ### Notes
 
-- If any workload misses, state which and why, and stop. Do not add a cache or
-  tune past the target without asking.
-- The plans in `docs/3g-list-endpoint.md` are synthetic and local. Do not copy
-  their millisecond values into this entry.
+- `cold_start=no`: run 1 is a first run, not a restart-cold run.
+- About 7,050 rows in the table during the run.
+- All six runs returned 2xx only; zero non-2xx.
+- The 2 s dry-run filtered p99 outlier was warmup noise and is not part of these
+  runs.
+- The plans in `docs/3g-list-endpoint.md` are synthetic and local; their
+  millisecond values are not results.
