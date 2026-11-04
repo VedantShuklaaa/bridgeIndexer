@@ -94,6 +94,9 @@ pub struct AppConfig {
     pub wormhole_rps: u32,
     /// Most upstream fetches one cold `/analyse` may run at once.
     pub upstream_permits: usize,
+    /// How long a failed (`Normalisation` or transient upstream) analysis stays in the
+    /// negative cache before the next request may retry it.
+    pub failed_cache_ttl_secs: u64,
     pub port: u16,
     pub solana_token_bridge_program: String,
     pub solana_ws_url: String,
@@ -109,6 +112,15 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    /// The config the live pipeline runs with: everything is shared with the API
+    /// except `helius_url`, which points at the live endpoint so the live registry,
+    /// `analyse_tx` and account preloads spend the live key and quota.
+    pub fn for_live(&self) -> Self {
+        let mut live = self.clone();
+        live.helius_url = live.helius_live_url.clone();
+        live
+    }
+
     pub fn from_env() -> anyhow::Result<Self> {
         dotenvy::dotenv().ok();
 
@@ -152,6 +164,7 @@ impl AppConfig {
             reconcile_rps: number("RECONCILE_RPS", 3u32).max(1),
             wormhole_rps: number("WORMHOLE_RPS", 20u32).max(1),
             upstream_permits: number("UPSTREAM_PERMITS", 16usize).max(1),
+            failed_cache_ttl_secs: number("FAILED_CACHE_TTL_SECS", 10u64).max(1),
             port: std::env::var("PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
@@ -189,6 +202,57 @@ impl AppConfig {
                 origin_share_percent: number("REENRICH_ORIGIN_SHARE", 40u8).min(100),
             },
         })
+    }
+}
+
+#[cfg(test)]
+impl AppConfig {
+    /// An env-independent config for unit tests that build an `AppState` without a
+    /// database or any upstream: the API and live Helius endpoints differ so a test
+    /// can tell which lane a caller uses.
+    pub(crate) fn test_config() -> Self {
+        Self {
+            database_url: "postgres://127.0.0.1:1/unused".to_string(),
+            redis_url: "redis://127.0.0.1:1".to_string(),
+            helius_url: "https://api.helius.test".to_string(),
+            helius_live_url: "https://live.helius.test".to_string(),
+            helius_reconcile_url: "https://reconcile.helius.test".to_string(),
+            wormhole_url: "https://wormholescan.test".to_string(),
+            helius_api_rps: 20,
+            helius_live_rps: 20,
+            helius_live_token_wait: Duration::from_secs(5),
+            reconcile_rps: 20,
+            wormhole_rps: 20,
+            upstream_permits: 4,
+            failed_cache_ttl_secs: 10,
+            port: 0,
+            solana_token_bridge_program: "worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth".to_string(),
+            solana_ws_url: "ws://127.0.0.1:1".to_string(),
+            allowed_origins: Vec::new(),
+            ingest: IngestConfig {
+                enabled: false,
+                backfill: false,
+                backfill_max: 0,
+                backfill_pace_ms: 0,
+                dedupe_ttl_secs: 0,
+            },
+            reenrich: ReenrichConfig {
+                enabled: false,
+                interval_secs: 1,
+                batch: 1,
+                min_age_secs: 0,
+                retry_secs: 0,
+                max_age_secs: 1,
+                origin_share_percent: 40,
+            },
+            worker: WorkerConfig {
+                max_deliveries: 1,
+                reclaim_idle_ms: 1,
+                reclaim_interval_secs: 1,
+            },
+            chain_registry_refresh_secs: 60,
+            health_max_ingest_age_secs: 3600,
+        }
     }
 }
 

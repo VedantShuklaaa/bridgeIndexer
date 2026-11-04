@@ -54,6 +54,22 @@ impl Deref for AppState {
 }
 
 impl AppState {
+    /// A state for unit tests: an unconnectable lazy pool and an empty chain registry,
+    /// so a test that reaches the read path fails fast instead of touching a database.
+    #[cfg(test)]
+    pub(crate) fn test_state(config: AppConfig) -> Self {
+        use crate::chain_adapters::setup::build_registry;
+        use crate::chains::Snapshot;
+
+        let client = Client::new();
+        let registry = build_registry(&config, &client, config.helius_api_rps);
+        let chains = ChainRegistry::new(Snapshot::build(Vec::new(), Vec::new()));
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy(&config.database_url)
+            .expect("lazy pool");
+        Self::new(db, config, client, registry, chains).expect("test state")
+    }
+
     pub fn new(
         db: PgPool,
         config: AppConfig,
@@ -62,7 +78,10 @@ impl AppState {
         chains: ChainRegistry,
     ) -> anyhow::Result<Self> {
         let (tx_broadcast, _) = broadcast::channel(BROADCAST_CAPACITY);
-        let read_through = Arc::new(ReadThrough::new(config.upstream_permits));
+        let read_through = Arc::new(ReadThrough::new(
+            config.upstream_permits,
+            Duration::from_secs(config.failed_cache_ttl_secs),
+        ));
         let wormhole_rps = config.wormhole_rps;
         // The registry built the Helius adapter and its token metadata lookup around
         // one limiter; reuse it so metadata and getTransaction share the same quota.
@@ -121,5 +140,27 @@ impl AppState {
                 ..(*self.inner).clone()
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain_adapters::setup::build_registry;
+
+    /// The live lane must spend the live Helius key: every caller reads
+    /// `config.helius_url`, so `for_live` has to repoint it at `HELIUS_LIVE_URL`.
+    #[tokio::test]
+    async fn the_live_lane_uses_the_live_helius_url() {
+        let config = AppConfig::test_config();
+        let expected = config.helius_live_url.clone();
+        assert_ne!(expected, config.helius_url);
+
+        let base = AppState::test_state(config.clone());
+        let live_config = config.for_live();
+        let registry = build_registry(&live_config, &base.http_client, live_config.helius_live_rps);
+        let live = base.for_live(live_config, registry);
+
+        assert_eq!(live.config.helius_url, expected);
     }
 }

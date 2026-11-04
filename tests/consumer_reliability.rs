@@ -49,6 +49,7 @@ fn test_config(
         reconcile_rps: 20,
         wormhole_rps: 20,
         upstream_permits: 4,
+        failed_cache_ttl_secs: 10,
         port: 0,
         solana_token_bridge_program: "worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth".to_string(),
         solana_ws_url: "ws://127.0.0.1:0".to_string(),
