@@ -22,6 +22,8 @@ const POSTGRES_TAG: &str = "18";
 
 pub struct TestDb {
     pub pool: PgPool,
+    /// The same database as a URL, for tests that spawn the binary.
+    pub url: String,
     // Held so the container lives as long as the test.
     _container: Option<ContainerAsync<Postgres>>,
 }
@@ -38,8 +40,11 @@ pub async fn test_db() -> TestDb {
 
 /// A database with no migrations applied, for tests that stage old data first.
 pub async fn empty_db() -> TestDb {
-    let (pool, container) = match std::env::var("TEST_DATABASE_URL") {
-        Ok(url) => (fresh_database(&url).await, None),
+    let (pool, url, container) = match std::env::var("TEST_DATABASE_URL") {
+        Ok(url) => {
+            let (pool, fresh_url) = fresh_database(&url).await;
+            (pool, fresh_url, None)
+        }
         Err(_) => {
             let container = Postgres::default()
                 .with_tag(POSTGRES_TAG)
@@ -54,12 +59,13 @@ pub async fn empty_db() -> TestDb {
             let pool = PgPool::connect(&url)
                 .await
                 .expect("failed to connect to test postgres");
-            (pool, Some(container))
+            (pool, url, Some(container))
         }
     };
 
     TestDb {
         pool,
+        url,
         _container: container,
     }
 }
@@ -148,7 +154,7 @@ pub fn sample_redeem_tx(
     tx
 }
 
-async fn fresh_database(base_url: &str) -> PgPool {
+async fn fresh_database(base_url: &str) -> (PgPool, String) {
     let admin_options = PgConnectOptions::from_str(base_url).expect("invalid TEST_DATABASE_URL");
     let admin = PgPool::connect_with(admin_options.clone())
         .await
@@ -160,9 +166,30 @@ async fn fresh_database(base_url: &str) -> PgPool {
         .await
         .expect("failed to create test database");
 
-    PgPool::connect_with(admin_options.database(&name))
+    let pool = PgPool::connect_with(admin_options.database(&name))
         .await
-        .expect("failed to connect to test database")
+        .expect("failed to connect to test database");
+    (pool, with_database(base_url, &name))
+}
+
+/// Replaces the database segment of a Postgres URL without losing credentials or
+/// query parameters (sqlx's connect options do not implement `Display`).
+fn with_database(base_url: &str, database: &str) -> String {
+    let (base, query) = match base_url.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (base_url, None),
+    };
+    let prefix = base
+        .rsplit_once('/')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(base);
+
+    let mut url = format!("{prefix}/{database}");
+    if let Some(query) = query {
+        url.push('?');
+        url.push_str(query);
+    }
+    url
 }
 
 /// `XAUTOCLAIM`, which the recovery worker relies on, needs Redis 6.2+.
