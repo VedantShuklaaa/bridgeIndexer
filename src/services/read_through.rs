@@ -286,7 +286,7 @@ async fn check_memory(
 /// slot, a shared upstream permit and one provider token each for Helius and
 /// WormholeScan. `None` means something is busy right now.
 fn try_reserve_refresh(state: &AppState) -> Option<RefreshReservation> {
-    let rt = &state.read_through;
+    let rt = state.read_through();
     let slot = rt.refresh_permits.clone().try_acquire_owned().ok()?;
     let upstream = rt.upstream_permits.clone().try_acquire_owned().ok()?;
     // The tokens pay for the first upstream attempt of each call; a refresh that
@@ -327,7 +327,7 @@ async fn refresh(
     guard: RefreshGuard,
     _reservation: RefreshReservation,
 ) {
-    let rt = &state.read_through;
+    let rt = state.read_through();
 
     let fetched = complete_refresh(rt, &key, guard, || {
         // The reservation already paid the first Helius and WormholeScan token.
@@ -350,7 +350,7 @@ async fn refresh(
 }
 
 async fn maybe_spawn_refresh(state: &AppState, key: &str, chain: &str, hash: &str) {
-    let rt = &state.read_through;
+    let rt = state.read_through();
 
     if rt.refresh_cooldown.contains_key(key) {
         return;
@@ -401,7 +401,7 @@ pub async fn analyse_cached(
         return Err(AppError::InvalidTransactionHash(hash.to_string()));
     }
 
-    let rt = &state.read_through;
+    let rt = state.read_through();
     let key = normalised_key(chain, hash);
 
     // 1: fast path, memory only (hits and remembered failures)
@@ -482,7 +482,7 @@ pub async fn analyse_cached_v2(
     chain: &str,
     hash: &str,
 ) -> Result<Arc<V2Analysis>, AppError> {
-    let rt = &state.read_through;
+    let rt = state.read_through();
 
     if let Some(hit) = rt.v2_completed.get(hash).await {
         return Ok(hit);
@@ -597,7 +597,7 @@ mod tests {
 
         maybe_spawn_refresh(&state, key, "solana", "sig").await;
 
-        let rt = &state.read_through;
+        let rt = state.read_through();
         assert_eq!(rt.refresh_stats().spawned(), 0);
         assert_eq!(rt.refresh_stats().skipped_no_token(), 1);
         assert_eq!(rt.refresh_stats().skipped_inflight(), 0);
