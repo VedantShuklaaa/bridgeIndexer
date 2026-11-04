@@ -12,7 +12,7 @@ use bridge::chain_adapters::setup::build_registry;
 use bridge::chains::ChainRegistry;
 use bridge::clients::limiter::call_upstream;
 use bridge::clients::{helius, wormhole};
-use bridge::config::AppConfig;
+use bridge::config::{AppConfig, Lane};
 use bridge::db;
 use bridge::services::analyzer::analyse_tx;
 use bridge::services::replay::{Outcome, Summary, Verdict, compare};
@@ -96,7 +96,7 @@ async fn collect_signatures(
         let page = call_upstream(&state.helius_limiter, || {
             helius::get_signatures_for_address(
                 &state.http_client,
-                &state.config.helius_url,
+                &state.helius_url,
                 program,
                 before.clone(),
             )
@@ -235,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
 
     let db = db::connection::connect(&config.database_url).await?;
     let http_client = Client::builder().timeout(Duration::from_secs(15)).build()?;
-    let registry = build_registry(&config, &http_client, config.helius_api_rps);
+    let registry = build_registry(&config, &http_client, Lane::Api);
     let chains = ChainRegistry::load(&db).await?;
     let state = AppState::new(db, config, http_client, registry, chains)?;
 

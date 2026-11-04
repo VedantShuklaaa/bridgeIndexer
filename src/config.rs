@@ -1,3 +1,4 @@
+use crate::clients::limiter::API_TOKEN_WAIT;
 use std::time::Duration;
 
 /// Which part of the pipeline this process runs. `All` keeps the single-process
@@ -115,20 +116,21 @@ pub struct AppConfig {
     pub health_port: u16,
     pub database_url: String,
     pub redis_url: String,
-    /// Helius endpoint for the GET API (`/analyse`).
-    pub helius_url: String,
-    /// Helius endpoint for the live pipeline (backfill + consumer workers).
-    /// Falls back to `helius_url` when `HELIUS_LIVE_URL` is unset.
-    pub helius_live_url: String,
+    /// Helius endpoint for the API lane (`/analyse`, list endpoint).
+    /// `HELIUS_API_URL`, falling back to `HELIUS_URL`.
+    pub helius_api_url: String,
+    /// Helius endpoint for the ingest lane (ingester backfill + consumer workers).
+    /// `HELIUS_STREAM_URL`, then the deprecated `HELIUS_LIVE_URL`, then `HELIUS_URL`.
+    pub helius_stream_url: String,
     /// Helius endpoint for the read-only `reconcile` tool. Falls back to
-    /// `helius_url` when `HELIUS_RECONCILE_URL` is unset.
+    /// `HELIUS_URL` when `HELIUS_RECONCILE_URL` is unset.
     pub helius_reconcile_url: String,
     pub wormhole_url: String,
-    /// Helius requests/sec for the GET API. Helius free plan: 10 requests/sec per key.
-    /// The API and the live pipeline share one key until Phase 2 gives each its own,
-    /// so `helius_api_rps + helius_live_rps` must add up to the plan limit.
+    /// Helius requests/sec for the API lane. Helius free plan: 10 requests/sec per key.
+    /// While both lanes point at one key, `helius_api_rps + helius_live_rps` must add
+    /// up to the plan limit; with a key per lane each can use its own plan's limit.
     pub helius_api_rps: u32,
-    /// Helius requests/sec for the live pipeline (backfill + consumer workers).
+    /// Helius requests/sec for the ingest lane (backfill + consumer workers).
     pub helius_live_rps: u32,
     /// How long a live worker waits for its first Helius token of a message. The
     /// message stays in the stream meanwhile; it must stay well below the reclaim
@@ -162,10 +164,28 @@ impl AppConfig {
     /// The config the live pipeline runs with: everything is shared with the API
     /// except `helius_url`, which points at the live endpoint so the live registry,
     /// `analyse_tx` and account preloads spend the live key and quota.
-    pub fn for_live(&self) -> Self {
-        let mut live = self.clone();
-        live.helius_url = live.helius_live_url.clone();
-        live
+    /// The Helius endpoint a lane spends.
+    pub fn helius_url(&self, lane: Lane) -> &str {
+        match lane {
+            Lane::Api => &self.helius_api_url,
+            Lane::Ingest => &self.helius_stream_url,
+        }
+    }
+
+    /// Requests per second a lane's limiter allows.
+    pub fn helius_rps(&self, lane: Lane) -> u32 {
+        match lane {
+            Lane::Api => self.helius_api_rps,
+            Lane::Ingest => self.helius_live_rps,
+        }
+    }
+
+    /// How long a caller on this lane waits for a Helius token before giving up.
+    pub fn helius_token_wait(&self, lane: Lane) -> Duration {
+        match lane {
+            Lane::Api => API_TOKEN_WAIT,
+            Lane::Ingest => self.helius_live_token_wait,
+        }
     }
 
     pub fn from_env() -> anyhow::Result<Self> {
@@ -186,6 +206,10 @@ impl AppConfig {
                 .collect()
         }
 
+        fn non_empty(key: &str) -> Option<String> {
+            std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+        }
+
         fn number<T: std::str::FromStr>(key: &str, default: T) -> T {
             std::env::var(key)
                 .ok()
@@ -196,7 +220,17 @@ impl AppConfig {
         // Parsed before the other settings so a bad ROLE fails with its own message
         // rather than a missing database URL.
         let role = Role::from_env()?;
-        let helius_url = required("HELIUS_URL")?;
+        let helius = resolve_helius_urls(
+            role,
+            non_empty("HELIUS_URL"),
+            non_empty("HELIUS_API_URL"),
+            non_empty("HELIUS_STREAM_URL"),
+            non_empty("HELIUS_LIVE_URL"),
+            non_empty("HELIUS_RECONCILE_URL"),
+        )?;
+        if helius.used_legacy_live_url {
+            tracing::warn!("HELIUS_LIVE_URL is deprecated, rename it to HELIUS_STREAM_URL");
+        }
 
         Ok(Self {
             role,
@@ -207,9 +241,9 @@ impl AppConfig {
                 .unwrap_or(8081),
             database_url: required("DATABASE_URL")?,
             redis_url: required("REDIS_URL")?,
-            helius_live_url: optional("HELIUS_LIVE_URL", &helius_url),
-            helius_reconcile_url: optional("HELIUS_RECONCILE_URL", &helius_url),
-            helius_url,
+            helius_api_url: helius.api,
+            helius_stream_url: helius.ingest,
+            helius_reconcile_url: helius.reconcile,
             wormhole_url: optional("WORMHOLE_URL", "https://api.wormholescan.io"),
             helius_api_rps: number("HELIUS_API_RPS", 6u32).max(1),
             helius_live_rps: number("HELIUS_LIVE_RPS", 4u32).max(1),
@@ -261,6 +295,64 @@ impl AppConfig {
     }
 }
 
+/// A Helius provider lane: its own endpoint (so its own key and plan quota), its own
+/// rate limiter and its own token patience. `Api` serves `/analyse` and the list
+/// endpoint; `Ingest` is the pipeline (ingester backfill, consumer workers, recovery
+/// and re-enrichment).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lane {
+    Api,
+    Ingest,
+}
+
+/// The Helius endpoints resolved from the environment.
+#[derive(Debug, PartialEq, Eq)]
+struct HeliusUrls {
+    api: String,
+    ingest: String,
+    reconcile: String,
+    /// `HELIUS_LIVE_URL` supplied the ingest endpoint (the pre-1c name).
+    used_legacy_live_url: bool,
+}
+
+/// Picks each lane's endpoint. `HELIUS_API_URL` and `HELIUS_STREAM_URL` win; the
+/// ingest lane then accepts the pre-1c `HELIUS_LIVE_URL`, and both fall back to
+/// `HELIUS_URL`. Only the lanes the role runs have to resolve; a lane the role never
+/// builds borrows the other one so no field is ever empty.
+fn resolve_helius_urls(
+    role: Role,
+    base: Option<String>,
+    api: Option<String>,
+    stream: Option<String>,
+    legacy_live: Option<String>,
+    reconcile: Option<String>,
+) -> anyhow::Result<HeliusUrls> {
+    let used_legacy_live_url = stream.is_none() && legacy_live.is_some();
+    let api = api.or_else(|| base.clone());
+    let ingest = stream.or(legacy_live).or_else(|| base.clone());
+
+    if role.runs_api() && api.is_none() {
+        anyhow::bail!("HELIUS_API_URL not set (and no HELIUS_URL to fall back to)");
+    }
+    if role.runs_pipeline() && ingest.is_none() {
+        anyhow::bail!("HELIUS_STREAM_URL not set (and no HELIUS_URL to fall back to)");
+    }
+
+    let (api, ingest) = match (api, ingest) {
+        (Some(api), Some(ingest)) => (api, ingest),
+        (Some(url), None) | (None, Some(url)) => (url.clone(), url),
+        (None, None) => anyhow::bail!("set HELIUS_URL, or HELIUS_API_URL and HELIUS_STREAM_URL"),
+    };
+    let reconcile = reconcile.or(base).unwrap_or_else(|| api.clone());
+
+    Ok(HeliusUrls {
+        api,
+        ingest,
+        reconcile,
+        used_legacy_live_url,
+    })
+}
+
 #[cfg(test)]
 impl AppConfig {
     /// An env-independent config for unit tests that build an `AppState` without a
@@ -273,8 +365,8 @@ impl AppConfig {
             health_port: 0,
             database_url: "postgres://127.0.0.1:1/unused".to_string(),
             redis_url: "redis://127.0.0.1:1".to_string(),
-            helius_url: "https://api.helius.test".to_string(),
-            helius_live_url: "https://live.helius.test".to_string(),
+            helius_api_url: "https://api.helius.test".to_string(),
+            helius_stream_url: "https://stream.helius.test".to_string(),
             helius_reconcile_url: "https://reconcile.helius.test".to_string(),
             wormhole_url: "https://wormholescan.test".to_string(),
             helius_api_rps: 20,
@@ -365,5 +457,84 @@ mod tests {
         assert!(Role::All.runs_api() && Role::All.runs_pipeline());
         assert!(Role::Api.runs_api() && !Role::Api.runs_pipeline());
         assert!(!Role::Stream.runs_api() && Role::Stream.runs_pipeline());
+    }
+
+    fn s(value: &str) -> Option<String> {
+        Some(value.to_string())
+    }
+
+    #[test]
+    fn both_lanes_fall_back_to_helius_url() {
+        let urls = resolve_helius_urls(Role::All, s("base"), None, None, None, None).unwrap();
+        assert_eq!((urls.api.as_str(), urls.ingest.as_str()), ("base", "base"));
+        assert_eq!(urls.reconcile, "base");
+        assert!(!urls.used_legacy_live_url);
+    }
+
+    #[test]
+    fn each_lane_prefers_its_own_url() {
+        let urls = resolve_helius_urls(
+            Role::All,
+            s("base"),
+            s("api"),
+            s("stream"),
+            s("live"),
+            s("reconcile"),
+        )
+        .unwrap();
+        assert_eq!(urls.api, "api");
+        assert_eq!(urls.ingest, "stream");
+        assert_eq!(urls.reconcile, "reconcile");
+        assert!(!urls.used_legacy_live_url);
+    }
+
+    #[test]
+    fn the_old_live_url_still_feeds_the_ingest_lane_and_is_flagged() {
+        let urls =
+            resolve_helius_urls(Role::All, s("base"), s("api"), None, s("live"), None).unwrap();
+        assert_eq!(urls.api, "api");
+        assert_eq!(urls.ingest, "live");
+        assert!(urls.used_legacy_live_url);
+    }
+
+    #[test]
+    fn a_split_role_needs_only_its_own_lane_url() {
+        let api = resolve_helius_urls(Role::Api, None, s("api"), None, None, None).unwrap();
+        assert_eq!(api.api, "api");
+
+        let stream =
+            resolve_helius_urls(Role::Stream, None, None, s("stream"), None, None).unwrap();
+        assert_eq!(stream.ingest, "stream");
+    }
+
+    #[test]
+    fn a_missing_lane_url_names_the_variable() {
+        let error = resolve_helius_urls(Role::Api, None, None, s("stream"), None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("HELIUS_API_URL"), "{error}");
+
+        let error = resolve_helius_urls(Role::Stream, None, s("api"), None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("HELIUS_STREAM_URL"), "{error}");
+
+        assert!(resolve_helius_urls(Role::All, None, None, None, None, None).is_err());
+    }
+
+    #[test]
+    fn a_lane_reads_its_own_url_quota_and_patience() {
+        let config = AppConfig::test_config();
+        assert_ne!(
+            config.helius_url(Lane::Api),
+            config.helius_url(Lane::Ingest)
+        );
+        assert_eq!(config.helius_rps(Lane::Api), config.helius_api_rps);
+        assert_eq!(config.helius_rps(Lane::Ingest), config.helius_live_rps);
+        assert_eq!(config.helius_token_wait(Lane::Api), API_TOKEN_WAIT);
+        assert_eq!(
+            config.helius_token_wait(Lane::Ingest),
+            config.helius_live_token_wait
+        );
     }
 }

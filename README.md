@@ -444,7 +444,7 @@ which has to stay under the configured provider quotas.
 | Failed-analysis negative cache TTL | `FAILED_CACHE_TTL_SECS` | 10 s |
 | Max background refreshes | `MAX_BACKGROUND_REFRESHES` in `services/read_through.rs` | 8 |
 | Cache TTLs and capacities | `ReadThrough::new` | see table above |
-| Provider quotas | `HELIUS_API_RPS`, `HELIUS_LIVE_RPS` in `state.rs`, `wormhole_limiter` in `AppState::new` | Helius 6/s (API) + 4/s (live) to fit the free plan's 10/s on one shared key, WormholeScan 20/s. Raise them when you upgrade or split keys (Phase 2) |
+| Provider quotas | `HELIUS_API_RPS`, `HELIUS_LIVE_RPS` (one per lane, see `Lane` in `config.rs`), `wormhole_limiter` in `AppState::new` | Helius 6/s (API) + 4/s (ingest) to fit the free plan's 10/s while both lanes share one key, WormholeScan 20/s. With a key per lane (`HELIUS_API_URL`, `HELIUS_STREAM_URL`) raise each to its own plan's limit |
 
 ### Token metadata
 
@@ -676,8 +676,15 @@ and compares their status with WormholeScan, reusing the replay comparison.
 
 ### Config notes
 
-* `HELIUS_LIVE_URL` (optional, falls back to `HELIUS_URL`) is the endpoint for the
-  live pipeline.
+* Helius provider lanes (1c). `HELIUS_API_URL` is the API lane's endpoint and
+  `HELIUS_STREAM_URL` is the ingest lane's (ingester backfill, consumer workers,
+  recovery, re-enrichment); each falls back to `HELIUS_URL` when unset, so a single
+  `HELIUS_URL` still works. Each lane has its own limiter: `HELIUS_API_RPS` (6) and
+  `HELIUS_LIVE_RPS` (4). While both lanes point at one key those two must add up to the
+  plan limit; with a key per lane, give each the limit of its own plan. A process only
+  needs its own lane's URL (`ROLE=api` needs the API one, `ROLE=stream` the stream one).
+  `HELIUS_LIVE_URL` is the deprecated name of `HELIUS_STREAM_URL`: it is still read when
+  `HELIUS_STREAM_URL` is unset and logs a warning at startup.
 * `HELIUS_RECONCILE_URL` (optional, falls back to `HELIUS_URL`) and `RECONCILE_RPS`
   (default 3) are the `reconcile` tool's own Helius lane. Its limiter is built
   separately from the API's and the live pipeline's, so a reconciliation run cannot
@@ -889,7 +896,7 @@ Provider lanes, replay and the decode bench stay in this phase. Items 1a, 1b and
 
 * \[x] 1a. Split `analyse_tx` into fetch (IO), decode (pure, no network or state), enrich (IO). Delivered by A1
 * \[x] 1b. Destination tx resolution: operation payload paths first, then the `global-tx` lookup through the WormholeScan limiter. Delivered by A5b, as the WormholeScan enrichment provider
-* \[ ] 1c. Provider lanes: `Lane::Api` and `Lane::Ingest`, each with its own Helius URL (`HELIUS_API_URL`, `HELIUS_STREAM_URL`) and its own limiter. Fall back to `HELIUS_URL` when unset. Today the code has one extra endpoint, `HELIUS_LIVE_URL`, and `AppState::for_live` for the live pipeline. This item replaces it
+* \[x] 1c. Provider lanes: `Lane::Api` and `Lane::Ingest`, each with its own Helius URL (`HELIUS_API_URL`, `HELIUS_STREAM_URL`, both falling back to `HELIUS_URL`), its own limiter (`HELIUS_API_RPS`, `HELIUS_LIVE_RPS`) and its own token patience. `build_registry` takes a lane, `AppState` carries its lane and endpoint (`state.helius_url`), and `AppState::for_ingest` derives the ingest copy for `ROLE=all`; the `helius_live_url` config field and `AppConfig::for_live` are gone. The `HELIUS_LIVE_URL` variable is still read as a deprecated alias for `HELIUS_STREAM_URL` (with a startup warning) so an existing `.env` keeps its live key. A split role needs only its own lane's URL. The `reconcile` tool keeps its own `HELIUS_RECONCILE_URL` lane
 * \[x] 1d. Golden tests per fixture, status matrix test. Delivered by A9, with the matrix redefined for on-chain-first statuses: every outbound fixture is `Detected` from its on-chain decode alone, a matched VAA without a destination tx raises it to `Pending`, and a matched VAA plus its destination tx to `Completed`; no VAA, a VAA for another message (even with a destination tx), or a destination tx with no VAA leaves it `Detected`. Registry membership no longer chooses a status: the same rows produce the same status with an unregistered destination (only resolution and explorer URLs differ). Inbound redeems are `Completed` at detection. The old WormholeScan-driven matrix (known tx → `Completed`, none + registered chain → `Pending`, unregistered → `Detected`) remains only for the fallback path in `services::correlator`, tested there.
 * \[x] 1e. `src/bin/replay.rs`: take the last N signatures, run the pipeline, compare our status with WormholeScan's `global-tx`
 * \[ ] 1f. Criterion bench for the pure classify/decode path
@@ -900,7 +907,7 @@ Exit: ≥ 99% agreement on transfers older than 15 minutes; `Pending` only when 
 ## Phase 2 — deploy pipeline and roles
 
 * \[x] `ROLE=api|stream|all`. `api` serves `/analyse`; `stream` runs ingester, workers, recovery and `/stream`. Shared Postgres and Redis. Deploy exit criteria met: two systemd units on the main EC2 box, `bridge-api` (port 8080, `ROLE=api`) and `bridge-stream` (healthz on 8081, `ROLE=stream`), both reading the same `.env`; the old `bridge` unit is disabled and kept as the rollback. The 3g rerun ran against this deployed service (`docs/scaling-log.md`)
-* \[ ] Hostnames `api.<domain>` and `stream.<domain>`, each process with its own Helius key
+* \[ ] Hostnames `api.<domain>` and `stream.<domain>`. Each process's own Helius key is configurable since 1c (`HELIUS_API_URL`, `HELIUS_STREAM_URL`); what is left is the hostnames and setting the second key on the box
 * \[ ] CI builds the release binary; CD over SSH on merge to `main`: deploy key, one systemd unit per role, health check, rollback to previous binary
 * \[x] `GET /health`: Postgres and Redis ping, ingest heartbeat age, stream lag and pending, dead-letter depth. 200 normally, 503 on a dependency outage or stale ingest; cached 15 s
 * \[ ] Metrics: request latency histogram, cache hit/miss counters, limiter wait time, stream lag
@@ -947,9 +954,9 @@ Known suspects, most likely first:
 1. Checkpoint is slot-granular and backfill stops at `slot <= checkpoint`, so other transactions in the checkpoint's slot are lost on any reconnect
 2. Backfill runs before the read loop with a 150 ms sleep per signature, so live notifications queue up behind it
 3. No keepalive or watchdog: a silently dead socket produces neither errors nor data
-4. ~~A rejected `logsSubscribe` is swallowed (the check is unreachable)~~ — fixed in 4e: the reply is awaited before the read loop and a rejection or timeout is a failed connection. Any publish error still tears down the connection
-5. ~~The ingester is not under `spawn_supervised`, so a panic stops it permanently~~ — already handled by A8; the ingester starts under `spawn_supervised`
-6. ~~The checkpoint is written on every message and can move backwards on out-of-order slots~~ — fixed in 4e: the upsert uses `GREATEST`, so it only moves forward
+4. \~~A rejected `logsSubscribe` is swallowed (the check is unreachable)~~ — fixed in 4e: the reply is awaited before the read loop and a rejection or timeout is a failed connection. Any publish error still tears down the connection
+5. \~~The ingester is not under `spawn_supervised`, so a panic stops it permanently~~ — already handled by A8; the ingester starts under `spawn_supervised`
+6. \~~The checkpoint is written on every message and can move backwards on out-of-order slots~~ — fixed in 4e: the upsert uses `GREATEST`, so it only moves forward
 
 Work items:
 
@@ -1073,10 +1080,10 @@ rate-limit token, while API requests retain the existing 2-second wait. This
 lets queued transactions tolerate temporary rate-limit pressure instead of
 unnecessarily entering the dead-letter stream.
 
-- **Before:** 197 `service overloaded` dead-letter entries initially; the count continued growing during redrive, reaching 237.
-- **After:** No new dead-letter entries or overload log lines observed after deployment. The 7 remaining entries were successfully redriven, leaving 0.
-- **Rate limit and sizing:** Approximately 4 tokens/s. Five workers with `XREADGROUP COUNT 10` can have up to 50 messages waiting for tokens.
-- **Validation limitation:** Only a few messages arrived after deployment. This is evidence of normal-load behavior, not proof that a large burst or 400-entry redrive will succeed.
+* **Before:** 197 `service overloaded` dead-letter entries initially; the count continued growing during redrive, reaching 237.
+* **After:** No new dead-letter entries or overload log lines observed after deployment. The 7 remaining entries were successfully redriven, leaving 0.
+* **Rate limit and sizing:** Approximately 4 tokens/s. Five workers with `XREADGROUP COUNT 10` can have up to 50 messages waiting for tokens.
+* **Validation limitation:** Only a few messages arrived after deployment. This is evidence of normal-load behavior, not proof that a large burst or 400-entry redrive will succeed.
 
 Link to the detailed notes: [`docs/3e-worker-patience.md`](docs/3e-worker-patience.md).
 

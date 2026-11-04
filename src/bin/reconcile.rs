@@ -18,7 +18,7 @@ use bridge::chain_adapters::setup::build_registry;
 use bridge::chains::ChainRegistry;
 use bridge::clients::helius;
 use bridge::clients::limiter::call_upstream;
-use bridge::config::AppConfig;
+use bridge::config::{AppConfig, Lane};
 use bridge::db;
 use bridge::db::repository;
 use bridge::protocols::{Classification, Protocol, SolanaTx};
@@ -154,13 +154,13 @@ async fn main() -> anyhow::Result<()> {
 
     let mut config = AppConfig::from_env()?;
     // The reconcile tool's own Helius lane: its endpoint and quota, never the
-    // live pipeline's limiter.
-    config.helius_url = config.helius_reconcile_url.clone();
+    // ingest pipeline's limiter. It runs as an API-lane state pointed at its own key.
+    config.helius_api_url = config.helius_reconcile_url.clone();
     config.helius_api_rps = config.reconcile_rps;
 
     let db = db::connection::connect(&config.database_url).await?;
     let http_client = Client::builder().timeout(Duration::from_secs(15)).build()?;
-    let registry = build_registry(&config, &http_client, config.reconcile_rps);
+    let registry = build_registry(&config, &http_client, Lane::Api);
     let chains = ChainRegistry::load(&db).await?;
     let state = AppState::new(db, config, http_client, registry, chains)?;
 
@@ -322,7 +322,7 @@ async fn scan_signatures(
         let page = call_upstream(&state.helius_limiter, || {
             helius::get_signatures_for_address(
                 &state.http_client,
-                &state.config.helius_url,
+                &state.helius_url,
                 program,
                 before.clone(),
             )

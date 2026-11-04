@@ -288,7 +288,7 @@ async fn preload_accounts(state: &AppState, tx: &mut SolanaTx) -> Result<(), App
         return Ok(());
     }
     let accounts = call_upstream(&state.helius_limiter, || {
-        helius::get_multiple_accounts(&state.http_client, &state.config.helius_url, &keys)
+        helius::get_multiple_accounts(&state.http_client, &state.helius_url, &keys)
     })
     .await?;
 
@@ -337,7 +337,7 @@ async fn fetch_solana_source(
     match chain {
         "solana" => {
             let get_transaction =
-                || helius::get_transaction(&state.http_client, &state.config.helius_url, hash);
+                || helius::get_transaction(&state.http_client, &state.helius_url, hash);
             // Retries still wait on the limiter in both branches.
             let raw = if first_attempt_paid {
                 call_upstream_after_token(&state.helius_limiter, get_transaction).await?
