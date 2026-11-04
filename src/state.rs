@@ -1,7 +1,6 @@
 use crate::chain_adapters::registry::AdapterRegistry;
 use crate::chains::ChainRegistry;
-use crate::clients::limiter::API_TOKEN_WAIT;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, Lane};
 use crate::enrichment::EnrichmentProvider;
 use crate::enrichment::wormholescan::WormholeScanProvider;
 use crate::protocols::registry::{ProtocolRegistry, default_registry};
@@ -39,6 +38,11 @@ pub struct Inner {
     pub broadcast: BroadcastSink,
     /// The read-through cache. Built only in the roles that serve the read API.
     pub read_through: Option<Arc<ReadThrough>>,
+    /// The Helius lane this state spends: its endpoint, limiter and token patience.
+    pub lane: Lane,
+    /// The lane's Helius endpoint. Callers read this, never the config, so a state
+    /// can only ever call its own lane's key.
+    pub helius_url: String,
     pub helius_limiter: Arc<Limiter>,
     pub wormhole_limiter: Arc<Limiter>,
     pub enrichment: Arc<dyn EnrichmentProvider>,
@@ -67,7 +71,7 @@ impl AppState {
         use crate::chains::Snapshot;
 
         let client = Client::new();
-        let registry = build_registry(&config, &client, config.helius_api_rps);
+        let registry = build_registry(&config, &client, Lane::Api);
         let chains = ChainRegistry::new(Snapshot::build(Vec::new(), Vec::new()));
         let db = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy(&config.database_url)
@@ -92,9 +96,12 @@ impl AppState {
         // one limiter; reuse it so metadata and getTransaction share the same quota.
         let helius_limiter = registry.helius_limiter().unwrap_or_else(|| {
             Arc::new(RateLimiter::direct(Quota::per_second(
-                NonZeroU32::new(config.helius_api_rps).unwrap(),
+                NonZeroU32::new(config.helius_rps(Lane::Api)).unwrap(),
             )))
         });
+        let helius_url = config.helius_url(Lane::Api).to_string();
+        let helius_wait = config.helius_token_wait(Lane::Api);
+
         let wormhole_limiter: Arc<Limiter> = Arc::new(RateLimiter::direct(Quota::per_second(
             NonZeroU32::new(wormhole_rps).unwrap(),
         )));
@@ -116,16 +123,18 @@ impl AppState {
                 broadcast: BroadcastSink::Local(tx_broadcast.clone()),
                 tx_broadcast,
                 read_through: Some(read_through),
+                lane: Lane::Api,
+                helius_url,
                 helius_limiter,
                 wormhole_limiter,
                 enrichment,
-                helius_wait: API_TOKEN_WAIT,
+                helius_wait,
             }),
         })
     }
 
     /// The slim state `ROLE=stream` runs with: no read-through cache and the
-    /// registry passed in is the live-lane one (the API lane is never built).
+    /// registry passed in is the ingest-lane one (the API lane is never built).
     ///
     /// The protocol registry and the live registry stay: consumer analysis
     /// (`analyse_tx`) decodes with the former and resolves token metadata through
@@ -142,10 +151,11 @@ impl AppState {
             BroadcastSink::redis(&config.redis_url, config.pubsub_channel.clone()).await?;
         let helius_limiter = registry.helius_limiter().unwrap_or_else(|| {
             Arc::new(RateLimiter::direct(Quota::per_second(
-                NonZeroU32::new(config.helius_live_rps).unwrap(),
+                NonZeroU32::new(config.helius_rps(Lane::Ingest)).unwrap(),
             )))
         });
-        let helius_wait = config.helius_live_token_wait;
+        let helius_url = config.helius_url(Lane::Ingest).to_string();
+        let helius_wait = config.helius_token_wait(Lane::Ingest);
         let wormhole_limiter: Arc<Limiter> = Arc::new(RateLimiter::direct(Quota::per_second(
             NonZeroU32::new(config.wormhole_rps).unwrap(),
         )));
@@ -167,6 +177,8 @@ impl AppState {
                 broadcast,
                 tx_broadcast,
                 read_through: None,
+                lane: Lane::Ingest,
+                helius_url,
                 helius_limiter,
                 wormhole_limiter,
                 enrichment,
@@ -183,25 +195,26 @@ impl AppState {
             .expect("read-through cache is built only in ROLE=api|all")
     }
 
-    /// A copy of this state for the live pipeline (backfill and consumer workers):
-    /// it talks to Helius through its own endpoint, registry and rate limiter, so
-    /// live traffic can never eat into the GET API's quota. Everything else
-    /// (database, broadcast channel, Wormholescan limiter) stays shared.
-    pub fn for_live(&self, config: AppConfig, registry: AdapterRegistry) -> Self {
-        // Same wiring as `new`: the live registry's metadata lookup and the live
-        // pipeline share one limiter, separate from the GET API's.
+    /// A copy of this state for the ingest lane (backfill and consumer workers): its
+    /// own Helius endpoint, registry, rate limiter and token patience, so ingest
+    /// traffic can never eat into the API lane's quota. Everything else (database,
+    /// broadcast channel, Wormholescan limiter) stays shared.
+    pub fn for_ingest(&self, registry: AdapterRegistry) -> Self {
+        // Same wiring as `new`: the ingest registry's metadata lookup and the ingest
+        // pipeline share one limiter, separate from the API lane's.
+        let config = &self.config;
         let helius_limiter = registry.helius_limiter().unwrap_or_else(|| {
             Arc::new(RateLimiter::direct(Quota::per_second(
-                NonZeroU32::new(config.helius_live_rps).unwrap(),
+                NonZeroU32::new(config.helius_rps(Lane::Ingest)).unwrap(),
             )))
         });
-        let helius_wait = config.helius_live_token_wait;
         Self {
             inner: Arc::new(Inner {
-                config: Arc::new(config),
                 registry: Arc::new(registry),
+                lane: Lane::Ingest,
+                helius_url: config.helius_url(Lane::Ingest).to_string(),
                 helius_limiter,
-                helius_wait,
+                helius_wait: config.helius_token_wait(Lane::Ingest),
                 ..(*self.inner).clone()
             }),
         }
@@ -213,19 +226,27 @@ mod tests {
     use super::*;
     use crate::chain_adapters::setup::build_registry;
 
-    /// The live lane must spend the live Helius key: every caller reads
-    /// `config.helius_url`, so `for_live` has to repoint it at `HELIUS_LIVE_URL`.
+    /// Each lane must spend its own Helius key: the API state reads the API
+    /// endpoint and `for_ingest` repoints the copy at the stream endpoint, with the
+    /// ingest lane's own quota and patience.
     #[tokio::test]
-    async fn the_live_lane_uses_the_live_helius_url() {
+    async fn each_lane_spends_its_own_helius_key() {
         let config = AppConfig::test_config();
-        let expected = config.helius_live_url.clone();
-        assert_ne!(expected, config.helius_url);
+        assert_ne!(config.helius_api_url, config.helius_stream_url);
 
-        let base = AppState::test_state(config.clone());
-        let live_config = config.for_live();
-        let registry = build_registry(&live_config, &base.http_client, live_config.helius_live_rps);
-        let live = base.for_live(live_config, registry);
+        let api = AppState::test_state(config.clone());
+        assert_eq!(api.lane, Lane::Api);
+        assert_eq!(api.helius_url, config.helius_api_url);
+        assert_eq!(api.helius_wait, config.helius_token_wait(Lane::Api));
 
-        assert_eq!(live.config.helius_url, expected);
+        let registry = build_registry(&config, &api.http_client, Lane::Ingest);
+        let ingest = api.for_ingest(registry);
+
+        assert_eq!(ingest.lane, Lane::Ingest);
+        assert_eq!(ingest.helius_url, config.helius_stream_url);
+        assert_eq!(ingest.helius_wait, config.helius_live_token_wait);
+        assert!(!Arc::ptr_eq(&api.helius_limiter, &ingest.helius_limiter));
+        // The API state is untouched by deriving the ingest copy.
+        assert_eq!(api.helius_url, config.helius_api_url);
     }
 }

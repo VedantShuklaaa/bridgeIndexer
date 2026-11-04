@@ -8,29 +8,25 @@ use crate::{
         registry::AdapterRegistry, solana::SolanaAdapter, token_metadata::TokenMetadataLookup,
     },
     clients::limiter::Limiter,
-    config::AppConfig,
+    config::{AppConfig, Lane},
 };
 
 /// Wormhole chain ID of Solana. It is the only chain whose token metadata is looked up.
 const SOLANA_WORMHOLE_ID: u16 = 1;
 
-/// Builds the token metadata adapters and the Helius limiter they share with the
-/// state. `helius_rps` is the plan quota for this role: the API process passes
-/// `HELIUS_API_RPS`, the live pipeline passes `HELIUS_LIVE_RPS`.
-pub fn build_registry(
-    config: &AppConfig,
-    http_client: &Client,
-    helius_rps: u32,
-) -> AdapterRegistry {
+/// state, for one provider lane. The lane picks the endpoint (`HELIUS_API_URL` or
+/// `HELIUS_STREAM_URL`) and the quota (`HELIUS_API_RPS` or `HELIUS_LIVE_RPS`), so a
+/// lane's adapters and limiter can never point at the other lane's key.
+pub fn build_registry(config: &AppConfig, http_client: &Client, lane: Lane) -> AdapterRegistry {
     let mut registry = AdapterRegistry::new();
 
     let helius_limiter: Arc<Limiter> = Arc::new(RateLimiter::direct(Quota::per_second(
-        NonZeroU32::new(helius_rps).unwrap(),
+        NonZeroU32::new(config.helius_rps(lane)).unwrap(),
     )));
 
     let solana_adapter = Arc::new(SolanaAdapter::new(
         http_client.clone(),
-        config.helius_url.clone(),
+        config.helius_url(lane).to_string(),
         "solana",
     ));
     registry.register_token_metadata(SOLANA_WORMHOLE_ID, solana_adapter);

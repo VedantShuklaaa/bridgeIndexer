@@ -9,7 +9,7 @@ mod common;
 
 use bridge::chain_adapters::setup::build_registry;
 use bridge::chains::ChainRegistry;
-use bridge::config::{AppConfig, IngestConfig, ReenrichConfig, WorkerConfig};
+use bridge::config::{AppConfig, IngestConfig, Lane, ReenrichConfig, WorkerConfig};
 use bridge::redis::consumer::RedisConsumer;
 use bridge::state::AppState;
 use redis::aio::MultiplexedConnection;
@@ -42,8 +42,8 @@ fn test_config(
         health_port: 0,
         database_url: database_url.to_string(),
         redis_url: redis_url.to_string(),
-        helius_url: upstream_url.to_string(),
-        helius_live_url: upstream_url.to_string(),
+        helius_api_url: upstream_url.to_string(),
+        helius_stream_url: upstream_url.to_string(),
         helius_reconcile_url: upstream_url.to_string(),
         wormhole_url: upstream_url.to_string(),
         helius_api_rps: 20,
@@ -90,7 +90,7 @@ async fn live_state(pool: &PgPool, config: AppConfig) -> AppState {
         .build()
         .expect("http client");
     let chains = ChainRegistry::load(pool).await.expect("chain registry");
-    let registry = build_registry(&config, &client, config.helius_live_rps);
+    let registry = build_registry(&config, &client, Lane::Api);
     let base = AppState::new(
         pool.clone(),
         config.clone(),
@@ -100,8 +100,8 @@ async fn live_state(pool: &PgPool, config: AppConfig) -> AppState {
     )
     .expect("app state");
 
-    let live_registry = build_registry(&config, &client, config.helius_live_rps);
-    base.for_live(config, live_registry)
+    let live_registry = build_registry(&config, &client, Lane::Ingest);
+    base.for_ingest(live_registry)
 }
 
 fn spawn_consumer(

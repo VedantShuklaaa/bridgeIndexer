@@ -1,6 +1,6 @@
 use bridge::chain_adapters::setup::build_registry;
 use bridge::chains::{ChainRegistry, db::run_refresh_loop};
-use bridge::config::{AppConfig, Role};
+use bridge::config::{AppConfig, Lane, Role};
 use bridge::db;
 use bridge::enrichment::reenrich;
 use bridge::ingestion::solana::SolanaIngester;
@@ -96,7 +96,7 @@ async fn run_all(config: AppConfig) -> anyhow::Result<()> {
     let db = connect_database(&config).await?;
     let http_client = build_http_client()?;
 
-    let registry = build_registry(&config, &http_client, config.helius_api_rps);
+    let registry = build_registry(&config, &http_client, Lane::Api);
     let chains = ChainRegistry::load(&db).await?;
     let state = AppState::new(
         db.clone(),
@@ -106,12 +106,10 @@ async fn run_all(config: AppConfig) -> anyhow::Result<()> {
         chains.clone(),
     )?;
 
-    // The live pipeline (backfill + consumer workers) gets its own Helius endpoint, registry
-    // and rate limiter, so it can't use up the GET API's quota.
-    let live_config = config.for_live();
-
-    let live_registry = build_registry(&live_config, &http_client, live_config.helius_live_rps);
-    let live_state = state.for_live(live_config, live_registry);
+    // The ingest lane (backfill + consumer workers) gets its own Helius endpoint, registry
+    // and rate limiter, so it can't use up the API lane's quota.
+    let live_registry = build_registry(&config, &http_client, Lane::Ingest);
+    let live_state = state.for_ingest(live_registry);
 
     let redis = RedisProducer::new(&config.redis_url).await?;
     redis.test_connection().await?;
@@ -155,7 +153,7 @@ async fn run_api(config: AppConfig) -> anyhow::Result<()> {
     let db = connect_database(&config).await?;
     let http_client = build_http_client()?;
 
-    let registry = build_registry(&config, &http_client, config.helius_api_rps);
+    let registry = build_registry(&config, &http_client, Lane::Api);
     let chains = ChainRegistry::load(&db).await?;
     let state = AppState::new(
         db.clone(),
@@ -208,13 +206,12 @@ async fn run_stream(config: AppConfig) -> anyhow::Result<()> {
     let db = connect_database(&config).await?;
     let http_client = build_http_client()?;
 
-    // Only the live lane is built; the API registry is not.
-    let live_config = config.for_live();
-    let live_registry = build_registry(&live_config, &http_client, live_config.helius_live_rps);
+    // Only the ingest lane is built; the API lane is not.
+    let live_registry = build_registry(&config, &http_client, Lane::Ingest);
     let chains = ChainRegistry::load(&db).await?;
     let live_state = AppState::new_stream(
         db.clone(),
-        live_config,
+        config.clone(),
         http_client.clone(),
         live_registry,
         chains.clone(),
@@ -328,7 +325,7 @@ fn spawn_ingester(
         redis,
         db,
         http_client,
-        config.helius_live_url.clone(),
+        config.helius_url(Lane::Ingest).to_string(),
         config.ingest.clone(),
     ));
 

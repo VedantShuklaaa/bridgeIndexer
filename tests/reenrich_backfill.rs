@@ -6,7 +6,7 @@ mod common;
 
 use bridge::chain_adapters::setup::build_registry;
 use bridge::chains::ChainRegistry;
-use bridge::config::{AppConfig, IngestConfig, ReenrichConfig, WorkerConfig};
+use bridge::config::{AppConfig, IngestConfig, Lane, ReenrichConfig, WorkerConfig};
 use bridge::db::repository::persist_transaction;
 use bridge::domain::bridge_transfer::ChainId;
 use bridge::enrichment::reenrich::run_pass;
@@ -23,8 +23,8 @@ fn test_config(upstream_url: &str, batch: i64, origin_share_percent: u8) -> AppC
         health_port: 0,
         database_url: "postgres://unused".to_string(),
         redis_url: "redis://127.0.0.1:1".to_string(),
-        helius_url: upstream_url.to_string(),
-        helius_live_url: upstream_url.to_string(),
+        helius_api_url: upstream_url.to_string(),
+        helius_stream_url: upstream_url.to_string(),
         helius_reconcile_url: upstream_url.to_string(),
         wormhole_url: upstream_url.to_string(),
         helius_api_rps: 20,
@@ -72,7 +72,7 @@ async fn state(pool: &PgPool, config: AppConfig) -> AppState {
         .build()
         .expect("http client");
     let chains = ChainRegistry::load(pool).await.expect("chain registry");
-    let registry = build_registry(&config, &client, config.helius_api_rps);
+    let registry = build_registry(&config, &client, Lane::Api);
     AppState::new(pool.clone(), config, client, registry, chains).expect("app state")
 }
 

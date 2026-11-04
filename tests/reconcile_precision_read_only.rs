@@ -12,7 +12,7 @@ mod common;
 
 use bridge::chain_adapters::setup::build_registry;
 use bridge::chains::ChainRegistry;
-use bridge::config::{AppConfig, IngestConfig, ReenrichConfig, WorkerConfig};
+use bridge::config::{AppConfig, IngestConfig, Lane, ReenrichConfig, WorkerConfig};
 use bridge::db::repository;
 use bridge::domain::bridge_transfer::ChainId;
 use bridge::services::precision::precision_pass;
@@ -63,8 +63,8 @@ fn test_config(database_url: &str, upstream_url: &str) -> AppConfig {
         // The analysis path never opens Redis; a value here is only a reminder that
         // nothing in the pass should need it.
         redis_url: "redis://127.0.0.1:1".to_string(),
-        helius_url: upstream_url.to_string(),
-        helius_live_url: upstream_url.to_string(),
+        helius_api_url: upstream_url.to_string(),
+        helius_stream_url: upstream_url.to_string(),
         helius_reconcile_url: upstream_url.to_string(),
         wormhole_url: upstream_url.to_string(),
         helius_api_rps: 20,
@@ -132,7 +132,7 @@ async fn the_precision_pass_leaves_every_table_untouched() {
     // The state is handed the pool directly; the analysis path never reads
     // `database_url`. Nothing in the pass may need it, which is the point.
     let config = test_config("postgres://unused", &fake.base_url);
-    let registry = build_registry(&config, &client, config.helius_api_rps);
+    let registry = build_registry(&config, &client, Lane::Api);
     let chains = ChainRegistry::load(&db.pool).await.expect("chain registry");
     let state =
         AppState::new(db.pool.clone(), config, client, registry, chains).expect("app state");
