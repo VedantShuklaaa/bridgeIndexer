@@ -401,7 +401,7 @@ that almost no request pays that cost.
 
 ```mermaid
 flowchart TD
-    REQ[GET /analyse] --> VAL{Valid hash?}
+    REQ[GET /analyse] --> VAL{Valid hash and chain?}
     VAL -- no --> E400[400, no cache or upstream touched]
     VAL -- yes --> MEM{"Memory cache: completed, open, negative"}
     MEM -- hit --> RESP[Respond]
@@ -423,9 +423,9 @@ flowchart TD
 
 | Layer | What it does |
 | --- | --- |
-| Hash validation | Rejects anything that isn't a 64-byte base58 Solana signature before any cache or upstream call. |
-| Memory cache (moka) | `completed` transfers for 10 min, `open` (Pending/Detected) for 15 s, `not_found` for 30 s, transient upstream failures for 2 s. |
-| Single-flight lock | One request per transaction hash does the work; concurrent requests for the same hash wait, then re-check memory. 50 concurrent requests for one uncached hash cause 1 upstream fetch. |
+| Hash validation | Rejects anything that isn't a 64-byte base58 Solana signature, and any source chain other than Solana, with a 400 before any cache or upstream call. |
+| Memory cache (moka) | `completed` transfers for 10 min, `open` (Pending/Detected) for 15 s, `not_found` for 30 s, transient upstream and normalisation failures for 10 s (`FAILED_CACHE_TTL_SECS`). |
+| Single-flight lock | One request per `(chain, transaction hash)` does the work; concurrent requests for the same key wait, then re-check memory. 50 concurrent requests for one uncached hash cause 1 upstream fetch. |
 | Postgres | `bridge_transfers.analysis` holds the last analysis. Completed transfers are always fresh; Pending/Detected ones are fresh for 60 s. |
 | Stale-while-revalidate | A stale row is served immediately and refreshed in the background (max 8 refreshes at once, 15 s cooldown per key). A failed refresh only logs; the stale copy keeps being served. |
 | Rate limiting | One limiter per provider (`governor`), so retries can't exceed a provider's quota. A call waits at most 2 s for a token, then fails fast with a 503. |
@@ -441,6 +441,7 @@ which has to stay under the configured provider quotas.
 | Setting | Where | Default |
 | --- | --- | --- |
 | Freshness window for non-Completed rows | `FRESH_SECS` in `services/read_through.rs` | 60 s |
+| Failed-analysis negative cache TTL | `FAILED_CACHE_TTL_SECS` | 10 s |
 | Max background refreshes | `MAX_BACKGROUND_REFRESHES` in `services/read_through.rs` | 8 |
 | Cache TTLs and capacities | `ReadThrough::new` | see table above |
 | Provider quotas | `HELIUS_API_RPS`, `HELIUS_LIVE_RPS` in `state.rs`, `wormhole_limiter` in `AppState::new` | Helius 6/s (API) + 4/s (live) to fit the free plan's 10/s on one shared key, WormholeScan 20/s. Raise them when you upgrade or split keys (Phase 2) |

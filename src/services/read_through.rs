@@ -28,6 +28,7 @@ enum Neg {
     RateLimited,
     Timeout,
     Provider,
+    Normalisation(String),
 }
 
 impl Neg {
@@ -38,6 +39,7 @@ impl Neg {
             AppError::UpstreamRateLimited(_) => Some(Neg::RateLimited),
             AppError::UpstreamTimeout(_) => Some(Neg::Timeout),
             AppError::UpstreamProvider { .. } => Some(Neg::Provider),
+            AppError::Normalisation(message) => Some(Neg::Normalisation(message.clone())),
             _ => None,
         }
     }
@@ -53,8 +55,15 @@ impl Neg {
                 message: "recent upstream failure".to_string(),
                 retryable: true,
             },
+            Neg::Normalisation(message) => AppError::Normalisation(message),
         }
     }
+}
+
+/// One key for every per-chain memo: the chain slug lowercased, so `Solana` and
+/// `solana` share single-flight, the refresh cooldown and the negative caches.
+fn normalised_key(chain: &str, hash: &str) -> String {
+    format!("{}:{hash}", chain.to_ascii_lowercase())
 }
 
 /// A `/api/v2` response and the legacy `bridge_event` `/api/v1` still exposes. The
@@ -113,14 +122,14 @@ pub struct ReadThrough {
     v2_open: Cache<String, Arc<V2Analysis>>,
     // negative caches
     not_found: Cache<String, Neg>, // tx doesn't exist: longer TTL
-    failed: Cache<String, Neg>,    // transient upstream failure: very short TTL
+    failed: Cache<String, Neg>,    // transient or normalisation failure: short TTL
     // stale-while-revalidate
     refresh_permits: Arc<Semaphore>,
     refresh_cooldown: Cache<String, ()>, // at most one refresh attempt per key per TTL
 }
 
 impl ReadThrough {
-    pub fn new(max_concurrent_upstream: usize) -> Self {
+    pub fn new(max_concurrent_upstream: usize, failed_ttl: Duration) -> Self {
         Self {
             inflight: DashMap::new(),
             upstream_permits: Semaphore::new(max_concurrent_upstream),
@@ -147,7 +156,7 @@ impl ReadThrough {
                 .build(),
             failed: Cache::builder()
                 .max_capacity(10_000)
-                .time_to_live(Duration::from_secs(2))
+                .time_to_live(failed_ttl)
                 .build(),
             refresh_permits: Arc::new(Semaphore::new(MAX_BACKGROUND_REFRESHES)),
             refresh_cooldown: Cache::builder()
@@ -185,6 +194,7 @@ async fn remember(rt: &ReadThrough, hash: &str, tx: &NormalisedTransaction) {
 /// Memory-only check: positive caches first, then negative caches.
 async fn check_memory(
     rt: &ReadThrough,
+    key: &str,
     hash: &str,
 ) -> Option<Result<NormalisedTransaction, AppError>> {
     if let Some(hit) = rt.completed.get(hash).await {
@@ -193,10 +203,10 @@ async fn check_memory(
     if let Some(hit) = rt.open.get(hash).await {
         return Some(Ok(hit));
     }
-    if let Some(n) = rt.not_found.get(hash).await {
+    if let Some(n) = rt.not_found.get(key).await {
         return Some(Err(n.into_error(hash)));
     }
-    if let Some(n) = rt.failed.get(hash).await {
+    if let Some(n) = rt.failed.get(key).await {
         return Some(Err(n.into_error(hash)));
     }
     None
@@ -231,17 +241,17 @@ async fn refresh(state: AppState, chain: String, hash: String, _slot: OwnedSemap
     }
 }
 
-async fn maybe_spawn_refresh(state: &AppState, chain: &str, hash: &str) {
+async fn maybe_spawn_refresh(state: &AppState, key: &str, chain: &str, hash: &str) {
     let rt = &state.read_through;
 
-    if rt.refresh_cooldown.contains_key(hash) {
+    if rt.refresh_cooldown.contains_key(key) {
         return;
     }
     // bounded number of concurrent background refreshes; skip if all busy
     let Ok(slot) = rt.refresh_permits.clone().try_acquire_owned() else {
         return;
     };
-    rt.refresh_cooldown.insert(hash.to_string(), ()).await;
+    rt.refresh_cooldown.insert(key.to_string(), ()).await;
 
     let state = state.clone();
     let chain = chain.to_string();
@@ -268,13 +278,13 @@ pub async fn analyse_cached(
     }
 
     let rt = &state.read_through;
+    let key = normalised_key(chain, hash);
 
     // 1: fast path, memory only (hits and remembered failures)
-    if let Some(r) = check_memory(rt, hash).await {
+    if let Some(r) = check_memory(rt, &key, hash).await {
         return r;
     }
 
-    let key = format!("{chain}:{hash}");
     let lock = rt
         .inflight
         .entry(key.clone())
@@ -284,14 +294,14 @@ pub async fn analyse_cached(
 
     let result = async {
         // someone ahead of us may have filled a cache (or recorded a failure)
-        if let Some(r) = check_memory(rt, hash).await {
+        if let Some(r) = check_memory(rt, &key, hash).await {
             return r;
         }
 
         if let Some((hit, fresh)) = lookup(state, hash).await {
             remember(rt, hash, &hit).await;
             if !fresh {
-                maybe_spawn_refresh(state, chain, hash).await;
+                maybe_spawn_refresh(state, &key, chain, hash).await;
             }
             return Ok(hit);
         }
@@ -325,7 +335,7 @@ pub async fn analyse_cached(
                     } else {
                         &rt.failed
                     };
-                    cache.insert(hash.to_string(), neg).await;
+                    cache.insert(key.clone(), neg).await;
                 }
             }
         }
@@ -377,4 +387,41 @@ pub async fn analyse_cached_v2(
     };
     cache.insert(hash.to_string(), entry.clone()).await;
     Ok(entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_key_lowercases_the_chain_so_casing_cannot_split_the_caches() {
+        assert_eq!(normalised_key("Solana", "sig"), "solana:sig");
+        assert_eq!(
+            normalised_key("SOLANA", "sig"),
+            normalised_key("solana", "sig")
+        );
+        assert_ne!(
+            normalised_key("solana", "sig"),
+            normalised_key("ethereum", "sig")
+        );
+    }
+
+    #[test]
+    fn normalisation_failures_are_negative_cached_with_their_message() {
+        let neg = Neg::from_error(&AppError::Normalisation("bad vaa".into()))
+            .expect("normalisation errors are cached");
+        match neg.into_error("sig") {
+            AppError::Normalisation(message) => assert_eq!(message, "bad vaa"),
+            other => panic!("expected a normalisation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_failed_cache_ttl_comes_from_the_constructor() {
+        let rt = ReadThrough::new(4, Duration::from_secs(10));
+        assert_eq!(
+            rt.failed.policy().time_to_live(),
+            Some(Duration::from_secs(10))
+        );
+    }
 }

@@ -14,6 +14,18 @@ fn default_chain() -> String {
     "solana".to_string()
 }
 
+/// Only Solana is a supported source chain. Reject anything else before the read
+/// path, so an unsupported chain never reaches a cache or spends an upstream call.
+/// The slug is lowercased so `Solana` and `solana` share every per-chain memo.
+fn supported_chain(chain: &str) -> Result<String, AppError> {
+    let chain = chain.to_ascii_lowercase();
+    if chain == "solana" {
+        Ok(chain)
+    } else {
+        Err(AppError::BadRequest(format!("unsupported chain: {chain}")))
+    }
+}
+
 #[derive(Deserialize)]
 pub struct AnalyseQuery {
     pub transaction_hash: String,
@@ -25,8 +37,9 @@ pub async fn analyse_handler(
     State(state): State<AppState>,
     Query(params): Query<AnalyseQuery>,
 ) -> Result<Response, AppError> {
+    let chain = supported_chain(&params.chain)?;
     let analysed =
-        read_through::analyse_cached_v2(&state, &params.chain, &params.transaction_hash).await?;
+        read_through::analyse_cached_v2(&state, &chain, &params.transaction_hash).await?;
     v1_response(&analysed)
 }
 
@@ -57,8 +70,9 @@ pub async fn analyse_v2_handler(
     State(state): State<AppState>,
     Query(params): Query<AnalyseQuery>,
 ) -> Result<Response, AppError> {
+    let chain = supported_chain(&params.chain)?;
     let analysed =
-        read_through::analyse_cached_v2(&state, &params.chain, &params.transaction_hash).await?;
+        read_through::analyse_cached_v2(&state, &chain, &params.transaction_hash).await?;
     Ok(v2_response(&analysed))
 }
 
@@ -199,5 +213,38 @@ mod tests {
             assert_eq!(hit.headers(), &expected_headers, "hit {hit_number}");
             assert_eq!(bytes_of(hit).await, expected_body, "hit {hit_number}");
         }
+    }
+
+    #[test]
+    fn only_solana_is_supported_and_the_slug_is_lowercased() {
+        assert_eq!(supported_chain("solana").expect("supported"), "solana");
+        assert_eq!(supported_chain("Solana").expect("supported"), "solana");
+        for unsupported in ["ethereum", "SOLANA ", ""] {
+            assert!(
+                matches!(supported_chain(unsupported), Err(AppError::BadRequest(_))),
+                "{unsupported:?} must be a bad request"
+            );
+        }
+    }
+
+    /// Validation runs before `read_through`, so the unconnectable test state is
+    /// never used and no Helius or WormholeScan call can happen.
+    #[tokio::test]
+    async fn both_handlers_reject_an_unsupported_chain_before_the_read_path() {
+        let state = crate::state::AppState::test_state(crate::config::AppConfig::test_config());
+        let params = || AnalyseQuery {
+            transaction_hash: "sig".to_string(),
+            chain: "ethereum".to_string(),
+        };
+
+        let err = analyse_handler(State(state.clone()), Query(params()))
+            .await
+            .expect_err("unsupported chain");
+        assert!(matches!(err, AppError::BadRequest(_)));
+
+        let err = analyse_v2_handler(State(state), Query(params()))
+            .await
+            .expect_err("unsupported chain");
+        assert!(matches!(err, AppError::BadRequest(_)));
     }
 }

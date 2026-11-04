@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
 
     // The live pipeline (backfill + consumer workers) gets its own Helius endpoint, registry
     // and rate limiter, so it can't use up the GET API's quota.
-    let live_config = config.clone();
+    let live_config = config.for_live();
 
     let live_registry = build_registry(&live_config, &http_client, live_config.helius_live_rps);
     let live_state = state.for_live(live_config, live_registry);
