@@ -621,6 +621,33 @@ fake upstream, not Helius. `R-mix` uses `--disable-keepalive` and is not
 comparable with `R-hit`. Earlier `R-mix` numbers are not comparable with these.
 
 
+## Cold-path quota fixes (2026-11-04)
+
+Two merged PRs (#60, #61), with correctness tests rather than a throughput
+experiment. Each change removes a way a cold request could spend provider quota
+(it shares the Helius free plan's ~6 uncached lookups/s) without doing useful
+work.
+
+- Unknown `chain` is rejected with a 400 before any cache or upstream call.
+  Previously a non-Solana chain still fired a WormholeScan request on every
+  request, because the Normalisation error was not negative-cached.
+- One normalised key (lowercased chain + hash) is used for single-flight, the
+  15 s refresh cooldown and the not-found cache. The same hash under two chain
+  spellings could previously bypass dedupe and spawn a second refresh.
+- The live lane uses `HELIUS_LIVE_URL`. `live_config` never copied
+  `helius_live_url` into `helius_url`, so live `getTransaction` and
+  `getMultipleAccounts` calls still spent the API key.
+- Normalisation errors are negative-cached, and the failed-fetch TTL is raised
+  from 2 s to 10 s (`FAILED_CACHE_TTL_SECS`).
+- Background refresh admission is atomic: a key is claimed with an
+  insert-if-absent guard released by RAII, so concurrent hits on one stale entry
+  start at most one refresh.
+- A refresh never waits on quota. It try-acquires a background slot, a shared
+  upstream permit and one Helius and WormholeScan token; if any is busy it is
+  skipped and does not set the cooldown, leaving the quota to user cold lookups.
+  Spawned and skipped refreshes are counted.
+
+
 ## How to run the 3g list benchmarks
 
 `GET /api/v2/transfers` has no cache: every request goes to Postgres. The three
@@ -770,3 +797,65 @@ resource was identified.
   runs.
 - The plans in `docs/3g-list-endpoint.md` are synthetic and local; their
   millisecond values are not results.
+
+## ROLE split (api/stream) — 3g rerun (2026-11-04)
+
+Results: `bench-results/20261104T181215Z`, server git `1dc62db`.
+
+### Hypothesis
+
+Serving the API from a dedicated `ROLE=api` process, with ingester, workers,
+recovery and the WebSocket stream in a `ROLE=stream` process, does not regress
+the three 3g list workloads.
+
+### Workload
+
+Same as the 3g entry: `list-first`, `list-deep` and `list-filtered` against
+`GET /api/v2/transfers`, 50 connections, 30 s per run, two runs per workload.
+
+### Setup
+
+- Server: EC2 `m7i-flex.large`, git `1dc62db`.
+- Two systemd units on the same box: `bridge-api` (port 8080, `ROLE=api`) and
+  `bridge-stream` (healthz on 8081, `ROLE=stream`), both reading the same
+  `.env`. The old `bridge` unit is disabled and kept as the rollback.
+- `cold_start=no`: run 1 is a first run, not a restart-cold run.
+- No cache on the list path; every request reads Postgres.
+
+### After
+
+| Workload | Run | Connections | req/s | median (ms) | p99 (ms) | non-2xx |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| list-first | 1 | 50 | 1,602 | — | 62 | 0 |
+| list-first | 2 | 50 | 1,576 | — | 73 | 0 |
+| list-deep | 1 | 50 | 1,535 | — | 65 | 0 |
+| list-deep | 2 | 50 | 1,465 | — | 101 | 0 |
+| list-filtered | 1 | 50 | 1,290 | — | 74 | 0 |
+| list-filtered | 2 | 50 | 1,212 | — | 104 | 0 |
+
+### Delta
+
+| Workload | 3g req/s | Role split req/s | 3g p99 (ms) | Role split p99 (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| list-first | 1,574 / 1,571 | 1,602 / 1,576 | 66 / 66 | 62 / 73 |
+| list-deep | 1,463 / 1,508 | 1,535 / 1,465 | 90 / 74 | 65 / 101 |
+| list-filtered | 1,272 / 1,295 | 1,290 / 1,212 | 85 / 80 | 74 / 104 |
+
+Run 1 / run 2. This is **no regression, within run-to-run noise**, not an
+improvement. The targets (300 req/s, p99 < 150 ms) are met on every row.
+
+### Runs
+
+- `bench-results/20261104T181215Z/meta.txt` (SHA, instance type, cold_start)
+- One JSON file per workload and run in the same directory.
+
+### Limited by
+
+Not measured in these runs.
+
+### Notes
+
+- `cold_start=no`: run 1 is a first run, not a restart-cold run.
+- Zero non-2xx across all six runs.
+- The `bridge-stream` process still shares the box's CPU with the API, so this
+  run does not isolate the API from ingest load.

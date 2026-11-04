@@ -899,7 +899,7 @@ Exit: ≥ 99% agreement on transfers older than 15 minutes; `Pending` only when 
 
 ## Phase 2 — deploy pipeline and roles
 
-* \[ ] `ROLE=api|stream|all`. `api` serves `/analyse`; `stream` runs ingester, workers, recovery and `/stream`. Shared Postgres and Redis
+* \[x] `ROLE=api|stream|all`. `api` serves `/analyse`; `stream` runs ingester, workers, recovery and `/stream`. Shared Postgres and Redis. Deploy exit criteria met: two systemd units on the main EC2 box, `bridge-api` (port 8080, `ROLE=api`) and `bridge-stream` (healthz on 8081, `ROLE=stream`), both reading the same `.env`; the old `bridge` unit is disabled and kept as the rollback. The 3g rerun ran against this deployed service (`docs/scaling-log.md`)
 * \[ ] Hostnames `api.<domain>` and `stream.<domain>`, each process with its own Helius key
 * \[ ] CI builds the release binary; CD over SSH on merge to `main`: deploy key, one systemd unit per role, health check, rollback to previous binary
 * \[x] `GET /health`: Postgres and Redis ping, ingest heartbeat age, stream lag and pending, dead-letter depth. 200 normally, 503 on a dependency outage or stale ingest; cached 15 s
