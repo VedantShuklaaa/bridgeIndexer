@@ -1,8 +1,10 @@
 use crate::domain::bridge_transfer::BridgeStatus;
 use axum::body::Bytes;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use moka::future::Cache;
+use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
@@ -14,7 +16,7 @@ use crate::domain::bridge::BridgeEvent;
 use crate::domain::transaction::NormalisedTransaction;
 use crate::error::AppError;
 use crate::routes::v1::compat;
-use crate::services::analyzer::analyse_tx;
+use crate::services::analyzer::{analyse_tx, analyse_tx_prepaid};
 use crate::services::api_v2;
 use crate::state::AppState;
 
@@ -115,7 +117,7 @@ impl V2Analysis {
 
 pub struct ReadThrough {
     inflight: DashMap<String, Arc<Mutex<()>>>,
-    upstream_permits: Semaphore,
+    upstream_permits: Arc<Semaphore>,
     completed: Cache<String, NormalisedTransaction>,
     open: Cache<String, NormalisedTransaction>,
     v2_completed: Cache<String, Arc<V2Analysis>>,
@@ -125,14 +127,62 @@ pub struct ReadThrough {
     failed: Cache<String, Neg>,    // transient or normalisation failure: short TTL
     // stale-while-revalidate
     refresh_permits: Arc<Semaphore>,
+    /// Keys with a refresh currently running. Claimed atomically so concurrent hits
+    /// for one key can only ever start one refresh; released by an RAII guard.
+    refresh_inflight: Arc<DashSet<String>>,
     refresh_cooldown: Cache<String, ()>, // at most one refresh attempt per key per TTL
+    refresh_stats: RefreshStats,
+}
+
+/// Counters for the background refresh admission decisions, so a benchmark can
+/// show how many refreshes ran and why the others were skipped.
+#[derive(Debug, Default)]
+pub struct RefreshStats {
+    spawned: AtomicU64,
+    skipped_no_token: AtomicU64,
+    skipped_inflight: AtomicU64,
+}
+
+impl RefreshStats {
+    pub fn spawned(&self) -> u64 {
+        self.spawned.load(Ordering::Relaxed)
+    }
+
+    pub fn skipped_no_token(&self) -> u64 {
+        self.skipped_no_token.load(Ordering::Relaxed)
+    }
+
+    pub fn skipped_inflight(&self) -> u64 {
+        self.skipped_inflight.load(Ordering::Relaxed)
+    }
+}
+
+/// Removes the key from the in-flight set when the refresh finishes, fails or
+/// panics.
+struct RefreshGuard {
+    inflight: Arc<DashSet<String>>,
+    key: String,
+}
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        self.inflight.remove(&self.key);
+    }
+}
+
+/// Everything a background refresh holds while it runs: a background slot and a
+/// shared upstream permit. Both are taken with `try_acquire`, so a refresh never
+/// queues behind user requests.
+struct RefreshReservation {
+    _slot: OwnedSemaphorePermit,
+    _upstream: OwnedSemaphorePermit,
 }
 
 impl ReadThrough {
     pub fn new(max_concurrent_upstream: usize, failed_ttl: Duration) -> Self {
         Self {
             inflight: DashMap::new(),
-            upstream_permits: Semaphore::new(max_concurrent_upstream),
+            upstream_permits: Arc::new(Semaphore::new(max_concurrent_upstream)),
             completed: Cache::builder()
                 .max_capacity(50_000)
                 .time_to_live(Duration::from_secs(600))
@@ -159,11 +209,31 @@ impl ReadThrough {
                 .time_to_live(failed_ttl)
                 .build(),
             refresh_permits: Arc::new(Semaphore::new(MAX_BACKGROUND_REFRESHES)),
+            refresh_inflight: Arc::new(DashSet::new()),
             refresh_cooldown: Cache::builder()
                 .max_capacity(50_000)
                 .time_to_live(Duration::from_secs(15))
                 .build(),
+            refresh_stats: RefreshStats::default(),
         }
+    }
+
+    /// Atomically claims a key for a background refresh. `None` means another
+    /// refresh for the same key is already running.
+    fn begin_refresh(&self, key: &str) -> Option<RefreshGuard> {
+        if !self.refresh_inflight.insert(key.to_string()) {
+            return None;
+        }
+        Some(RefreshGuard {
+            inflight: Arc::clone(&self.refresh_inflight),
+            key: key.to_string(),
+        })
+    }
+
+    /// Counters for spawned, skipped-without-token and skipped-already-in-flight
+    /// refreshes.
+    pub fn refresh_stats(&self) -> &RefreshStats {
+        &self.refresh_stats
     }
 }
 
@@ -212,19 +282,57 @@ async fn check_memory(
     None
 }
 
+/// Reserves the resources a refresh needs, without ever waiting: a background
+/// slot, a shared upstream permit and one provider token each for Helius and
+/// WormholeScan. `None` means something is busy right now.
+fn try_reserve_refresh(state: &AppState) -> Option<RefreshReservation> {
+    let rt = &state.read_through;
+    let slot = rt.refresh_permits.clone().try_acquire_owned().ok()?;
+    let upstream = rt.upstream_permits.clone().try_acquire_owned().ok()?;
+    // The tokens pay for the first upstream attempt of each call; a refresh that
+    // cannot get one is skipped instead of queueing behind user traffic.
+    state.helius_limiter.check().ok()?;
+    state.wormhole_limiter.check().ok()?;
+    Some(RefreshReservation {
+        _slot: slot,
+        _upstream: upstream,
+    })
+}
+
+/// Runs the fetch under the admission guard and sets the cooldown on completion,
+/// whether it succeeded or failed. The guard is released only after the cooldown
+/// is set, so a concurrent hit cannot slip through and start a duplicate refresh.
+async fn complete_refresh<T, F, Fut>(
+    rt: &ReadThrough,
+    key: &str,
+    _guard: RefreshGuard,
+    fetch: F,
+) -> Result<T, AppError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T, AppError>>,
+{
+    let result = fetch().await;
+    rt.refresh_cooldown.insert(key.to_string(), ()).await;
+    result
+}
+
 /// Background refresh of a stale entry. Failures are only logged: the stale
 /// copy keeps being served and the cooldown spaces out the next attempt.
-async fn refresh(state: AppState, chain: String, hash: String, _slot: OwnedSemaphorePermit) {
+async fn refresh(
+    state: AppState,
+    key: String,
+    chain: String,
+    hash: String,
+    guard: RefreshGuard,
+    _reservation: RefreshReservation,
+) {
     let rt = &state.read_through;
 
-    let fetched = async {
-        let _permit = rt
-            .upstream_permits
-            .acquire()
-            .await
-            .expect("semaphore closed");
-        analyse_tx(&state, &chain, &hash).await
-    }
+    let fetched = complete_refresh(rt, &key, guard, || {
+        // The reservation already paid the first Helius and WormholeScan token.
+        analyse_tx_prepaid(&state, &chain, &hash)
+    })
     .await;
 
     match fetched {
@@ -247,17 +355,33 @@ async fn maybe_spawn_refresh(state: &AppState, key: &str, chain: &str, hash: &st
     if rt.refresh_cooldown.contains_key(key) {
         return;
     }
-    // bounded number of concurrent background refreshes; skip if all busy
-    let Ok(slot) = rt.refresh_permits.clone().try_acquire_owned() else {
+
+    let Some(guard) = rt.begin_refresh(key) else {
+        rt.refresh_stats
+            .skipped_inflight
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(key = %key, "background refresh skipped: already in flight");
         return;
     };
-    rt.refresh_cooldown.insert(key.to_string(), ()).await;
+
+    let Some(reservation) = try_reserve_refresh(state) else {
+        rt.refresh_stats
+            .skipped_no_token
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(key = %key, "background refresh skipped: no upstream capacity right now");
+        // `guard` drops here, so a later hit can retry; no cooldown is set.
+        return;
+    };
+
+    rt.refresh_stats.spawned.fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(key = %key, "background refresh spawned");
 
     let state = state.clone();
+    let key = key.to_string();
     let chain = chain.to_string();
     let hash = hash.to_string();
     tokio::spawn(async move {
-        refresh(state, chain, hash, slot).await;
+        refresh(state, key, chain, hash, guard, reservation).await;
     });
 }
 
@@ -422,6 +546,92 @@ mod tests {
         assert_eq!(
             rt.failed.policy().time_to_live(),
             Some(Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn concurrent_admissions_for_one_key_admit_exactly_one_refresh() {
+        use std::sync::Barrier;
+
+        let rt = Arc::new(ReadThrough::new(4, Duration::from_secs(10)));
+        let key = "solana:sig";
+        let threads = 8;
+        let start = Arc::new(Barrier::new(threads));
+        let attempted = Arc::new(Barrier::new(threads));
+
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let rt = Arc::clone(&rt);
+                let start = Arc::clone(&start);
+                let attempted = Arc::clone(&attempted);
+                std::thread::spawn(move || {
+                    start.wait();
+                    let guard = rt.begin_refresh(key);
+                    // Keep the guard alive until every thread has tried, so an early
+                    // drop cannot hand the key to a later caller and mask the race.
+                    attempted.wait();
+                    guard.is_some()
+                })
+            })
+            .collect();
+
+        let admitted: usize = handles
+            .into_iter()
+            .map(|handle| usize::from(handle.join().expect("admission thread")))
+            .sum();
+        assert_eq!(admitted, 1, "exactly one refresh may claim the key");
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_limiter_skips_the_refresh_and_leaves_the_permit_for_users() {
+        let mut config = crate::config::AppConfig::test_config();
+        config.helius_api_rps = 1;
+        config.wormhole_rps = 1;
+        config.upstream_permits = 1;
+        let state = AppState::test_state(config);
+        let key = "solana:sig";
+
+        // Spend the single burst token of each provider.
+        assert!(state.helius_limiter.check().is_ok());
+        assert!(state.wormhole_limiter.check().is_ok());
+
+        maybe_spawn_refresh(&state, key, "solana", "sig").await;
+
+        let rt = &state.read_through;
+        assert_eq!(rt.refresh_stats().spawned(), 0);
+        assert_eq!(rt.refresh_stats().skipped_no_token(), 1);
+        assert_eq!(rt.refresh_stats().skipped_inflight(), 0);
+        // A skip leaves no in-flight marker and no cooldown behind, so the next hit
+        // may retry.
+        assert!(rt.refresh_inflight.get(key).is_none());
+        assert!(!rt.refresh_cooldown.contains_key(key));
+        // The skipped refresh holds no upstream permit: the user cold path still
+        // has the only one.
+        assert!(
+            rt.upstream_permits.clone().try_acquire_owned().is_ok(),
+            "the user cold path must still get its upstream permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_releases_the_guard_and_sets_the_cooldown() {
+        let rt = ReadThrough::new(4, Duration::from_secs(10));
+        let key = "solana:sig";
+        let guard = rt.begin_refresh(key).expect("the key is free");
+
+        let result: Result<(), AppError> = complete_refresh(&rt, key, guard, || async {
+            Err(AppError::UpstreamTimeout("test"))
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            rt.refresh_inflight.get(key).is_none(),
+            "the in-flight guard must be released after the error"
+        );
+        assert!(
+            rt.refresh_cooldown.contains_key(key),
+            "completion must set the cooldown"
         );
     }
 }
