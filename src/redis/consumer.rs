@@ -558,7 +558,9 @@ impl RedisConsumer {
 
                 match serde_json::to_string(&analysed.tx) {
                     Ok(payload) => {
-                        let _ = self.state.tx_broadcast.send(payload);
+                        // The sink decides: local channel in `ROLE=all`, Redis
+                        // pub/sub to the api process in `ROLE=stream`.
+                        self.state.broadcast.publish(payload).await;
                     }
                     Err(error) => {
                         tracing::warn!(?error, "Failed to serialize transaction for broadcast");

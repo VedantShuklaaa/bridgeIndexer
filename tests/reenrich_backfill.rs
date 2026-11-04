@@ -18,6 +18,9 @@ use tokio_util::sync::CancellationToken;
 
 fn test_config(upstream_url: &str, batch: i64, origin_share_percent: u8) -> AppConfig {
     AppConfig {
+        role: bridge::config::Role::All,
+        pubsub_channel: "bridge:tx_events".to_string(),
+        health_port: 0,
         database_url: "postgres://unused".to_string(),
         redis_url: "redis://127.0.0.1:1".to_string(),
         helius_url: upstream_url.to_string(),

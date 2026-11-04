@@ -37,6 +37,9 @@ fn test_config(
     reclaim_interval_secs: u64,
 ) -> AppConfig {
     AppConfig {
+        role: bridge::config::Role::All,
+        pubsub_channel: "bridge:tx_events".to_string(),
+        health_port: 0,
         database_url: database_url.to_string(),
         redis_url: redis_url.to_string(),
         helius_url: upstream_url.to_string(),

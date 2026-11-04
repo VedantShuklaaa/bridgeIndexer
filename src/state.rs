@@ -5,6 +5,7 @@ use crate::config::AppConfig;
 use crate::enrichment::EnrichmentProvider;
 use crate::enrichment::wormholescan::WormholeScanProvider;
 use crate::protocols::registry::{ProtocolRegistry, default_registry};
+use crate::redis::broadcast::BroadcastSink;
 use crate::services::read_through::ReadThrough;
 use governor::{
     Quota, RateLimiter,
@@ -33,7 +34,11 @@ pub struct Inner {
     pub chains: ChainRegistry,
     pub protocols: Arc<ProtocolRegistry>,
     pub tx_broadcast: broadcast::Sender<String>,
-    pub read_through: Arc<ReadThrough>,
+    /// Where workers send broadcast events. Local in `ROLE=all`, Redis pub/sub in
+    /// `ROLE=stream`.
+    pub broadcast: BroadcastSink,
+    /// The read-through cache. Built only in the roles that serve the read API.
+    pub read_through: Option<Arc<ReadThrough>>,
     pub helius_limiter: Arc<Limiter>,
     pub wormhole_limiter: Arc<Limiter>,
     pub enrichment: Arc<dyn EnrichmentProvider>,
@@ -108,14 +113,74 @@ impl AppState {
                 registry: Arc::new(registry),
                 chains,
                 protocols: Arc::new(default_registry()),
+                broadcast: BroadcastSink::Local(tx_broadcast.clone()),
                 tx_broadcast,
-                read_through,
+                read_through: Some(read_through),
                 helius_limiter,
                 wormhole_limiter,
                 enrichment,
                 helius_wait: API_TOKEN_WAIT,
             }),
         })
+    }
+
+    /// The slim state `ROLE=stream` runs with: no read-through cache and the
+    /// registry passed in is the live-lane one (the API lane is never built).
+    ///
+    /// The protocol registry and the live registry stay: consumer analysis
+    /// (`analyse_tx`) decodes with the former and resolves token metadata through
+    /// the latter. Broadcast events go to Redis pub/sub instead of the local channel.
+    pub async fn new_stream(
+        db: PgPool,
+        config: AppConfig,
+        http_client: Client,
+        registry: AdapterRegistry,
+        chains: ChainRegistry,
+    ) -> anyhow::Result<Self> {
+        let (tx_broadcast, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let broadcast =
+            BroadcastSink::redis(&config.redis_url, config.pubsub_channel.clone()).await?;
+        let helius_limiter = registry.helius_limiter().unwrap_or_else(|| {
+            Arc::new(RateLimiter::direct(Quota::per_second(
+                NonZeroU32::new(config.helius_live_rps).unwrap(),
+            )))
+        });
+        let helius_wait = config.helius_live_token_wait;
+        let wormhole_limiter: Arc<Limiter> = Arc::new(RateLimiter::direct(Quota::per_second(
+            NonZeroU32::new(config.wormhole_rps).unwrap(),
+        )));
+        let enrichment = Arc::new(WormholeScanProvider::new(
+            http_client.clone(),
+            config.wormhole_url.clone(),
+            wormhole_limiter.clone(),
+            chains.clone(),
+        ));
+
+        Ok(Self {
+            inner: Arc::new(Inner {
+                db,
+                http_client,
+                config: Arc::new(config),
+                registry: Arc::new(registry),
+                chains,
+                protocols: Arc::new(default_registry()),
+                broadcast,
+                tx_broadcast,
+                read_through: None,
+                helius_limiter,
+                wormhole_limiter,
+                enrichment,
+                helius_wait,
+            }),
+        })
+    }
+
+    /// The read-through cache. Only the api/all roles build it; the stream role has
+    /// no read path, so reaching this there is a wiring bug.
+    pub fn read_through(&self) -> &Arc<ReadThrough> {
+        self.read_through
+            .as_ref()
+            .expect("read-through cache is built only in ROLE=api|all")
     }
 
     /// A copy of this state for the live pipeline (backfill and consumer workers):

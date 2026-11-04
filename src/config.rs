@@ -1,5 +1,45 @@
 use std::time::Duration;
 
+/// Which part of the pipeline this process runs. `All` keeps the single-process
+/// behaviour; the split roles connect through the broadcast channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    All,
+    Api,
+    Stream,
+}
+
+impl Role {
+    /// Parses `ROLE`. The error is the startup message, so it names the accepted
+    /// values and the value that was rejected.
+    pub fn parse(raw: &str) -> anyhow::Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "all" => Ok(Self::All),
+            "api" => Ok(Self::Api),
+            "stream" => Ok(Self::Stream),
+            other => anyhow::bail!("invalid ROLE {other:?}: expected one of all, api, stream"),
+        }
+    }
+
+    fn from_env() -> anyhow::Result<Self> {
+        match std::env::var("ROLE") {
+            Ok(raw) => Self::parse(&raw),
+            Err(std::env::VarError::NotPresent) => Ok(Self::All),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Whether this role serves the read API (and the WebSocket stream).
+    pub fn runs_api(self) -> bool {
+        matches!(self, Self::All | Self::Api)
+    }
+
+    /// Whether this role runs ingestion, consumers, recovery and re-enrichment.
+    pub fn runs_pipeline(self) -> bool {
+        matches!(self, Self::All | Self::Stream)
+    }
+}
+
 /// Background re-enrichment of `Detected` and `Pending` transfers.
 #[derive(Clone, Debug)]
 pub struct ReenrichConfig {
@@ -66,6 +106,13 @@ pub struct IngestConfig {
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
+    /// `ROLE=all|api|stream`; defaults to `all`.
+    pub role: Role,
+    /// Redis pub/sub channel the stream role publishes broadcast events on and
+    /// the api role forwards to its local WebSocket subscribers.
+    pub pubsub_channel: String,
+    /// Where the stream role serves its minimal `/healthz`.
+    pub health_port: u16,
     pub database_url: String,
     pub redis_url: String,
     /// Helius endpoint for the GET API (`/analyse`).
@@ -146,9 +193,18 @@ impl AppConfig {
                 .unwrap_or(default)
         }
 
+        // Parsed before the other settings so a bad ROLE fails with its own message
+        // rather than a missing database URL.
+        let role = Role::from_env()?;
         let helius_url = required("HELIUS_URL")?;
 
         Ok(Self {
+            role,
+            pubsub_channel: optional("TX_EVENTS_CHANNEL", "bridge:tx_events"),
+            health_port: std::env::var("HEALTH_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(8081),
             database_url: required("DATABASE_URL")?,
             redis_url: required("REDIS_URL")?,
             helius_live_url: optional("HELIUS_LIVE_URL", &helius_url),
@@ -212,6 +268,9 @@ impl AppConfig {
     /// can tell which lane a caller uses.
     pub(crate) fn test_config() -> Self {
         Self {
+            role: Role::All,
+            pubsub_channel: "bridge:tx_events".to_string(),
+            health_port: 0,
             database_url: "postgres://127.0.0.1:1/unused".to_string(),
             redis_url: "redis://127.0.0.1:1".to_string(),
             helius_url: "https://api.helius.test".to_string(),
@@ -283,5 +342,28 @@ mod tests {
     fn a_small_batch_still_reserves_one_origin_slot() {
         assert_eq!(reenrich(40).batch_split(1), (0, 1));
         assert_eq!(reenrich(40).batch_split(2), (1, 1));
+    }
+
+    #[test]
+    fn role_parses_the_three_deployments() {
+        assert_eq!(Role::parse("all").unwrap(), Role::All);
+        assert_eq!(Role::parse("api").unwrap(), Role::Api);
+        assert_eq!(Role::parse("stream").unwrap(), Role::Stream);
+        assert_eq!(Role::parse(" API ").unwrap(), Role::Api);
+    }
+
+    #[test]
+    fn an_unknown_role_names_the_valid_values() {
+        let error = Role::parse("wokrer").unwrap_err().to_string();
+        assert!(error.contains("invalid ROLE"), "{error}");
+        assert!(error.contains("wokrer"), "{error}");
+        assert!(error.contains("all, api, stream"), "{error}");
+    }
+
+    #[test]
+    fn the_roles_split_api_and_pipeline_work() {
+        assert!(Role::All.runs_api() && Role::All.runs_pipeline());
+        assert!(Role::Api.runs_api() && !Role::Api.runs_pipeline());
+        assert!(!Role::Stream.runs_api() && Role::Stream.runs_pipeline());
     }
 }

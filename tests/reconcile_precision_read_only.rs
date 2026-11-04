@@ -56,6 +56,9 @@ async fn snapshot(pool: &PgPool) -> Value {
 
 fn test_config(database_url: &str, upstream_url: &str) -> AppConfig {
     AppConfig {
+        role: bridge::config::Role::All,
+        pubsub_channel: "bridge:tx_events".to_string(),
+        health_port: 0,
         database_url: database_url.to_string(),
         // The analysis path never opens Redis; a value here is only a reminder that
         // nothing in the pass should need it.
