@@ -15,6 +15,26 @@ use crate::vaa::decode::{decode_destination_address, decode_vaa};
 use serde_json::Value;
 
 pub async fn analyse_tx(state: &AppState, chain: &str, hash: &str) -> Result<Analysis, AppError> {
+    analyse_tx_inner(state, chain, hash, false).await
+}
+
+/// A background refresh variant: the caller has already reserved one Helius and one
+/// WormholeScan token, so the first upstream attempt of each does not wait on the
+/// limiter. Retries still take their own tokens.
+pub async fn analyse_tx_prepaid(
+    state: &AppState,
+    chain: &str,
+    hash: &str,
+) -> Result<Analysis, AppError> {
+    analyse_tx_inner(state, chain, hash, true).await
+}
+
+async fn analyse_tx_inner(
+    state: &AppState,
+    chain: &str,
+    hash: &str,
+    prepaid: bool,
+) -> Result<Analysis, AppError> {
     if hash.trim().is_empty() {
         return Err(AppError::InvalidTransactionHash(hash.to_string()));
     }
@@ -24,8 +44,11 @@ pub async fn analyse_tx(state: &AppState, chain: &str, hash: &str) -> Result<Ana
     // Take the Helius token before either upstream call starts: a request that
     // times out here must not spend a WormholeScan call whose result is then
     // discarded. The token pays for the first getTransaction attempt below.
+    // A prepaid refresh already holds that token.
     let first_attempt_paid = if chain == "solana" {
-        acquire_token_within(&state.helius_limiter, state.helius_wait).await?;
+        if !prepaid {
+            acquire_token_within(&state.helius_limiter, state.helius_wait).await?;
+        }
         true
     } else {
         false
@@ -40,14 +63,18 @@ pub async fn analyse_tx(state: &AppState, chain: &str, hash: &str) -> Result<Ana
         },
         async {
             let t = std::time::Instant::now();
-            let r = call_upstream(&state.wormhole_limiter, || {
+            let operation = || {
                 wormhole::get_operation_by_tx_hash(
                     &state.http_client,
                     &state.config.wormhole_url,
                     hash,
                 )
-            })
-            .await;
+            };
+            let r = if prepaid {
+                call_upstream_after_token(&state.wormhole_limiter, operation).await
+            } else {
+                call_upstream(&state.wormhole_limiter, operation).await
+            };
             tracing::info!(wormhole_ms = t.elapsed().as_millis() as u64, "wormholescan");
             r
         },
