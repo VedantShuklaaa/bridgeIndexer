@@ -17,7 +17,7 @@
 use bridge::chain_adapters::setup::build_registry;
 use bridge::chains::ChainRegistry;
 use bridge::clients::helius;
-use bridge::clients::limiter::call_upstream;
+use bridge::clients::limiter::{UpstreamLabels, call_upstream};
 use bridge::config::{AppConfig, Lane};
 use bridge::db;
 use bridge::db::repository;
@@ -319,14 +319,18 @@ async fn scan_signatures(
     let mut before: Option<String> = None;
 
     loop {
-        let page = call_upstream(&state.helius_limiter, || {
-            helius::get_signatures_for_address(
-                &state.http_client,
-                &state.helius_url,
-                program,
-                before.clone(),
-            )
-        })
+        let page = call_upstream(
+            &state.helius_limiter,
+            UpstreamLabels::helius(state.lane.as_str()),
+            || {
+                helius::get_signatures_for_address(
+                    &state.http_client,
+                    &state.helius_url,
+                    program,
+                    before.clone(),
+                )
+            },
+        )
         .await?;
 
         if page.is_empty() {

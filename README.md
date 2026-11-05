@@ -674,6 +674,39 @@ and compares their status with WormholeScan, reusing the replay comparison.
 `--json` prints the same report machine-readable. Exits 1 when recall is below
 `--min-recall` (default 99.9) and the cap was not hit.
 
+### Metrics
+
+Every role serves Prometheus metrics on `0.0.0.0:$METRICS_PORT` (default `9100`)
+at `/metrics`, installed once at startup before any work runs. The endpoint is
+internal: Caddy does not proxy it, and the security group must keep `9100`
+closed, so scrape it only from the private network.
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `cache_lookups_total` | counter | `result`: `memory`, `pg_fresh`, `pg_stale`, `cold` |
+| `cache_refresh_skipped_total` | counter | `reason`: `no_token`, `in_flight` |
+| `limiter_wait_seconds` | histogram | `provider`: `helius`, `wormhole`; `lane`: `api`, `ingest`, `shared` |
+| `upstream_calls_total` | counter | `provider` and `lane` as above; `outcome`: `ok`, `err`, `timeout` |
+
+Every label is a static string: no transaction hashes, addresses or user ids are
+used as label values. `cache_lookups_total` counts cache lookups, so a v2 request
+that misses its own cache also performs the underlying v1 lookups.
+`limiter_wait_seconds` includes shed waits (a token timeout is recorded), and
+`upstream_calls_total` counts each upstream attempt, retries included. A
+WormholeScan call is reported with lane `shared` because one limiter serves every
+role.
+
+Minimal `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: bridge
+    static_configs:
+      - targets: ["127.0.0.1:9100"]   # the host that runs the bridge process
+```
+
+`METRICS_PORT` is the only setting; set it in `.env` or the service environment.
+
 ### Config notes
 
 * Helius provider lanes (1c). `HELIUS_API_URL` is the API lane's endpoint and
