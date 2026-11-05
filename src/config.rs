@@ -84,6 +84,10 @@ pub struct WorkerConfig {
     pub reclaim_idle_ms: u64,
     /// Seconds between recovery sweeps.
     pub reclaim_interval_secs: u64,
+    /// Worker tasks reading the stream.
+    pub worker_count: usize,
+    /// `XREADGROUP COUNT`: messages a worker reads per round.
+    pub read_count: usize,
 }
 
 /// Always-on Solana ingestion (A8).
@@ -277,6 +281,8 @@ impl AppConfig {
                 max_deliveries: number("WORKER_MAX_DELIVERIES", 10u32).max(1),
                 reclaim_idle_ms: number("WORKER_RECLAIM_IDLE_MS", 300_000u64),
                 reclaim_interval_secs: number("WORKER_RECLAIM_INTERVAL_SECS", 30u64).max(1),
+                worker_count: number("CONSUMER_COUNT", 5usize).max(1),
+                read_count: number("CONSUMER_READ_COUNT", 10usize).max(1),
             },
             chain_registry_refresh_secs: number("CHAIN_REGISTRY_REFRESH_SECS", 60u64).max(5),
             health_max_ingest_age_secs: number("HEALTH_MAX_INGEST_AGE_SECS", 3600i64).max(1),
@@ -410,6 +416,8 @@ impl AppConfig {
                 max_deliveries: 1,
                 reclaim_idle_ms: 1,
                 reclaim_interval_secs: 1,
+                worker_count: 5,
+                read_count: 10,
             },
             chain_registry_refresh_secs: 60,
             health_max_ingest_age_secs: 3600,

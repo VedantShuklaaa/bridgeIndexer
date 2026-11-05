@@ -255,7 +255,7 @@ async fn run_stream(config: AppConfig) -> anyhow::Result<()> {
 }
 
 fn spawn_consumers(state: AppState, config: &AppConfig, shutdown: CancellationToken) {
-    for worker_id in 1..=5 {
+    for worker_id in 1..=config.worker.worker_count {
         let worker_name = format!("worker-{worker_id}");
         let redis_url = config.redis_url.clone();
         let worker_state = state.clone();
