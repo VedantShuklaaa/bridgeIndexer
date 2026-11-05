@@ -104,9 +104,17 @@ pub struct IngestConfig {
     /// A backfilled message costs up to three live Helius calls, so the pause has to
     /// be long enough that publishing cannot outrun the live limiter.
     pub backfill_pace_ms: u64,
+    /// How far before the checkpoint a backfill starts, so transactions in the
+    /// checkpoint's own slot are not lost on a reconnect. Never goes below slot 0.
+    pub rewind_slots: u64,
     /// How long a published signature is remembered so a repeat (backfill overlapping the
     /// live feed, a reconnect) is not published twice. `0` disables the check.
     pub dedupe_ttl_secs: u64,
+    /// WebSocket ping interval. A ping every this long keeps the connection observable.
+    pub ping_secs: u64,
+    /// No-frame watchdog. When not even a Pong arrives for this long the connection is
+    /// treated as dead and reconnected. Always above `ping_secs`.
+    pub watchdog_secs: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -236,6 +244,10 @@ impl AppConfig {
             tracing::warn!("HELIUS_LIVE_URL is deprecated, rename it to HELIUS_STREAM_URL");
         }
 
+        // The watchdog must outlast a ping, or a keepalive would be mistaken for silence.
+        let ping_secs = number("INGEST_PING_SECS", 30u64).max(1);
+        let watchdog_secs = number("INGEST_WATCHDOG_SECS", 90u64).max(ping_secs + 1);
+
         Ok(Self {
             role,
             pubsub_channel: optional("TX_EVENTS_CHANNEL", "bridge:tx_events"),
@@ -275,7 +287,10 @@ impl AppConfig {
                     .unwrap_or(true),
                 backfill_max: number("INGEST_BACKFILL_MAX", 5000usize),
                 backfill_pace_ms: number("INGEST_BACKFILL_PACE_MS", 750u64),
+                rewind_slots: number("INGEST_REWIND_SLOTS", 20u64),
                 dedupe_ttl_secs: number("INGEST_DEDUPE_TTL_SECS", 7200u64),
+                ping_secs,
+                watchdog_secs,
             },
             worker: WorkerConfig {
                 max_deliveries: number("WORKER_MAX_DELIVERIES", 10u32).max(1),
@@ -401,7 +416,10 @@ impl AppConfig {
                 backfill: false,
                 backfill_max: 0,
                 backfill_pace_ms: 0,
+                rewind_slots: 20,
                 dedupe_ttl_secs: 0,
+                ping_secs: 30,
+                watchdog_secs: 90,
             },
             reenrich: ReenrichConfig {
                 enabled: false,

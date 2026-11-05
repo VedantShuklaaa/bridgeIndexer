@@ -19,6 +19,7 @@ pub const STREAM_LAG: &str = "stream_lag";
 pub const STREAM_PENDING: &str = "stream_pending";
 pub const DEAD_LETTER_DEPTH: &str = "dead_letter_depth";
 pub const INGEST_AGE_SECONDS: &str = "ingest_age_seconds";
+pub const INGEST_RECONNECTS_TOTAL: &str = "ingest_reconnects_total";
 
 /// Installs the Prometheus recorder and starts its HTTP listener on
 /// `0.0.0.0:$METRICS_PORT` (default 9100). Every role calls this once at startup.
@@ -77,6 +78,10 @@ fn describe() {
     metrics::describe_gauge!(
         INGEST_AGE_SECONDS,
         "Seconds since the ingester last handled a notification, from the health probe"
+    );
+    metrics::describe_counter!(
+        INGEST_RECONNECTS_TOTAL,
+        "Solana WebSocket reconnects by reason (watchdog, subscribe_failed, closed, error)"
     );
 }
 
