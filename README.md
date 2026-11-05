@@ -1148,9 +1148,9 @@ no faster than the live limiter drains (`INGEST_BACKFILL_PACE_MS`, now 750 ms).
 
 5000 pre-filled signatures, five workers, production defaults, fake upstream at
 zero latency. With the Helius lane raised to 100000 tokens/s the write path
-sustains **2.35k messages/s** (laptop, working tree) with 5000/5000 rows and no
-dead letters; with the real 4/s quota it is quota-bound at 2.3–2.4 messages/s,
-with Helius limiter wait averaging 4.0 s per call. Larger `XREADGROUP COUNT`,
+sustains **about 0.9k messages/s on EC2** (RDS, local Redis; 2.35k on the laptop)
+with 5000/5000 rows and no dead letters; with the real 4/s quota it is
+quota-bound at 2.3–2.4 messages/s,with Helius limiter wait averaging 4.0 s per call. Larger `XREADGROUP COUNT`,
 bounded per-worker concurrency, batched upserts and a bigger pool were flat or
 worse, so no behavioural change was kept. The isolated ceiling is Postgres work
 per message; real traffic has distinct message keys, whereas the six fake
@@ -1308,7 +1308,7 @@ runs. There was no endpoint before, so there is no before number. Methodology:
 | 03bbb0d (3b) | `/api/v1` cache stores the serialized body; a hit returns it directly | 132.1k | ~0.59 ms | — | — | server CPU |
 | perf-1 | global allocator switched to mimalloc | 139.3k | ~0.57 ms | — | — | server CPU |
 | perf-2 | `AppState` clone behind a single `Arc` | 156.8k | ~0.50 ms | — | — | server CPU |
-| 3f (working tree) | write path measured; no default changed (larger `COUNT`, bounded concurrency, batched upserts and pool sweeps were flat or worse); worker count, read count and pool size made env-configurable | — | — | — | 2.35k (laptop, isolated); 2.3–2.4 at 4/s | Postgres (isolated), provider quota (real) |
+| 3f | write path measured; no default changed (larger `COUNT`, bounded concurrency, batched upserts and pool sweeps were flat or worse); worker count, read count and pool size made env-configurable | — | — | — | 0.9k (EC2, isolated); 2.35k (laptop, isolated); 2.3–2.4 at 4/s | Postgres on RDS (isolated), provider quota (real) |
 | | | | | | | |
 
 ### Phase 4 — stream
