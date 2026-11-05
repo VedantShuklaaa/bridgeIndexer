@@ -280,6 +280,7 @@ bridgeIndexer/
 │   └── 20261031120000_list_endpoint_token_index.sql  # token filter index for the list endpoint (3g)
 ├── docs/
 │   ├── 3e-worker-patience.md            # live token wait notes (3e)
+│   ├── 4bd-reconnect-verification.md    # 4b + 4d EC2 reconnect/watchdog verification
 │   ├── 3g-list-endpoint.md              # list contract, synthetic plans, known limits (3g)
 │   └── scaling-log.md                   # measured before/after entries
 ├── scripts/
@@ -1138,6 +1139,7 @@ unnecessarily entering the dead-letter stream.
 * **After:** No new dead-letter entries or overload log lines observed after deployment. The 7 remaining entries were successfully redriven, leaving 0.
 * **Rate limit and sizing:** Approximately 4 tokens/s. Five workers with `XREADGROUP COUNT 10` can have up to 50 messages waiting for tokens.
 * **Validation limitation:** Only a few messages arrived after deployment. This is evidence of normal-load behavior, not proof that a large burst or 400-entry redrive will succeed.
+* 4b + 4d: a real WebSocket read error recovered in 6 s with the checkpoint rewound by 20 slots (3 h reconcile 97/97, 0 missed), and a blackholed stream tripped the 90 s watchdog, reconnected and backfilled the same way. The 24 h clean-window reconcile is pending. Link to the detailed notes: [`docs/4bd-reconnect-verification.md`](docs/4bd-reconnect-verification.md).
 
 Link to the detailed notes: [`docs/3e-worker-patience.md`](docs/3e-worker-patience.md).
 
