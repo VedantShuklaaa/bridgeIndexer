@@ -14,6 +14,11 @@ pub const CACHE_LOOKUPS_TOTAL: &str = "cache_lookups_total";
 pub const CACHE_REFRESH_SKIPPED_TOTAL: &str = "cache_refresh_skipped_total";
 pub const LIMITER_WAIT_SECONDS: &str = "limiter_wait_seconds";
 pub const UPSTREAM_CALLS_TOTAL: &str = "upstream_calls_total";
+pub const HTTP_REQUEST_DURATION_SECONDS: &str = "http_request_duration_seconds";
+pub const STREAM_LAG: &str = "stream_lag";
+pub const STREAM_PENDING: &str = "stream_pending";
+pub const DEAD_LETTER_DEPTH: &str = "dead_letter_depth";
+pub const INGEST_AGE_SECONDS: &str = "ingest_age_seconds";
 
 /// Installs the Prometheus recorder and starts its HTTP listener on
 /// `0.0.0.0:$METRICS_PORT` (default 9100). Every role calls this once at startup.
@@ -51,6 +56,27 @@ fn describe() {
     metrics::describe_counter!(
         UPSTREAM_CALLS_TOTAL,
         "Upstream provider calls by outcome (ok, err, timeout), by provider and lane"
+    );
+    metrics::describe_histogram!(
+        HTTP_REQUEST_DURATION_SECONDS,
+        metrics::Unit::Seconds,
+        "HTTP request duration by matched route and status class"
+    );
+    metrics::describe_gauge!(
+        STREAM_LAG,
+        "Bridge stream consumer-group lag, from the health probe"
+    );
+    metrics::describe_gauge!(
+        STREAM_PENDING,
+        "Bridge stream consumer-group pending entries, from the health probe"
+    );
+    metrics::describe_gauge!(
+        DEAD_LETTER_DEPTH,
+        "Entries in the failed-transaction stream, from the health probe"
+    );
+    metrics::describe_gauge!(
+        INGEST_AGE_SECONDS,
+        "Seconds since the ingester last handled a notification, from the health probe"
     );
 }
 

@@ -687,6 +687,11 @@ closed, so scrape it only from the private network.
 | `cache_refresh_skipped_total` | counter | `reason`: `no_token`, `in_flight` |
 | `limiter_wait_seconds` | histogram | `provider`: `helius`, `wormhole`; `lane`: `api`, `ingest`, `shared` |
 | `upstream_calls_total` | counter | `provider` and `lane` as above; `outcome`: `ok`, `err`, `timeout` |
+| `http_request_duration_seconds` | histogram | `route`: matched route pattern (or `unmatched`); `status_class`: `2xx`, `4xx`, `5xx`, `other` |
+| `stream_lag` | gauge | none |
+| `stream_pending` | gauge | none |
+| `dead_letter_depth` | gauge | none |
+| `ingest_age_seconds` | gauge | none |
 
 Every label is a static string: no transaction hashes, addresses or user ids are
 used as label values. `cache_lookups_total` counts cache lookups, so a v2 request
@@ -695,6 +700,13 @@ that misses its own cache also performs the underlying v1 lookups.
 `upstream_calls_total` counts each upstream attempt, retries included. A
 WormholeScan call is reported with lane `shared` because one limiter serves every
 role.
+
+The four health gauges are set only when `GET /health` is served, from the same
+15 s cache the endpoint returns, so they add no Redis or Postgres traffic and
+refresh at most every 15 s. A value the probe could not measure (for example
+Redis did not answer) is left at its previous reading instead of being reported
+as zero. `http_request_duration_seconds` uses the matched route pattern as its
+label, so path parameters and unknown URIs cannot create unbound cardinality.
 
 Minimal `prometheus.yml`:
 

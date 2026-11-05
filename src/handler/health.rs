@@ -135,6 +135,7 @@ pub async fn health_handler(State(state): State<AppState>) -> Response {
     if let Some((stored_at, cached)) = cache.as_ref()
         && stored_at.elapsed() < CACHE_TTL
     {
+        publish_gauges(&cached.report);
         return cached.response();
     }
 
@@ -159,8 +160,27 @@ pub async fn health_handler(State(state): State<AppState>) -> Response {
         http: decision.http,
     };
     *cache = Some((Instant::now(), cached.clone()));
+    publish_gauges(&cached.report);
 
     cached.response()
+}
+
+/// Publishes the cached probe values as gauges; it never performs a probe of its
+/// own. A field the probe could not measure stays at its previous value rather
+/// than being reported as a false zero.
+fn publish_gauges(report: &HealthReport) {
+    if let Some(seconds) = report.ingest_age_secs {
+        metrics::gauge!(crate::metrics::INGEST_AGE_SECONDS).set(seconds as f64);
+    }
+    if let Some(lag) = report.stream_lag {
+        metrics::gauge!(crate::metrics::STREAM_LAG).set(lag as f64);
+    }
+    if let Some(pending) = report.stream_pending {
+        metrics::gauge!(crate::metrics::STREAM_PENDING).set(pending as f64);
+    }
+    if let Some(depth) = report.dead_letter_len {
+        metrics::gauge!(crate::metrics::DEAD_LETTER_DEPTH).set(depth as f64);
+    }
 }
 
 async fn measure(state: &AppState) -> Measurements {
