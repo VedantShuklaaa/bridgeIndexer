@@ -183,9 +183,9 @@ the sweep showed no throughput gain from doing so.
 
 ## EC2 results
 
-Run on the main EC2 box (`<instance type>`), Postgres on RDS (`<instance class>`,
-`max_connections` = `<n>`), a throwaway local Redis on port 6380, the fake upstream
-on loopback, `bridge-api` and `bridge-stream` stopped, git SHA `<sha>`. The
+Run on the main EC2 box (`m7i-flex.large`), Postgres on RDS (`db.t3.medium`,
+`max_connections` = `402`), a throwaway local Redis on port 6380, the fake upstream
+on loopback, `bridge-api` and `bridge-stream` stopped, git SHA `aab6936`. The
 production Redis is Upstash, so Redis round trips are not in these numbers and the
 real ceiling is lower. Config (1), 5000 messages, every run valid (5000/5000 rows,
 0 dead letters, 0 pending, limiter wait 0 ms).
