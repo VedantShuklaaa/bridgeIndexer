@@ -181,6 +181,42 @@ connections available by RDS's default formula (`DBInstanceClassMemory /
 for admin sessions. Raise `DB_POOL_MAX` only after checking the instance class:
 the sweep showed no throughput gain from doing so.
 
+## EC2 results
+
+Run on the main EC2 box (`<instance type>`), Postgres on RDS (`<instance class>`,
+`max_connections` = `<n>`), a throwaway local Redis on port 6380, the fake upstream
+on loopback, `bridge-api` and `bridge-stream` stopped, git SHA `<sha>`. The
+production Redis is Upstash, so Redis round trips are not in these numbers and the
+real ceiling is lower. Config (1), 5000 messages, every run valid (5000/5000 rows,
+0 dead letters, 0 pending, limiter wait 0 ms).
+
+| Setting | msgs/s | p50 | p99 |
+|---|---|---|---|
+| baseline (5 workers, pool 20, COUNT 10), run 1 | 919 | 2.69 s | 5.23 s |
+| baseline, run 2 | 892 | 2.78 s | 5.40 s |
+| baseline, run 3 | 903 | 2.72 s | 5.35 s |
+| `DB_POOL_MAX=10`, run 1 | 998 | 2.43 s | 4.82 s |
+| `DB_POOL_MAX=10`, run 2 | 1022 | 2.36 s | 4.75 s |
+| `DB_POOL_MAX=10`, run 3 | 997 | 2.47 s | 4.93 s |
+| `DB_POOL_MAX=40` | 732 | 3.29 s | 6.57 s |
+| `BENCH_WORKERS=1` | 548 | 4.15 s | 8.97 s |
+| `BENCH_WORKERS=2` | 757 | 3.34 s | 6.49 s |
+| `BENCH_WORKERS=10` | 848 | 2.81 s | 5.54 s |
+| `BENCH_WORKERS=20` | 839 | 3.06 s | 5.86 s |
+| `CONSUMER_READ_COUNT=50` | 836 | 3.06 s | 5.76 s |
+
+A first run with the services still up scored 1016 msgs/s, so run-to-run noise
+on this box is about 10%.
+
+* The EC2 ceiling is about 0.9k messages/s against 2.35k on the laptop. Limiter
+  wait is 0, so the limit is RDS round trips plus the hot-row upsert, not the
+  provider quota or the consumer CPU.
+* Worker count plateaus at 5 as on the laptop. 10 and 20 do not help.
+* A pool of 10 is about 11% faster than 20 on this fixture set, and 40 is 19%
+  slower. The fixtures collapse onto one hot `bridge_transfers` row, so this is
+  not carried over to real traffic. Defaults stay at 5 / 10 / 20; a smaller pool
+  for `bridge-stream` is an option to try with real traffic.
+
 ## Reproduce on EC2
 
 Run on the app host with the fake upstream on the same host (loopback, no
@@ -189,6 +225,18 @@ provider calls), Postgres and Redis reachable through the environment:
 ```sh
 cargo build --release --bin fake_upstream --bin bench_write_path
 FAKE_LATENCY_MS=0 FAKE_PORT=9090 ./target/release/fake_upstream &
+
+The bench runs `DEL bridge:transactions bridge:transactions:failed` and writes
+5000 rows. Never point it at the production Redis (Upstash has one logical DB)
+or the production database. Use a local throwaway Redis and a scratch database:
+
+    redis6-server --port 6380 --bind 127.0.0.1 --save "" --appendonly no --daemonize yes
+    psql "$DB" -c "CREATE DATABASE bench_3f;"
+
+Use `REDIS_URL=redis://127.0.0.1:6380`, `DATABASE_URL` pointing at `bench_3f`, and
+also set `HELIUS_API_URL`, `HELIUS_STREAM_URL` and `HELIUS_LIVE_URL` to the
+fake so a real key in `.env` cannot be used. The worker count in the bench is
+`BENCH_WORKERS`; `CONSUMER_COUNT` only affects the real binary.
 
 # config (1) isolated
 DATABASE_URL=... REDIS_URL=... HELIUS_URL=http://127.0.0.1:9090 \
