@@ -60,6 +60,8 @@ fn test_config(upstream_url: &str, batch: i64, origin_share_percent: u8) -> AppC
             max_deliveries: 10,
             reclaim_idle_ms: 300_000,
             reclaim_interval_secs: 30,
+            worker_count: 5,
+            read_count: 10,
         },
         chain_registry_refresh_secs: 60,
         health_max_ingest_age_secs: 3600,

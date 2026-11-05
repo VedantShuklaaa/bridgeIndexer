@@ -77,6 +77,8 @@ fn test_config(
             max_deliveries,
             reclaim_idle_ms: 50,
             reclaim_interval_secs,
+            worker_count: 1,
+            read_count: 10,
         },
         chain_registry_refresh_secs: 60,
         health_max_ingest_age_secs: 3600,

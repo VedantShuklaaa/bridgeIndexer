@@ -751,7 +751,10 @@ scrape_configs:
   redelivered before it is dead-lettered; `WORKER_RECLAIM_IDLE_MS` (300000) is how long a
   message must sit unacknowledged before recovery reclaims it; `WORKER_RECLAIM_INTERVAL_SECS`
   (30) is how often recovery sweeps. The token wait must stay well below the reclaim idle
-  time.
+  time. `CONSUMER_COUNT` (5) is the number of worker tasks, `CONSUMER_READ_COUNT` (10) is
+  `XREADGROUP COUNT`, and `DB_POOL_MAX` (20) is the Postgres pool per process. They default
+  to the previous hardcoded values; the 3f sweep found no throughput gain above them, so
+  raise them only with a measurement (see [docs/3f-write-path.md](docs/3f-write-path.md)).
 * `SOLANA_TOKEN_BRIDGE_PROGRAM` is a single address and is still the only program
   setting `config.rs` reads. `protocols::registry` already has a parser for
   `SOLANA_BRIDGE_PROGRAMS` (a `protocol:program_id` CSV), but nothing reads that
@@ -974,7 +977,7 @@ Measure before changing anything. Each item is one tagged experiment with the sa
 * \[ ] 3d. `v3` two API instances behind a proxy: per-process caches duplicate refreshes; compare a Redis-shared cache against sticky routing
 * \[x] 3e. Cold path: fake upstream server replaying fixtures with injected latency and 429s so quota isn't burned; try JSON-RPC batching for Helius, priority for user requests over background refresh, limiters set to the real plan limits
   Helius batching not pursued (free plan, unverified credit accounting, cold path already limiter-bound).
-* \[ ] 3f. Write path: consumer throughput against the fake upstream. Try larger `XREADGROUP COUNT`, concurrent processing inside a worker, batched upserts per Postgres transaction, pool sizing against RDS limits
+* \[x] 3f. Write path: consumer throughput against the fake upstream. Try larger `XREADGROUP COUNT`, concurrent processing inside a worker, batched upserts per Postgres transaction, pool sizing against RDS limits
 * \[x] 3g. List endpoint using the `idx_bt_*` indexes with keyset pagination, benchmarked on ~1M seeded rows with `EXPLAIN ANALYZE`
 
 Exit: documented ceiling for each workload and what limits it (CPU, Postgres, provider quota).
@@ -1141,6 +1144,21 @@ all: it is transient, so the message stays pending and recovery redelivers it,
 bounded by the delivery budget (`WORKER_MAX_DELIVERIES`). Backfill also publishes
 no faster than the live limiter drains (`INGEST_BACKFILL_PACE_MS`, now 750 ms).
 
+### 3f — Write path: consumer throughput against the fake upstream
+
+5000 pre-filled signatures, five workers, production defaults, fake upstream at
+zero latency. With the Helius lane raised to 100000 tokens/s the write path
+sustains **2.35k messages/s** (laptop, working tree) with 5000/5000 rows and no
+dead letters; with the real 4/s quota it is quota-bound at 2.3–2.4 messages/s,
+with Helius limiter wait averaging 4.0 s per call. Larger `XREADGROUP COUNT`,
+bounded per-worker concurrency, batched upserts and a bigger pool were flat or
+worse, so no behavioural change was kept. The isolated ceiling is Postgres work
+per message; real traffic has distinct message keys, whereas the six fake
+fixtures collapse onto one hot `bridge_transfers` row.
+
+Method, both configurations, every before/after row and the RDS connection
+assumption: [`docs/3f-write-path.md`](docs/3f-write-path.md).
+
 ### perf-1: mimalloc allocator
 
 Against `16018712` on the same `m7i-flex.large` server and `c7i.xlarge`
@@ -1290,6 +1308,7 @@ runs. There was no endpoint before, so there is no before number. Methodology:
 | 03bbb0d (3b) | `/api/v1` cache stores the serialized body; a hit returns it directly | 132.1k | ~0.59 ms | — | — | server CPU |
 | perf-1 | global allocator switched to mimalloc | 139.3k | ~0.57 ms | — | — | server CPU |
 | perf-2 | `AppState` clone behind a single `Arc` | 156.8k | ~0.50 ms | — | — | server CPU |
+| 3f (working tree) | write path measured; no default changed (larger `COUNT`, bounded concurrency, batched upserts and pool sweeps were flat or worse); worker count, read count and pool size made env-configurable | — | — | — | 2.35k (laptop, isolated); 2.3–2.4 at 4/s | Postgres (isolated), provider quota (real) |
 | | | | | | | |
 
 ### Phase 4 — stream

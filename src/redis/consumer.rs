@@ -61,7 +61,7 @@ impl RedisConsumer {
                 .arg(CONSUMER_GROUP)
                 .arg(&self.consumer_name)
                 .arg("COUNT")
-                .arg(10)
+                .arg(self.state.config.worker.read_count as i64)
                 .arg("BLOCK")
                 .arg(5000)
                 .arg("STREAMS")
