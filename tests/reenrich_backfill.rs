@@ -43,7 +43,10 @@ fn test_config(upstream_url: &str, batch: i64, origin_share_percent: u8) -> AppC
             backfill: false,
             backfill_max: 0,
             backfill_pace_ms: 0,
+            rewind_slots: 20,
             dedupe_ttl_secs: 0,
+            ping_secs: 30,
+            watchdog_secs: 90,
         },
         reenrich: ReenrichConfig {
             enabled: true,

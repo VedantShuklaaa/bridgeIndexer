@@ -3,7 +3,7 @@ use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::Value;
 use sqlx::PgPool;
 use std::time::Duration;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep, sleep_until};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{self, Message},
@@ -25,6 +25,101 @@ use crate::{
 /// How long the server has to acknowledge `logsSubscribe`. Data messages are not expected
 /// before the acknowledgement, so silence past this means the connection is dead.
 const SUBSCRIBE_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Why a connection ended. `Stopped` is the clean shutdown path; every other variant is
+/// a reconnect and carries the static label reported in `ingest_reconnects_total`.
+#[derive(Debug)]
+enum ConnectionEnd {
+    Stopped,
+    Closed,
+    Watchdog,
+    SubscribeFailed,
+    Error(anyhow::Error),
+}
+
+impl ConnectionEnd {
+    fn is_reconnect(&self) -> bool {
+        !matches!(self, Self::Stopped)
+    }
+
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Closed => "closed",
+            Self::Watchdog => "watchdog",
+            Self::SubscribeFailed => "subscribe_failed",
+            Self::Error(_) => "error",
+        }
+    }
+}
+
+/// No frame of any kind arrived before the watchdog deadline. It is an error so the
+/// supervisor reconnects, and its own type so the reconnect metric can say why.
+#[derive(Debug)]
+struct WatchdogExpired(Duration);
+
+impl std::fmt::Display for WatchdogExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no frame received for {:?}, watchdog forcing a reconnect",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for WatchdogExpired {}
+
+/// Ping and no-frame watchdog timing. Time is passed in rather than read from the clock,
+/// so the whole thing can be driven from a test without a socket.
+#[derive(Debug)]
+struct Keepalive {
+    ping_interval: Duration,
+    watchdog: Duration,
+    last_frame: Instant,
+    next_ping: Instant,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KeepaliveAction {
+    Ping,
+    Watchdog,
+    Idle,
+}
+
+impl Keepalive {
+    fn new(ping_interval: Duration, watchdog: Duration, now: Instant) -> Self {
+        Self {
+            ping_interval,
+            watchdog,
+            last_frame: now,
+            next_ping: now + ping_interval,
+        }
+    }
+
+    /// When the next ping or the watchdog is due, whichever comes first.
+    fn next_deadline(&self) -> Instant {
+        self.next_ping.min(self.last_frame + self.watchdog)
+    }
+
+    /// Any frame at all proves the connection is alive: data, a Ping, or a Pong.
+    fn on_frame(&mut self, now: Instant) {
+        self.last_frame = now;
+    }
+
+    /// Resolves the deadline from [`next_deadline`]. The watchdog is checked first, so a
+    /// silent connection is dropped even when a ping is also due.
+    fn on_deadline(&mut self, now: Instant) -> KeepaliveAction {
+        if now >= self.last_frame + self.watchdog {
+            KeepaliveAction::Watchdog
+        } else if now >= self.next_ping {
+            self.next_ping = now + self.ping_interval;
+            KeepaliveAction::Ping
+        } else {
+            KeepaliveAction::Idle
+        }
+    }
+}
 
 /// The reply to our `logsSubscribe` request, as far as it concerns us.
 #[derive(Debug, PartialEq, Eq)]
@@ -140,10 +235,26 @@ impl SolanaIngester {
     /// Runs (and reconnects) until `stop` is cancelled.
     pub async fn run(&self, stop: CancellationToken) -> Result<()> {
         loop {
-            match self.run_connection(&stop).await {
-                Ok(()) => warn!("Solana WebSocket connection closed"),
-                Err(error) => error!(%error, "Solana ingestion connection failed"),
+            let end = match self.run_connection(&stop).await {
+                Ok(end) => end,
+                Err(error) => ConnectionEnd::Error(error),
+            };
+
+            if !end.is_reconnect() {
+                return Ok(());
             }
+
+            if let ConnectionEnd::Error(error) = &end {
+                error!(%error, "Solana ingestion connection failed");
+            } else {
+                warn!(reason = end.reason(), "Solana WebSocket connection ended");
+            }
+
+            metrics::counter!(
+                crate::metrics::INGEST_RECONNECTS_TOTAL,
+                "reason" => end.reason()
+            )
+            .increment(1);
 
             tokio::select! {
                 _ = stop.cancelled() => return Ok(()),
@@ -152,12 +263,12 @@ impl SolanaIngester {
         }
     }
 
-    async fn run_connection(&self, stop: &CancellationToken) -> Result<()> {
+    async fn run_connection(&self, stop: &CancellationToken) -> Result<ConnectionEnd> {
         let ws_host = self.ws_url.split('?').next().unwrap_or_default();
         info!(ws_host, bridge_program = %self.bridge_program, "Connecting to Solana WebSocket");
 
         let (ws_stream, _) = tokio::select! {
-            _ = stop.cancelled() => return Ok(()),
+            _ = stop.cancelled() => return Ok(ConnectionEnd::Stopped),
             result = connect_async(&self.ws_url) => {
                 result.context("failed to connect to Solana WebSocket")?
             }
@@ -194,7 +305,7 @@ impl SolanaIngester {
                         program = %self.bridge_program,
                         "logsSubscribe failed, closing the connection"
                     );
-                    return Err(error);
+                    return Ok(ConnectionEnd::SubscribeFailed);
                 }
             };
 
@@ -210,39 +321,72 @@ impl SolanaIngester {
             warn!(%error, "Solana transaction backfill failed, continuing with live ingestion");
         }
 
-        loop {
-            tokio::select! {
-                _ = stop.cancelled() => {
-                    info!("stop requested, closing Solana WebSocket");
-                    let _ = write.send(Message::Close(None)).await;
-                    return Ok(());
-                }
-                message = read.next() => {
-                    let Some(message) = message else { break; };
-                    let message = message.context("failed to read Solana WebSocket message")?;
+        let mut keepalive = Keepalive::new(
+            Duration::from_secs(self.config.ping_secs),
+            Duration::from_secs(self.config.watchdog_secs),
+            Instant::now(),
+        );
 
-                    match message {
-                        Message::Text(text) => {
-                            self.handle_message(&text).await?;
+        let ended: Result<ConnectionEnd> = async {
+            loop {
+                let deadline = keepalive.next_deadline();
+
+                tokio::select! {
+                    _ = stop.cancelled() => {
+                        info!("stop requested, closing Solana WebSocket");
+                        let _ = write.send(Message::Close(None)).await;
+                        return Ok(ConnectionEnd::Stopped);
+                    }
+                    message = read.next() => {
+                        let Some(message) = message else {
+                            return Ok(ConnectionEnd::Closed);
+                        };
+                        let message = message.context("failed to read Solana WebSocket message")?;
+
+                        // Every frame counts, including a Ping from the server.
+                        keepalive.on_frame(Instant::now());
+
+                        match message {
+                            Message::Text(text) => {
+                                self.handle_message(&text).await?;
+                            }
+
+                            Message::Ping(payload) => {
+                                info!("Received Solana WebSocket ping");
+                                write.send(Message::Pong(payload)).await?;
+                            }
+
+                            Message::Close(_) => {
+                                warn!("Solana WebSocket sent close frame");
+                                return Ok(ConnectionEnd::Closed);
+                            }
+
+                            _ => {}
                         }
-
-                        Message::Ping(payload) => {
-                            info!("Received Solana WebSocket ping");
-                            write.send(Message::Pong(payload)).await?;
+                    }
+                    _ = sleep_until(deadline) => {
+                        match keepalive.on_deadline(Instant::now()) {
+                            KeepaliveAction::Ping => {
+                                write.send(Message::Ping(Vec::new())).await?;
+                            }
+                            KeepaliveAction::Watchdog => {
+                                return Err(WatchdogExpired(keepalive.watchdog).into());
+                            }
+                            KeepaliveAction::Idle => {}
                         }
-
-                        Message::Close(_) => {
-                            warn!("Solana WebSocket sent close frame");
-                            break;
-                        }
-
-                        _ => {}
                     }
                 }
             }
         }
+        .await;
 
-        Ok(())
+        match ended {
+            Err(error) if error.downcast_ref::<WatchdogExpired>().is_some() => {
+                warn!(%error, "Solana WebSocket watchdog expired");
+                Ok(ConnectionEnd::Watchdog)
+            }
+            other => other,
+        }
     }
 
     async fn backfill_missed_transactions(&self, stop: &CancellationToken) -> Result<()> {
@@ -255,6 +399,7 @@ impl SolanaIngester {
 
         info!(
             last_ingested_slot,
+            rewind_slots = self.config.rewind_slots,
             max = self.config.backfill_max,
             "Starting Solana transaction backfill"
         );
@@ -282,7 +427,12 @@ impl SolanaIngester {
             }
 
             let remaining = self.config.backfill_max.saturating_sub(published);
-            let page = plan_page(&signatures, last_ingested_slot, remaining);
+            let page = plan_page(
+                &signatures,
+                last_ingested_slot,
+                self.config.rewind_slots,
+                remaining,
+            );
 
             for candidate in &page.candidates {
                 if stop.is_cancelled() {
@@ -542,5 +692,107 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("timed out"));
+    }
+
+    fn keepalive(ping_secs: u64, watchdog_secs: u64) -> Keepalive {
+        Keepalive::new(
+            Duration::from_secs(ping_secs),
+            Duration::from_secs(watchdog_secs),
+            Instant::now(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_connection_is_dropped_at_the_watchdog() {
+        let start = Instant::now();
+        let mut keepalive = keepalive(30, 90);
+        let mut pings = 0;
+
+        loop {
+            tokio::time::sleep_until(keepalive.next_deadline()).await;
+
+            match keepalive.on_deadline(Instant::now()) {
+                KeepaliveAction::Ping => pings += 1,
+                KeepaliveAction::Watchdog => break,
+                KeepaliveAction::Idle => {}
+            }
+        }
+
+        assert_eq!(pings, 2, "pings at 30 s and 60 s");
+        assert_eq!(
+            Instant::now().duration_since(start),
+            Duration::from_secs(90),
+            "the watchdog fires once no frame arrived for its interval"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pongs_keep_a_quiet_connection_alive() {
+        let mut keepalive = keepalive(30, 90);
+        let mut pings = 0;
+
+        for _ in 0..10 {
+            tokio::time::sleep_until(keepalive.next_deadline()).await;
+
+            match keepalive.on_deadline(Instant::now()) {
+                KeepaliveAction::Ping => {
+                    pings += 1;
+                    // The server's Pong arrives and proves the connection is alive.
+                    keepalive.on_frame(Instant::now());
+                }
+                KeepaliveAction::Watchdog => {
+                    panic!("watchdog fired although a pong arrived after every ping")
+                }
+                KeepaliveAction::Idle => {}
+            }
+        }
+
+        assert_eq!(pings, 10);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_data_frame_resets_the_watchdog() {
+        let start = Instant::now();
+        let mut keepalive = keepalive(30, 90);
+
+        // A data frame at t=80 moves the watchdog from 90 to 170.
+        tokio::time::sleep(Duration::from_secs(80)).await;
+        keepalive.on_frame(Instant::now());
+
+        loop {
+            tokio::time::sleep_until(keepalive.next_deadline()).await;
+
+            match keepalive.on_deadline(Instant::now()) {
+                KeepaliveAction::Ping => {}
+                KeepaliveAction::Watchdog => break,
+                KeepaliveAction::Idle => {}
+            }
+        }
+
+        assert_eq!(
+            Instant::now().duration_since(start),
+            Duration::from_secs(170),
+            "the data frame pushed the watchdog out by 80 seconds"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_ping_interval_fires_as_configured() {
+        let start = Instant::now();
+        let mut keepalive = keepalive(15, 90);
+
+        assert_eq!(
+            keepalive.next_deadline(),
+            start + Duration::from_secs(15),
+            "the first ping is due after one interval"
+        );
+
+        tokio::time::sleep_until(keepalive.next_deadline()).await;
+        assert_eq!(keepalive.on_deadline(Instant::now()), KeepaliveAction::Ping);
+        assert_eq!(
+            keepalive.next_deadline(),
+            start + Duration::from_secs(30),
+            "the next ping is scheduled one interval after the last one"
+        );
     }
 }
