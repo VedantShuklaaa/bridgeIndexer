@@ -1,4 +1,6 @@
-use crate::clients::limiter::{acquire_token_within, call_upstream, call_upstream_after_token};
+use crate::clients::limiter::{
+    UpstreamLabels, acquire_token_within, call_upstream, call_upstream_after_token,
+};
 use crate::clients::{helius, wormhole};
 use crate::domain::analysis::{Analysis, DecodedTransfer};
 use crate::domain::bridge_transfer::BridgeMessageId;
@@ -47,7 +49,12 @@ async fn analyse_tx_inner(
     // A prepaid refresh already holds that token.
     let first_attempt_paid = if chain == "solana" {
         if !prepaid {
-            acquire_token_within(&state.helius_limiter, state.helius_wait).await?;
+            acquire_token_within(
+                &state.helius_limiter,
+                state.helius_wait,
+                UpstreamLabels::helius(state.lane.as_str()),
+            )
+            .await?;
         }
         true
     } else {
@@ -70,10 +77,11 @@ async fn analyse_tx_inner(
                     hash,
                 )
             };
+            let labels = UpstreamLabels::wormhole();
             let r = if prepaid {
-                call_upstream_after_token(&state.wormhole_limiter, operation).await
+                call_upstream_after_token(&state.wormhole_limiter, labels, operation).await
             } else {
-                call_upstream(&state.wormhole_limiter, operation).await
+                call_upstream(&state.wormhole_limiter, labels, operation).await
             };
             tracing::info!(wormhole_ms = t.elapsed().as_millis() as u64, "wormholescan");
             r
@@ -287,9 +295,11 @@ async fn preload_accounts(state: &AppState, tx: &mut SolanaTx) -> Result<(), App
     if keys.is_empty() {
         return Ok(());
     }
-    let accounts = call_upstream(&state.helius_limiter, || {
-        helius::get_multiple_accounts(&state.http_client, &state.helius_url, &keys)
-    })
+    let accounts = call_upstream(
+        &state.helius_limiter,
+        UpstreamLabels::helius(state.lane.as_str()),
+        || helius::get_multiple_accounts(&state.http_client, &state.helius_url, &keys),
+    )
     .await?;
 
     for (key, account) in keys.into_iter().zip(accounts) {
@@ -339,10 +349,11 @@ async fn fetch_solana_source(
             let get_transaction =
                 || helius::get_transaction(&state.http_client, &state.helius_url, hash);
             // Retries still wait on the limiter in both branches.
+            let labels = UpstreamLabels::helius(state.lane.as_str());
             let raw = if first_attempt_paid {
-                call_upstream_after_token(&state.helius_limiter, get_transaction).await?
+                call_upstream_after_token(&state.helius_limiter, labels, get_transaction).await?
             } else {
-                call_upstream(&state.helius_limiter, get_transaction).await?
+                call_upstream(&state.helius_limiter, labels, get_transaction).await?
             };
 
             let mut solana_tx = SolanaTx::from_helius(&raw, hash)

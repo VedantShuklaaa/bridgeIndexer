@@ -10,7 +10,7 @@
 
 use bridge::chain_adapters::setup::build_registry;
 use bridge::chains::ChainRegistry;
-use bridge::clients::limiter::call_upstream;
+use bridge::clients::limiter::{UpstreamLabels, call_upstream};
 use bridge::clients::{helius, wormhole};
 use bridge::config::{AppConfig, Lane};
 use bridge::db;
@@ -93,14 +93,18 @@ async fn collect_signatures(
     let mut out: Vec<Sig> = Vec::with_capacity(limit);
 
     'pages: loop {
-        let page = call_upstream(&state.helius_limiter, || {
-            helius::get_signatures_for_address(
-                &state.http_client,
-                &state.helius_url,
-                program,
-                before.clone(),
-            )
-        })
+        let page = call_upstream(
+            &state.helius_limiter,
+            UpstreamLabels::helius(state.lane.as_str()),
+            || {
+                helius::get_signatures_for_address(
+                    &state.http_client,
+                    &state.helius_url,
+                    program,
+                    before.clone(),
+                )
+            },
+        )
         .await?;
 
         let Some(last) = page.last().and_then(|e| e["signature"].as_str()) else {
@@ -159,7 +163,7 @@ async fn replay_one(state: &AppState, sig: &Sig, min_age_secs: i64, now: i64) ->
         return report(Outcome::NoTransfer, None);
     };
 
-    let theirs = call_upstream(&state.wormhole_limiter, || {
+    let theirs = call_upstream(&state.wormhole_limiter, UpstreamLabels::wormhole(), || {
         wormhole::get_destination_tx(
             &state.http_client,
             &state.config.wormhole_url,

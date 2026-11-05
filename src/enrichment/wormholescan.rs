@@ -1,6 +1,6 @@
 use super::{EnrichInput, EnrichOutcome, Enriched, EnrichmentProvider, Prefetch};
 use crate::chains::{ChainRegistry, Snapshot};
-use crate::clients::limiter::{Limiter, call_upstream};
+use crate::clients::limiter::{Limiter, UpstreamLabels, call_upstream};
 use crate::clients::wormhole;
 use crate::domain::bridge_transfer::{BridgeMessageId, BridgeStatus, BridgeTransfer};
 use crate::error::AppError;
@@ -49,7 +49,7 @@ impl WormholeScanProvider {
             return None;
         }
 
-        let result = call_upstream(&self.limiter, || {
+        let result = call_upstream(&self.limiter, UpstreamLabels::wormhole(), || {
             wormhole::get_vaa_source_tx(&self.client, &self.base_url, &transfer.message_id)
         })
         .await;
@@ -88,7 +88,7 @@ impl EnrichmentProvider for WormholeScanProvider {
         let operation = match input.prefetch {
             Prefetch::Done(result) => result,
             Prefetch::None => {
-                fetched = call_upstream(&self.limiter, || {
+                fetched = call_upstream(&self.limiter, UpstreamLabels::wormhole(), || {
                     wormhole::get_operation_by_tx_hash(
                         &self.client,
                         &self.base_url,
@@ -143,7 +143,7 @@ impl EnrichmentProvider for WormholeScanProvider {
     /// Best effort: a failure is logged and treated as "not known yet", it never fails
     /// the analysis.
     async fn destination_tx(&self, id: &BridgeMessageId) -> Option<String> {
-        call_upstream(&self.limiter, || {
+        call_upstream(&self.limiter, UpstreamLabels::wormhole(), || {
             wormhole::get_destination_tx(&self.client, &self.base_url, id)
         })
         .await

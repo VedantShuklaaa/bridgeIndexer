@@ -40,6 +40,8 @@ chrono = { version = "0.4", features = ["serde"] }
 tower-http = { version = "0.5", features = ["cors"] }
 tokio-util = "0.7"
 mimalloc = "0.1.52"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 
 [dev-dependencies]
 testcontainers-modules = { version = "0.11", features = ["postgres", "redis"] }

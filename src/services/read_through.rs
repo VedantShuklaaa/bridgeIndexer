@@ -1,10 +1,11 @@
 use crate::domain::bridge_transfer::BridgeStatus;
 use axum::body::Bytes;
 use dashmap::{DashMap, DashSet};
+use metrics::Counter;
 use moka::future::Cache;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
@@ -157,6 +158,43 @@ impl RefreshStats {
     }
 }
 
+/// Cached metric handles. The label sets are fixed, so each handle is looked up
+/// once instead of on every hot-path record.
+struct CacheMetrics {
+    memory: Counter,
+    pg_fresh: Counter,
+    pg_stale: Counter,
+    cold: Counter,
+    skipped_no_token: Counter,
+    skipped_inflight: Counter,
+}
+
+impl CacheMetrics {
+    fn get() -> &'static Self {
+        static METRICS: OnceLock<CacheMetrics> = OnceLock::new();
+        METRICS.get_or_init(|| Self {
+            memory: metrics::counter!(
+                crate::metrics::CACHE_LOOKUPS_TOTAL, "result" => "memory"
+            ),
+            pg_fresh: metrics::counter!(
+                crate::metrics::CACHE_LOOKUPS_TOTAL, "result" => "pg_fresh"
+            ),
+            pg_stale: metrics::counter!(
+                crate::metrics::CACHE_LOOKUPS_TOTAL, "result" => "pg_stale"
+            ),
+            cold: metrics::counter!(
+                crate::metrics::CACHE_LOOKUPS_TOTAL, "result" => "cold"
+            ),
+            skipped_no_token: metrics::counter!(
+                crate::metrics::CACHE_REFRESH_SKIPPED_TOTAL, "reason" => "no_token"
+            ),
+            skipped_inflight: metrics::counter!(
+                crate::metrics::CACHE_REFRESH_SKIPPED_TOTAL, "reason" => "in_flight"
+            ),
+        })
+    }
+}
+
 /// Removes the key from the in-flight set when the refresh finishes, fails or
 /// panics.
 struct RefreshGuard {
@@ -268,15 +306,19 @@ async fn check_memory(
     hash: &str,
 ) -> Option<Result<NormalisedTransaction, AppError>> {
     if let Some(hit) = rt.completed.get(hash).await {
+        CacheMetrics::get().memory.increment(1);
         return Some(Ok(hit));
     }
     if let Some(hit) = rt.open.get(hash).await {
+        CacheMetrics::get().memory.increment(1);
         return Some(Ok(hit));
     }
     if let Some(n) = rt.not_found.get(key).await {
+        CacheMetrics::get().memory.increment(1);
         return Some(Err(n.into_error(hash)));
     }
     if let Some(n) = rt.failed.get(key).await {
+        CacheMetrics::get().memory.increment(1);
         return Some(Err(n.into_error(hash)));
     }
     None
@@ -360,6 +402,7 @@ async fn maybe_spawn_refresh(state: &AppState, key: &str, chain: &str, hash: &st
         rt.refresh_stats
             .skipped_inflight
             .fetch_add(1, Ordering::Relaxed);
+        CacheMetrics::get().skipped_inflight.increment(1);
         tracing::debug!(key = %key, "background refresh skipped: already in flight");
         return;
     };
@@ -368,6 +411,7 @@ async fn maybe_spawn_refresh(state: &AppState, key: &str, chain: &str, hash: &st
         rt.refresh_stats
             .skipped_no_token
             .fetch_add(1, Ordering::Relaxed);
+        CacheMetrics::get().skipped_no_token.increment(1);
         tracing::debug!(key = %key, "background refresh skipped: no upstream capacity right now");
         // `guard` drops here, so a later hit can retry; no cooldown is set.
         return;
@@ -423,6 +467,11 @@ pub async fn analyse_cached(
         }
 
         if let Some((hit, fresh)) = lookup(state, hash).await {
+            if fresh {
+                CacheMetrics::get().pg_fresh.increment(1);
+            } else {
+                CacheMetrics::get().pg_stale.increment(1);
+            }
             remember(rt, hash, &hit).await;
             if !fresh {
                 maybe_spawn_refresh(state, &key, chain, hash).await;
@@ -431,6 +480,7 @@ pub async fn analyse_cached(
         }
 
         // nothing stored anywhere: real cold fetch, bounded wait for a permit
+        CacheMetrics::get().cold.increment(1);
         let fetched = async {
             let _permit =
                 tokio::time::timeout(Duration::from_secs(2), rt.upstream_permits.acquire())
@@ -485,9 +535,11 @@ pub async fn analyse_cached_v2(
     let rt = state.read_through();
 
     if let Some(hit) = rt.v2_completed.get(hash).await {
+        CacheMetrics::get().memory.increment(1);
         return Ok(hit);
     }
     if let Some(hit) = rt.v2_open.get(hash).await {
+        CacheMetrics::get().memory.increment(1);
         return Ok(hit);
     }
 

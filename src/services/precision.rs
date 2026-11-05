@@ -6,7 +6,7 @@
 //! never persists; every write in the pipeline happens in the Redis consumer and
 //! the read-through writer, and neither is reachable from here.
 
-use crate::clients::limiter::call_upstream;
+use crate::clients::limiter::{UpstreamLabels, call_upstream};
 use crate::clients::wormhole;
 use crate::services::analyzer::analyse_tx;
 use crate::services::replay::{Outcome, Summary, compare};
@@ -29,14 +29,15 @@ pub async fn precision_pass(state: &AppState, hashes: &[&str]) -> PrecisionRepor
         match result {
             Ok(analysed) => match analysed.tx.bridge_transfer {
                 Some(transfer) => {
-                    let theirs = call_upstream(&state.wormhole_limiter, || {
-                        wormhole::get_destination_tx(
-                            &state.http_client,
-                            &state.config.wormhole_url,
-                            &transfer.message_id,
-                        )
-                    })
-                    .await;
+                    let theirs =
+                        call_upstream(&state.wormhole_limiter, UpstreamLabels::wormhole(), || {
+                            wormhole::get_destination_tx(
+                                &state.http_client,
+                                &state.config.wormhole_url,
+                                &transfer.message_id,
+                            )
+                        })
+                        .await;
                     match theirs {
                         Ok(destination) => {
                             let verdict = compare(

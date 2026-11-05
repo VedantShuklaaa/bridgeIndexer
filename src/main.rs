@@ -59,6 +59,9 @@ async fn main() -> anyhow::Result<()> {
 
     let config = AppConfig::from_env()?;
 
+    // Every role serves Prometheus metrics; the listener starts before any work.
+    bridge::metrics::init()?;
+
     match config.role {
         Role::All => run_all(config).await,
         Role::Api => run_api(config).await,

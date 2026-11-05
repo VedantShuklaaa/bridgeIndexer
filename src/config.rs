@@ -305,6 +305,16 @@ pub enum Lane {
     Ingest,
 }
 
+impl Lane {
+    /// The label value used in metrics for this lane.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Ingest => "ingest",
+        }
+    }
+}
+
 /// The Helius endpoints resolved from the environment.
 #[derive(Debug, PartialEq, Eq)]
 struct HeliusUrls {
