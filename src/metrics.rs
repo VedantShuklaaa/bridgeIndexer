@@ -20,6 +20,9 @@ pub const STREAM_PENDING: &str = "stream_pending";
 pub const DEAD_LETTER_DEPTH: &str = "dead_letter_depth";
 pub const INGEST_AGE_SECONDS: &str = "ingest_age_seconds";
 pub const INGEST_RECONNECTS_TOTAL: &str = "ingest_reconnects_total";
+pub const INGEST_BACKFILL_INFLIGHT: &str = "ingest_backfill_inflight";
+pub const INGEST_BACKFILL_DURATION_SECONDS: &str = "ingest_backfill_duration_seconds";
+pub const INGEST_BACKFILL_PUBLISHED_TOTAL: &str = "ingest_backfill_published_total";
 pub const POLL_CYCLES_TOTAL: &str = "poll_cycles_total";
 pub const POLL_MISSED_TOTAL: &str = "poll_missed_total";
 pub const POLL_LAST_SUCCESS_TIMESTAMP_SECONDS: &str = "poll_last_success_timestamp_seconds";
@@ -85,6 +88,19 @@ fn describe() {
     metrics::describe_counter!(
         INGEST_RECONNECTS_TOTAL,
         "Solana WebSocket reconnects by reason (watchdog, subscribe_failed, closed, error)"
+    );
+    metrics::describe_gauge!(
+        INGEST_BACKFILL_INFLIGHT,
+        "Backfill tasks currently running next to a live ingestion connection (0 or 1)"
+    );
+    metrics::describe_histogram!(
+        INGEST_BACKFILL_DURATION_SECONDS,
+        metrics::Unit::Seconds,
+        "Duration of one backfill run for a connection, including paced publishes and cancellation"
+    );
+    metrics::describe_counter!(
+        INGEST_BACKFILL_PUBLISHED_TOTAL,
+        "Signatures a backfill published to the bridge stream, dedupe suppressions excluded"
     );
     metrics::describe_counter!(
         POLL_CYCLES_TOTAL,

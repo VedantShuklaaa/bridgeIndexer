@@ -281,6 +281,7 @@ bridgeIndexer/
 ├── docs/
 │   ├── 3e-worker-patience.md            # live token wait notes (3e)
 │   ├── 4bd-reconnect-verification.md    # 4b + 4d EC2 reconnect/watchdog verification
+│   ├── 4c-concurrent-backfill.md        # live/backfill concurrency and the checkpoint invariant (4c)
 │   ├── 4f-reconcile-poll.md             # periodic poll: window, checkpoint, metrics (4f)
 │   ├── 3g-list-endpoint.md              # list contract, synthetic plans, known limits (3g)
 │   └── scaling-log.md                   # measured before/after entries
@@ -335,6 +336,7 @@ bridgeIndexer/
 │   ├── ingestion/                      # Solana WS listener + backfill, always on (A8)
 │   │   ├── solana.rs
 │   │   ├── backfill.rs                 # pure backfill planning: checkpoint cut-off, failed txs, cap (A8)
+│   │   ├── checkpoint.rs               # per-connection gate: live slots cannot pass an unfinished backfill (4c)
 │   │   └── types.rs
 │   ├── redis/                          # stream producer, consumer group, recovery
 │   │   ├── producer.rs
@@ -712,6 +714,9 @@ closed, so scrape it only from the private network.
 | `dead_letter_depth` | gauge | none |
 | `ingest_age_seconds` | gauge | none |
 | `ingest_reconnects_total` | counter | `reason`: `watchdog`, `subscribe_failed`, `closed`, `error` |
+| `ingest_backfill_inflight` | gauge | none |
+| `ingest_backfill_duration_seconds` | histogram | none |
+| `ingest_backfill_published_total` | counter | none |
 | `poll_cycles_total` | counter | `program`: registered program ID; `result`: `ok`, `error` |
 | `poll_missed_total` | counter | `program`: registered program ID |
 | `poll_last_success_timestamp_seconds` | gauge | `program`: registered program ID |
@@ -762,9 +767,16 @@ scrape_configs:
 * Ingestion is always on (A8), all settings optional: `INGEST_ENABLED` (default on, `0` is a
   kill switch), `LIVE_BACKFILL` (default **on**, was off), `INGEST_BACKFILL_MAX` (5000),
   `INGEST_BACKFILL_PACE_MS` (750), `INGEST_REWIND_SLOTS` (20) and `INGEST_DEDUPE_TTL_SECS`
-  (7200, `0` disables). On every (re)connect the backfill starts `INGEST_REWIND_SLOTS` slots
-  before the checkpoint (never below slot 0), so the checkpoint's own slot is replayed; the
-  two-hour dedupe TTL is far longer than that rewind window plus the 5 s reconnect delay.
+  (7200, `0` disables). On every (re)connect the backfill runs **concurrently with the
+  read loop** (4c), as a task owned by that connection and cancelled with it; it starts
+  `INGEST_REWIND_SLOTS` slots before the checkpoint (never below slot 0), so the
+  checkpoint's own slot is replayed, and the two-hour dedupe TTL is far longer than that
+  rewind window plus the 5 s reconnect delay. While the backfill is unfinished live
+  notifications publish normally but do not advance the persisted checkpoint
+  (`ingestion::checkpoint`), so a connection that dies mid-backfill leaves the resume
+  point unchanged; live messages still refresh the checkpoint row's `updated_at` so
+  `/health` does not go stale. See
+  [`docs/4c-concurrent-backfill.md`](docs/4c-concurrent-backfill.md).
   Keepalive: `INGEST_PING_SECS` (30) sends a WebSocket ping, and `INGEST_WATCHDOG_SECS` (90,
   always above the ping interval) reconnects when no frame of any kind arrives for that long.
   `LIVE_IDLE_GRACE_SECS` is gone, nothing stops the ingester any more. Backfill is skipped
@@ -844,7 +856,7 @@ cargo test
   (`tests/fixtures/account_<name>_vaa.json`, a `getAccountInfo` response) and checked
   against WormholeScan (message key, chains, amount, token, destination wallet).
   Without the account they are asserted `Unsupported`.
-* Unit tests in `src/ingestion/backfill.rs`: no backfill without a checkpoint, the rewound checkpoint window including the checkpoint's own slot, stop at the rewound cutoff, checkpoint below the rewind floored at 0, failed transactions and entries without a slot or signature skipped, the `INGEST_BACKFILL_MAX` cap, and the empty page. The Redis dedupe has no automated test (no Redis container in the suite yet).
+* Unit tests in `src/ingestion/backfill.rs`: no backfill without a checkpoint, the rewound checkpoint window including the checkpoint's own slot, stop at the rewound cutoff, checkpoint below the rewind floored at 0, failed transactions and entries without a slot or signature skipped, the `INGEST_BACKFILL_MAX` cap, and the empty page. `src/ingestion/checkpoint.rs` covers the 4c invariant: live slots deferred while the backfill runs, a connection dropped mid-backfill leaves the checkpoint unchanged and the next gate starts from it, completion releases the newest live slot and opens the gate, completion without live messages persists nothing, a failed backfill stays closed, and no-backfill connections persist immediately. The Redis dedupe has no automated test (no Redis container in the suite yet).
 * A7 in `tests/bridge_transfers_schema.rs`: a redeem is stored as one `Inbound`, `Completed` row with the redeem as destination tx and no origin tx, enrichment fills the origin tx and a later analysis without enrichment keeps it, a completed inbound row whose origin tx is still missing is due for the background backfill while one that learned it (and an outbound send) is not, and the repair migration turns rows stored like sends around (and leaves real sends alone). The source-wallet repair is covered there too: an inbound row with a wallet loses it and its cached analysis, an outbound row and an inbound row that is already NULL are untouched, and a second run is a no-op. In `tests/golden_fixtures.rs`, the captured redeems become `Completed` inbound transfers and the matched WormholeScan operation supplies exactly the origin tx WormholeScan reports. Unit tests in `src/services/detect.rs` cover the mapping, the origin tx rules (only for a matching operation, never overwritten, never for a send, EVM `0x` normalisation) and the legacy-path fix; unit tests in `src/enrichment/wormholescan.rs` cover the `/vaas` fallback (empty operations fill the origin, EVM hashes get `0x`, a VAA 404 leaves the row unchanged, a known origin is not asked for again), and `src/domain/bridge_transfer.rs` the derived direction.
 * `tests/persistence_idempotency.rs` — real Postgres 18 container (via `testcontainers`,
   needs Docker): redelivering the same transaction, the scenario `XAUTOCLAIM` recovery
@@ -1044,7 +1056,7 @@ plus the rejection counts by reason. That is the stream's `v0`.
 Known suspects, most likely first:
 
 1. \~~Checkpoint is slot-granular and backfill stops at `slot <= checkpoint`, so other transactions in the checkpoint's slot are lost on any reconnect~~ — fixed in 4b: backfill starts `INGEST_REWIND_SLOTS` (20) before the checkpoint, floored at slot 0, and the Redis dedupe TTL (2 h) covers the replay
-2. Backfill runs before the read loop with a 150 ms sleep per signature, so live notifications queue up behind it
+2. \~~Backfill runs before the read loop with a 150 ms sleep per signature, so live notifications queue up behind it~~ — fixed in 4c: the backfill is a per-connection task running next to the read loop, and a checkpoint gate keeps live slots from passing an unfinished backfill
 3. \~~No keepalive or watchdog: a silently dead socket produces neither errors nor data~~ — fixed in 4d: a ping every `INGEST_PING_SECS` (30) and a no-frame watchdog at `INGEST_WATCHDOG_SECS` (90) that forces a reconnect
 4. \~~A rejected `logsSubscribe` is swallowed (the check is unreachable)~~ — fixed in 4e: the reply is awaited before the read loop and a rejection or timeout is a failed connection. Any publish error still tears down the connection
 5. \~~The ingester is not under `spawn_supervised`, so a panic stops it permanently~~ — already handled by A8; the ingester starts under `spawn_supervised`
@@ -1054,7 +1066,7 @@ Work items:
 
 * \[x] 4a. `reconcile` bin: per-program recall, classification precision, and baseline over 24 h. The bin and its pure tests are built; the 24 h baseline is recorded in [Phase 4 — stream](#phase-4--stream)
 * \[x] 4b. Rewind the checkpoint a few slots on reconnect and dedupe by signature (persistence is already idempotent). Done: backfill starts `INGEST_REWIND_SLOTS` slots before the checkpoint (default 20, floored at 0), still inside `INGEST_BACKFILL_MAX` and `INGEST_BACKFILL_PACE_MS`, and the Redis dedupe drops anything already published
-* \[ ] 4c. Backfill as a separate task, concurrent with live reads
+* \[x] 4c. Backfill as a separate task, concurrent with live reads. Done: after `logsSubscribe` is confirmed the backfill is spawned as a child of the connection and the read loop starts immediately; the task is cancelled and awaited when the connection ends, so a reconnect starts one fresh backfill from the checkpoint. A pure per-connection `CheckpointGate` keeps live notifications from advancing the persisted checkpoint until the backfill finishes (failure or panic leaves it closed, and the next reconnect retries), while `ingest_backfill_inflight`, `ingest_backfill_duration_seconds` and `ingest_backfill_published_total` report the task. Notes: [`docs/4c-concurrent-backfill.md`](docs/4c-concurrent-backfill.md)
 * \[x] 4d. Ping/pong keepalive and a no-message watchdog that forces a reconnect. Done: a ping every `INGEST_PING_SECS` (default 30), the watchdog resets on every frame and reconnects after `INGEST_WATCHDOG_SECS` (default 90) of silence, and `ingest_reconnects_total{reason}` counts each ended connection
 * \[x] 4e. Surface subscribe errors, supervise the ingester, `GREATEST` on the checkpoint. Supervision was already in place from A8; subscribe replies are awaited and surfaced, and the checkpoint upsert is monotonic
 * \[x] 4f. Periodic reconciliation poll as a completeness guarantee: WebSocket is the low-latency path, polling is the safety net. Done: the supervised `reconcile-poll` task runs every `INGEST_POLL_SECS` (default 300, minimum 30) per registered program over `[last_poll_end - INGEST_POLL_OVERLAP_SECS, now - INGEST_POLL_OFFSET_SECS]`, subtracts signatures already in `bridge_transfers`, and republishes the rest through the normal stream so the consumers classify and persist them. The per-program checkpoint is monotonic in `indexer_state`, each cycle is capped at `INGEST_POLL_MAX_PUBLISH` (500), and the poll has its own reconcile Helius lane. Notes: [`docs/4f-reconcile-poll.md`](docs/4f-reconcile-poll.md)

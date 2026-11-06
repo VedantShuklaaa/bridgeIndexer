@@ -12,6 +12,11 @@ Build: `2c98dde` (merge of PR #72, `fix/4b-4d-stream-reconnect`). `bridge-stream
 
 ## Notes
 
+* Since 4c the backfill runs concurrently with the read loop, and the checkpoint gate
+  defers live checkpoint advances until it finishes. The "subscribe, then backfill,
+  then live" order in the results above is from the 4b/4d build; the reconnect and
+  rewind behaviour it demonstrates is unchanged. See
+  [`4c-concurrent-backfill.md`](4c-concurrent-backfill.md).
 * Recovery order is subscribe, then backfill from the checkpoint rewound by 20 slots. The rewind re-sees already-ingested signatures and dedupes them (`skipped=1` in both tests).
 * The stall test was ~2 min and no bridge tx landed in it, so it proves the watchdog, reconnect and rewind path, not recovery of a missed transaction. The real-drop reconcile (97/97) covers recall across a reconnect.
 * The earlier 24 h reconcile (706/706, lag p99 7796 s, max 8953 s) mostly ran on the old build. The lag tail is the 8984 s `bridge-stream` downtime from 10:42:39Z to 13:12:23Z on 2026-11-05, not a reconnect.

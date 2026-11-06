@@ -13,6 +13,15 @@ pub struct BackfillPage {
     pub done: bool,
 }
 
+/// What one connection's backfill did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct BackfillStats {
+    /// Signatures published to the stream.
+    pub published: usize,
+    /// Signatures the Redis dedupe suppressed because they were already published.
+    pub skipped: usize,
+}
+
 /// A fresh database has checkpoint 0, and walking the whole history of a busy bridge program
 /// from there would burn the Helius quota for nothing. Backfill only runs once there is a
 /// checkpoint to resume from; live ingestion starts the record from "now".
