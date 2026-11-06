@@ -305,6 +305,20 @@ pub async fn set_last_ingested_slot(pool: &PgPool, chain: &str, slot: u64) -> Re
     Ok(())
 }
 
+/// Refreshes the ingest heartbeat (`updated_at`) without moving the checkpoint. Used
+/// while a concurrent backfill defers checkpoint advances: live notifications are still
+/// being handled, so `/health` must not go stale, but the value must not pass the
+/// unreplayed gap. The row exists whenever a backfill is running, because a backfill
+/// only starts from a non-zero checkpoint.
+pub async fn touch_last_ingested_slot(pool: &PgPool, chain: &str) -> Result<()> {
+    let key = format!("{chain}_last_ingested_slot");
+    sqlx::query("UPDATE indexer_state SET updated_at = NOW() WHERE key = $1")
+        .bind(&key)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// The end of the last successful reconciliation-poll window for `program`.
 pub async fn get_last_poll_end(pool: &PgPool, program: &str) -> Result<Option<i64>> {
     let key = format!("reconcile_poll_{program}_last_end");

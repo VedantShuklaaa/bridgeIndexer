@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
-use futures_util::{SinkExt, Stream, StreamExt};
+use futures_util::{FutureExt, SinkExt, Stream, StreamExt};
 use serde_json::Value;
 use sqlx::PgPool;
+use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::time::{Instant, sleep, sleep_until};
 use tokio_tungstenite::{
     connect_async,
@@ -14,9 +17,10 @@ use tracing::{error, info, warn};
 use crate::{
     clients::helius::get_signatures_for_address,
     config::IngestConfig,
-    db::repository::{get_last_ingested_slot, set_last_ingested_slot},
+    db::repository::{get_last_ingested_slot, set_last_ingested_slot, touch_last_ingested_slot},
     ingestion::{
-        backfill::{plan_page, should_backfill},
+        backfill::{BackfillStats, plan_page, should_backfill},
+        checkpoint::{CheckpointGate, CheckpointUpdate},
         types::{CandidateTransaction, LogsConfig, LogsFilter, SolanaRpcRequest},
     },
     redis::producer::RedisProducer,
@@ -201,6 +205,7 @@ where
     }
 }
 
+#[derive(Clone)]
 pub struct SolanaIngester {
     ws_url: String,
     bridge_program: String,
@@ -315,11 +320,11 @@ impl SolanaIngester {
             "Subscribed to Solana bridge logs"
         );
 
-        if self.config.backfill
-            && let Err(error) = self.backfill_missed_transactions(stop).await
-        {
-            warn!(%error, "Solana transaction backfill failed, continuing with live ingestion");
-        }
+        // The backfill runs next to the read loop, not before it: a paced backfill can
+        // take up to `INGEST_BACKFILL_MAX * INGEST_BACKFILL_PACE_MS`, and live
+        // notifications must not queue behind it. It is a child of this connection, so
+        // it is cancelled with it; the gate keeps the checkpoint from passing the gap.
+        let (gate, backfill) = self.start_backfill(stop).await;
 
         let mut keepalive = Keepalive::new(
             Duration::from_secs(self.config.ping_secs),
@@ -348,7 +353,7 @@ impl SolanaIngester {
 
                         match message {
                             Message::Text(text) => {
-                                self.handle_message(&text).await?;
+                                self.handle_message(&text, &gate).await?;
                             }
 
                             Message::Ping(payload) => {
@@ -380,6 +385,12 @@ impl SolanaIngester {
         }
         .await;
 
+        // The backfill belongs to this connection: cancel it and wait for its cleanup,
+        // so a reconnect never runs two backfills and the inflight gauge drops to zero.
+        if let Some(backfill) = backfill {
+            backfill.shutdown().await;
+        }
+
         match ended {
             Err(error) if error.downcast_ref::<WatchdogExpired>().is_some() => {
                 warn!(%error, "Solana WebSocket watchdog expired");
@@ -389,16 +400,54 @@ impl SolanaIngester {
         }
     }
 
-    async fn backfill_missed_transactions(&self, stop: &CancellationToken) -> Result<()> {
-        let last_ingested_slot = get_last_ingested_slot(&self.db, "solana").await?;
+    /// Reads the checkpoint and, when there is one to resume from, spawns the backfill
+    /// for this connection. The returned gate is the only path through which live
+    /// notifications may advance the persisted checkpoint.
+    async fn start_backfill(
+        &self,
+        stop: &CancellationToken,
+    ) -> (Arc<Mutex<CheckpointGate>>, Option<BackfillTask>) {
+        let gate_without_backfill = || Arc::new(Mutex::new(CheckpointGate::new(0, false)));
 
-        if !should_backfill(last_ingested_slot) {
-            info!("No ingestion checkpoint yet, skipping backfill");
-            return Ok(());
+        if !self.config.backfill {
+            return (gate_without_backfill(), None);
         }
 
+        let start_checkpoint = match get_last_ingested_slot(&self.db, "solana").await {
+            Ok(slot) => slot,
+            Err(error) => {
+                warn!(
+                    %error,
+                    "Could not read the ingestion checkpoint, skipping backfill"
+                );
+                return (gate_without_backfill(), None);
+            }
+        };
+
+        if !should_backfill(start_checkpoint) {
+            info!("No ingestion checkpoint yet, skipping backfill");
+            return (gate_without_backfill(), None);
+        }
+
+        let gate = Arc::new(Mutex::new(CheckpointGate::new(start_checkpoint, true)));
+        let cancel = stop.child_token();
+        let task_cancel = cancel.clone();
+        let task_gate = gate.clone();
+        let ingester = self.clone();
+
+        let handle = tokio::spawn(async move {
+            run_backfill_task(ingester, start_checkpoint, task_gate, task_cancel).await;
+        });
+
+        (gate, Some(BackfillTask { cancel, handle }))
+    }
+
+    /// Replays the signatures the checkpoint has not covered yet. The caller wraps this
+    /// future in a `select!` against the connection's cancellation token, so a connection
+    /// ending mid-run drops it at its next await point.
+    async fn backfill_missed_transactions(&self, start_checkpoint: u64) -> Result<BackfillStats> {
         info!(
-            last_ingested_slot,
+            last_ingested_slot = start_checkpoint,
             rewind_slots = self.config.rewind_slots,
             max = self.config.backfill_max,
             "Starting Solana transaction backfill"
@@ -406,14 +455,9 @@ impl SolanaIngester {
 
         let pace = Duration::from_millis(self.config.backfill_pace_ms);
         let mut before: Option<String> = None;
-        let mut published = 0usize;
-        let mut skipped = 0usize;
+        let mut stats = BackfillStats::default();
 
         loop {
-            if stop.is_cancelled() {
-                return Ok(());
-            }
-
             let signatures = get_signatures_for_address(
                 &self.client,
                 &self.helius_url,
@@ -426,19 +470,15 @@ impl SolanaIngester {
                 break;
             }
 
-            let remaining = self.config.backfill_max.saturating_sub(published);
+            let remaining = self.config.backfill_max.saturating_sub(stats.published);
             let page = plan_page(
                 &signatures,
-                last_ingested_slot,
+                start_checkpoint,
                 self.config.rewind_slots,
                 remaining,
             );
 
             for candidate in &page.candidates {
-                if stop.is_cancelled() {
-                    return Ok(());
-                }
-
                 let fresh = self
                     .redis
                     .publish_transaction(candidate, self.config.dedupe_ttl_secs)
@@ -446,11 +486,12 @@ impl SolanaIngester {
                     .context("failed to publish backfilled transaction")?;
 
                 if !fresh {
-                    skipped += 1;
+                    stats.skipped += 1;
                     continue;
                 }
 
-                published += 1;
+                stats.published += 1;
+                metrics::counter!(crate::metrics::INGEST_BACKFILL_PUBLISHED_TOTAL).increment(1);
 
                 info!(
                     tx_hash = %candidate.tx_hash,
@@ -462,7 +503,7 @@ impl SolanaIngester {
             }
 
             if page.done {
-                if published >= self.config.backfill_max {
+                if stats.published >= self.config.backfill_max {
                     warn!(
                         max = self.config.backfill_max,
                         "Backfill stopped at INGEST_BACKFILL_MAX, older signatures were not replayed"
@@ -478,14 +519,16 @@ impl SolanaIngester {
         }
 
         info!(
-            published,
-            skipped, last_ingested_slot, "Solana transaction backfill completed"
+            published = stats.published,
+            skipped = stats.skipped,
+            last_ingested_slot = start_checkpoint,
+            "Solana transaction backfill completed"
         );
 
-        Ok(())
+        Ok(stats)
     }
 
-    async fn handle_message(&self, text: &str) -> Result<()> {
+    async fn handle_message(&self, text: &str, gate: &Mutex<CheckpointGate>) -> Result<()> {
         let message: Value = serde_json::from_str(text).context("invalid Solana WebSocket JSON")?;
         // The `logsSubscribe` reply is consumed before this loop starts, so anything that is
         // not a notification here (keepalive frames, stray replies) is ignored.
@@ -552,17 +595,173 @@ impl SolanaIngester {
             info!(tx_hash = %candidate.tx_hash, "Signature already published recently, skipping");
         }
 
-        set_last_ingested_slot(&self.db, "solana", candidate.slot)
-            .await
-            .context("failed to update Solana ingestion checkpoint")?;
+        let update = gate.lock().await.on_live_message(candidate.slot);
 
-        info!(
-            tx_hash = %candidate.tx_hash,
-            slot = candidate.slot,
-            "Published transaction to Redis and updated ingestion checkpoint"
-        );
+        match update {
+            CheckpointUpdate::Persist(slot) => {
+                set_last_ingested_slot(&self.db, "solana", slot)
+                    .await
+                    .context("failed to update Solana ingestion checkpoint")?;
+
+                info!(
+                    tx_hash = %candidate.tx_hash,
+                    slot = candidate.slot,
+                    "Published transaction to Redis and updated ingestion checkpoint"
+                );
+            }
+            CheckpointUpdate::Deferred => {
+                // The backfill owns the checkpoint interval until it finishes. Refresh
+                // only the heartbeat, so `/health` still sees live ingestion while the
+                // checkpoint stays before the unreplayed gap.
+                touch_last_ingested_slot(&self.db, "solana")
+                    .await
+                    .context("failed to refresh the Solana ingestion heartbeat")?;
+
+                info!(
+                    tx_hash = %candidate.tx_hash,
+                    slot = candidate.slot,
+                    "Published transaction to Redis; checkpoint advance deferred to the backfill"
+                );
+            }
+        }
 
         Ok(())
+    }
+}
+
+/// The backfill task owned by one WebSocket connection.
+struct BackfillTask {
+    cancel: CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl BackfillTask {
+    /// Cancels the task and waits for it, so a connection's backfill cleanup completes
+    /// before a reconnect starts a fresh one.
+    async fn shutdown(self) {
+        self.cancel.cancel();
+
+        match self.handle.await {
+            Ok(()) => {}
+            Err(error) if error.is_panic() => {
+                error!(%error, "Solana transaction backfill task panicked");
+            }
+            Err(error) => {
+                warn!(
+                    %error,
+                    "Solana transaction backfill task ended without completing"
+                );
+            }
+        }
+    }
+}
+
+enum BackfillOutcome {
+    Finished(BackfillStats),
+    Failed(anyhow::Error),
+    Cancelled,
+}
+
+/// Runs one connection's backfill and applies its result to the checkpoint gate.
+///
+/// It never propagates a failure to the live read loop. A failed or panicked backfill
+/// leaves the gate closed, so the checkpoint stays at `start_checkpoint` and the next
+/// reconnect retries the same gap. A successful completion opens the gate and persists
+/// the newest live slot seen while it ran (the store keeps the maximum).
+async fn run_backfill_task(
+    ingester: SolanaIngester,
+    start_checkpoint: u64,
+    gate: Arc<Mutex<CheckpointGate>>,
+    cancel: CancellationToken,
+) {
+    let _inflight = BackfillInflight::start();
+    let started = Instant::now();
+
+    let outcome = AssertUnwindSafe(async {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => BackfillOutcome::Cancelled,
+            result = ingester.backfill_missed_transactions(start_checkpoint) => {
+                match result {
+                    Ok(stats) => BackfillOutcome::Finished(stats),
+                    Err(error) => BackfillOutcome::Failed(error),
+                }
+            }
+        }
+    })
+    .catch_unwind()
+    .await;
+
+    let elapsed = started.elapsed();
+    metrics::histogram!(crate::metrics::INGEST_BACKFILL_DURATION_SECONDS)
+        .record(elapsed.as_secs_f64());
+
+    match outcome {
+        Ok(BackfillOutcome::Finished(stats)) => {
+            let checkpoint = {
+                let mut gate = gate.lock().await;
+                gate.on_backfill_finished()
+            };
+
+            if let Some(slot) = checkpoint
+                && let Err(error) = set_last_ingested_slot(&ingester.db, "solana", slot).await
+            {
+                error!(
+                    %error,
+                    slot,
+                    "Failed to persist the checkpoint released by the backfill; the next reconnect replays"
+                );
+            }
+
+            info!(
+                published = stats.published,
+                skipped = stats.skipped,
+                elapsed_ms = elapsed.as_millis(),
+                "Solana transaction backfill finished"
+            );
+        }
+        Ok(BackfillOutcome::Failed(error)) => {
+            gate.lock().await.on_backfill_failed();
+            error!(
+                %error,
+                "Solana transaction backfill failed, live ingestion continues and the next reconnect retries"
+            );
+        }
+        Ok(BackfillOutcome::Cancelled) => {
+            info!("Solana transaction backfill cancelled with its connection");
+        }
+        Err(panic) => {
+            gate.lock().await.on_backfill_failed();
+            error!(
+                panic = panic_message(panic.as_ref()),
+                "Solana transaction backfill panicked, live ingestion continues and the next reconnect retries"
+            );
+        }
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
+/// Holds `ingest_backfill_inflight` at 1 for the lifetime of the task, including a panic
+/// unwind, so the gauge cannot leak.
+struct BackfillInflight;
+
+impl BackfillInflight {
+    fn start() -> Self {
+        metrics::gauge!(crate::metrics::INGEST_BACKFILL_INFLIGHT).increment(1.0);
+        Self
+    }
+}
+
+impl Drop for BackfillInflight {
+    fn drop(&mut self) {
+        metrics::gauge!(crate::metrics::INGEST_BACKFILL_INFLIGHT).decrement(1.0);
     }
 }
 
