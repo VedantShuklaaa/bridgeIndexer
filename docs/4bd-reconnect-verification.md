@@ -8,7 +8,7 @@ Build: `2c98dde` (merge of PR #72, `fix/4b-4d-stream-reconnect`). `bridge-stream
 |---|---|---|
 | Real drop | `failed to read Solana WebSocket message` at 19:45:53Z | Reconnect after 5.0 s backoff, connected 19:45:59, backfill from slot 465827819 with `rewind_slots=20`, `published=0 skipped=1`. 3 h reconcile: 97/97 persisted, 0 missed, lag max 11 s. |
 | Silent stall (4d) | nftables drop of all traffic to `mainnet.helius-rpc.com`, both directions, 20:23:45Z to 20:25:35Z | Watchdog fired 20:25:00.011Z (`no frame received for 90s`), connection ended `reason="watchdog"`, reconnect attempt 20:25:05Z, connected 20:25:41Z (6 s after unblock), backfill from slot 465837802 with `rewind_slots=20`, `published=0 skipped=1`. |
-| Clean 24 h window | stream on this build from 17:57:25Z | TBD: run `reconcile --window-hours 24 --end-offset-secs 180` after 2026-11-06 17:57Z. |
+| Clean 24 h window | stream on this build from 17:57:25Z | `reconcile --window-hours 24 --end-offset-secs 180 --precision-sample 20`, window 2026-11-05T18:01:19Z to 2026-11-06T18:01:19Z: 594/594 persisted, 0 missed (recall 100.00%), 0 rejected, 0 fetch failed. Lag p50 1 s, p99 3 s, max 11 s (n=594). Precision 20/20 (18 both\_completed, 2 both\_open). 39 failed signatures excluded. |
 
 ## Notes
 

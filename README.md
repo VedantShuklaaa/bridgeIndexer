@@ -1139,7 +1139,7 @@ unnecessarily entering the dead-letter stream.
 * **After:** No new dead-letter entries or overload log lines observed after deployment. The 7 remaining entries were successfully redriven, leaving 0.
 * **Rate limit and sizing:** Approximately 4 tokens/s. Five workers with `XREADGROUP COUNT 10` can have up to 50 messages waiting for tokens.
 * **Validation limitation:** Only a few messages arrived after deployment. This is evidence of normal-load behavior, not proof that a large burst or 400-entry redrive will succeed.
-* 4b + 4d: a real WebSocket read error recovered in 6 s with the checkpoint rewound by 20 slots (3 h reconcile 97/97, 0 missed), and a blackholed stream tripped the 90 s watchdog, reconnected and backfilled the same way. The 24 h clean-window reconcile is pending. Link to the detailed notes: [`docs/4bd-reconnect-verification.md`](docs/4bd-reconnect-verification.md).
+* 4b + 4d: a real WebSocket read error recovered in 6 s with the checkpoint rewound by 20 slots (3 h reconcile 97/97, 0 missed), and a blackholed stream tripped the 90 s watchdog, reconnected and backfilled the same way. The 24 h clean-window reconcile on this build (2026-11-05T18:01Z to 2026-11-06T18:01Z) passed: 594/594 persisted, 0 missed, lag p50 1 s / p99 3 s / max 11 s, precision 20/20. Link to the detailed notes: [`docs/4bd-reconnect-verification.md`](docs/4bd-reconnect-verification.md).
 
 Link to the detailed notes: [`docs/3e-worker-patience.md`](docs/3e-worker-patience.md).
 
@@ -1325,7 +1325,7 @@ runs. There was no endpoint before, so there is no before number. Methodology:
 | --- | --- | --- | --- | --- | --- | --- |
 | v0 | baseline | — | — | — | — | — |
 | ee1a2a6 | 24 h baseline | Token Bridge | 100% (1101/1101) | 50/50 (39 `both_completed`, 11 `both_open`) | 0 | 5092 s |
-| — | pending: reconcile 24 h re-run on EC2 | — | — | — | — | — |
+| — | reconcile 24 h re-run on EC2 (clean window, 4b + 4d build): recall 100.00% (594/594), 0 missed, lag p50 1 s / p99 3 s / max 11 s, precision 20/20 | — | — | — | — | — |
 
 **24 h baseline, `ee1a2a6`.** Window `2026-10-29T10:06Z` to `2026-10-30T09:06Z`
 (23 h) on EC2, Token Bridge program: 1101 of 1101 successful signatures
