@@ -305,6 +305,36 @@ pub async fn set_last_ingested_slot(pool: &PgPool, chain: &str, slot: u64) -> Re
     Ok(())
 }
 
+/// The end of the last successful reconciliation-poll window for `program`.
+pub async fn get_last_poll_end(pool: &PgPool, program: &str) -> Result<Option<i64>> {
+    let key = format!("reconcile_poll_{program}_last_end");
+    let value: Option<String> =
+        sqlx::query_scalar("SELECT value FROM indexer_state WHERE key = $1")
+            .bind(&key)
+            .fetch_optional(pool)
+            .await?;
+
+    Ok(value.map(|v| v.parse()).transpose()?)
+}
+
+/// Records the end of a reconciliation-poll window. Like the ingest checkpoint, it
+/// only moves forward: a cycle that began before the stored end, or a wall clock that
+/// stepped back, must not rewind it and replay the same window.
+pub async fn set_last_poll_end(pool: &PgPool, program: &str, ended_at: i64) -> Result<()> {
+    let key = format!("reconcile_poll_{program}_last_end");
+    sqlx::query(
+        "INSERT INTO indexer_state (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE
+         SET value = GREATEST(indexer_state.value::bigint, EXCLUDED.value::bigint)::text,
+             updated_at = NOW()",
+    )
+    .bind(&key)
+    .bind(ended_at.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn get_cached_analysis(pool: &PgPool, hash: &str) -> Result<Option<serde_json::Value>> {
     Ok(sqlx::query_scalar(
         r#"

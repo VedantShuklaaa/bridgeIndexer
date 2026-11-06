@@ -66,6 +66,10 @@ fn test_config(
             dedupe_ttl_secs: 0,
             ping_secs: 30,
             watchdog_secs: 90,
+            poll_secs: 300,
+            poll_overlap_secs: 600,
+            poll_offset_secs: 180,
+            poll_max_publish: 500,
         },
         reenrich: ReenrichConfig {
             enabled: false,

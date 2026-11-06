@@ -115,6 +115,16 @@ pub struct IngestConfig {
     /// No-frame watchdog. When not even a Pong arrives for this long the connection is
     /// treated as dead and reconnected. Always above `ping_secs`.
     pub watchdog_secs: u64,
+    /// Seconds between reconciliation-poll cycles. The poll is the completeness
+    /// safety net next to the low-latency WebSocket.
+    pub poll_secs: u64,
+    /// Each poll window starts this far before the previous cycle's end, so the part
+    /// the previous window ended before seeing (the offset) is covered again.
+    pub poll_overlap_secs: i64,
+    /// Each poll window ends this long ago, so the ingester had a chance to see it.
+    pub poll_offset_secs: i64,
+    /// Most signatures one poll cycle publishes. Bounds the Helius spend after a gap.
+    pub poll_max_publish: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -291,6 +301,10 @@ impl AppConfig {
                 dedupe_ttl_secs: number("INGEST_DEDUPE_TTL_SECS", 7200u64),
                 ping_secs,
                 watchdog_secs,
+                poll_secs: number("INGEST_POLL_SECS", 300u64).max(30),
+                poll_overlap_secs: number("INGEST_POLL_OVERLAP_SECS", 600i64).max(0),
+                poll_offset_secs: number("INGEST_POLL_OFFSET_SECS", 180i64).max(0),
+                poll_max_publish: number("INGEST_POLL_MAX_PUBLISH", 500usize).max(1),
             },
             worker: WorkerConfig {
                 max_deliveries: number("WORKER_MAX_DELIVERIES", 10u32).max(1),
@@ -420,6 +434,10 @@ impl AppConfig {
                 dedupe_ttl_secs: 0,
                 ping_secs: 30,
                 watchdog_secs: 90,
+                poll_secs: 300,
+                poll_overlap_secs: 600,
+                poll_offset_secs: 180,
+                poll_max_publish: 500,
             },
             reenrich: ReenrichConfig {
                 enabled: false,

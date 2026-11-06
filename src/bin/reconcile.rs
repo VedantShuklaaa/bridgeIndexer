@@ -16,18 +16,16 @@
 
 use bridge::chain_adapters::setup::build_registry;
 use bridge::chains::ChainRegistry;
-use bridge::clients::helius;
-use bridge::clients::limiter::{UpstreamLabels, call_upstream};
 use bridge::config::{AppConfig, Lane};
 use bridge::db;
-use bridge::db::repository;
 use bridge::protocols::{Classification, Protocol, SolanaTx};
 use bridge::services::analyzer::load_solana_tx;
 use bridge::services::precision::{PrecisionReport, precision_pass};
 use bridge::services::reconcile::{
-    ClassificationTally, Diff, FetchOutcome, LagStats, MissCluster, PersistedTransaction, Recall,
-    Signature, SignatureScan, Window, cluster, diff, lag_stats, recall, sample_evenly,
+    ClassificationTally, Diff, FetchOutcome, LagStats, MissCluster, Recall, Signature,
+    SignatureScan, Window, cluster, diff, lag_stats, recall, sample_evenly,
 };
+use bridge::services::reconcile_poll::{persisted_rows, scan_signatures};
 use bridge::state::AppState;
 use reqwest::Client;
 use rustls::crypto::ring;
@@ -201,9 +199,17 @@ async fn main() -> anyhow::Result<()> {
 
     for program in &programs {
         eprintln!("scanning {program} ...");
-        let scan = scan_signatures(&state, program, window).await?;
+        let scan = scan_signatures(
+            &state.http_client,
+            &state.helius_url,
+            &state.helius_limiter,
+            state.lane.as_str(),
+            program,
+            window,
+        )
+        .await?;
         let protocols = state.protocols.protocols_for(program);
-        let persisted = persisted_rows(&state, &protocols, window).await?;
+        let persisted = persisted_rows(&state.db, &protocols, window).await?;
         let diff = diff(&scan.signatures, &persisted);
 
         let mut tally = ClassificationTally::default();
@@ -307,78 +313,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-/// Pages `getSignaturesForAddress` from newest to oldest until the window's start.
-async fn scan_signatures(
-    state: &AppState,
-    program: &str,
-    window: Window,
-) -> anyhow::Result<SignatureScan> {
-    let mut scan = SignatureScan::default();
-    let mut before: Option<String> = None;
-
-    loop {
-        let page = call_upstream(
-            &state.helius_limiter,
-            UpstreamLabels::helius(state.lane.as_str()),
-            || {
-                helius::get_signatures_for_address(
-                    &state.http_client,
-                    &state.helius_url,
-                    program,
-                    before.clone(),
-                )
-            },
-        )
-        .await?;
-
-        if page.is_empty() {
-            scan.push_page(&[], window);
-            break;
-        }
-
-        let last = page
-            .last()
-            .and_then(|entry| entry["signature"].as_str())
-            .map(str::to_string);
-        let done = scan.push_page(&page, window);
-        if done {
-            break;
-        }
-
-        // `before` is exclusive. A repeated cursor would loop forever.
-        match last {
-            Some(last) if before.as_deref() != Some(last.as_str()) => before = Some(last),
-            _ => break,
-        }
-    }
-
-    Ok(scan)
-}
-
-async fn persisted_rows(
-    state: &AppState,
-    protocols: &[Protocol],
-    window: Window,
-) -> anyhow::Result<Vec<PersistedTransaction>> {
-    let mut rows = Vec::new();
-    for protocol in protocols {
-        let found = repository::persisted_transfers_in_window(
-            &state.db,
-            protocol.as_str(),
-            window.start,
-            window.end,
-        )
-        .await?;
-        rows.extend(found.into_iter().map(|row| PersistedTransaction {
-            observed_tx_hash: row.observed_tx_hash,
-            slot: row.slot,
-            block_time: row.block_time,
-            stored_at: row.stored_at,
-        }));
-    }
-    Ok(rows)
 }
 
 async fn missing_outcome(

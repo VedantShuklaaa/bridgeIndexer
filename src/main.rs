@@ -4,10 +4,12 @@ use bridge::config::{AppConfig, Lane, Role};
 use bridge::db;
 use bridge::enrichment::reenrich;
 use bridge::ingestion::solana::SolanaIngester;
+use bridge::protocols::registry::ProtocolRegistry;
 use bridge::redis::broadcast;
 use bridge::redis::consumer::RedisConsumer;
 use bridge::redis::producer::RedisProducer;
 use bridge::routes::build_router;
+use bridge::services::reconcile_poll::ReconcilePoller;
 use bridge::shutdown::wait_for_shutdown_signal;
 use bridge::state::AppState;
 use mimalloc::MiMalloc;
@@ -138,6 +140,15 @@ async fn run_all(config: AppConfig) -> anyhow::Result<()> {
         shutdown.clone(),
     );
 
+    spawn_reconcile_poll(
+        &config,
+        state.protocols.clone(),
+        redis,
+        db,
+        http_client,
+        shutdown.clone(),
+    );
+
     let app = build_router(state);
     let addr = format!("0.0.0.0:{}", config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -235,9 +246,25 @@ async fn run_stream(config: AppConfig) -> anyhow::Result<()> {
 
     spawn_consumers(live_state.clone(), &config, shutdown.clone());
 
+    let poll_programs = live_state.protocols.clone();
     spawn_reenrichment(live_state, &config, shutdown.clone());
 
-    spawn_ingester(&config, redis, db, http_client, shutdown.clone());
+    spawn_ingester(
+        &config,
+        redis.clone(),
+        db.clone(),
+        http_client.clone(),
+        shutdown.clone(),
+    );
+
+    spawn_reconcile_poll(
+        &config,
+        poll_programs,
+        redis,
+        db,
+        http_client,
+        shutdown.clone(),
+    );
 
     let health = axum::Router::new().route(
         "/healthz",
@@ -340,5 +367,40 @@ fn spawn_ingester(
         let shutdown = shutdown.clone();
 
         async move { solana_ingester.run(shutdown).await }
+    });
+}
+
+/// The completeness safety net next to the WebSocket ingester: a periodic
+/// `getSignaturesForAddress` poll per registered program, republishing whatever the
+/// store does not have yet. It uses the reconcile Helius lane, so it cannot starve
+/// ingestion or the API, and it is started only when ingestion is enabled.
+fn spawn_reconcile_poll(
+    config: &AppConfig,
+    programs: Arc<ProtocolRegistry>,
+    redis: RedisProducer,
+    db: sqlx::PgPool,
+    http_client: Client,
+    shutdown: CancellationToken,
+) {
+    if !config.ingest.enabled {
+        tracing::warn!("INGEST_ENABLED=0, reconciliation poll is disabled");
+        return;
+    }
+
+    let poller = ReconcilePoller::new(
+        programs,
+        db,
+        redis,
+        http_client,
+        config.helius_reconcile_url.clone(),
+        config.reconcile_rps,
+        config.ingest.clone(),
+    );
+
+    spawn_supervised("reconcile-poll", shutdown.clone(), move || {
+        let poller = poller.clone();
+        let shutdown = shutdown.clone();
+
+        async move { poller.run(shutdown).await }
     });
 }
