@@ -1021,7 +1021,7 @@ Work items:
 * \[x] 4d. Ping/pong keepalive and a no-message watchdog that forces a reconnect. Done: a ping every `INGEST_PING_SECS` (default 30), the watchdog resets on every frame and reconnects after `INGEST_WATCHDOG_SECS` (default 90) of silence, and `ingest_reconnects_total{reason}` counts each ended connection
 * \[x] 4e. Surface subscribe errors, supervise the ingester, `GREATEST` on the checkpoint. Supervision was already in place from A8; subscribe replies are awaited and surfaced, and the checkpoint upsert is monotonic
 * \[ ] 4f. Periodic reconciliation poll as a completeness guarantee: WebSocket is the low-latency path, polling is the safety net
-* \[ ] 4g. Evaluate Helius' other streaming options against current docs before building anything custom
+* \[x] 4g. Evaluate Helius' other streaming options against current docs before building anything custom. Done: Enhanced WebSockets need Developer+, LaserStream gRPC mainnet needs Business+, webhooks are limited to 1 on Free and need a public endpoint. Decision: keep `logsSubscribe` and build 4f as the safety net. Notes: [`docs/4g-helius-streaming-options.md`](docs/4g-helius-streaming-options.md)
 
 Exit: recall ≥ 99.9% for every indexed program over 24 h, classification precision and p99 ingestion lag recorded.
 
