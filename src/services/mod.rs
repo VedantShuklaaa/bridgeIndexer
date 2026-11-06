@@ -5,6 +5,7 @@ pub mod detect;
 pub mod precision;
 pub mod read_through;
 pub mod reconcile;
+pub mod reconcile_poll;
 pub mod replay;
 pub mod token_metadata;
 pub mod transfers;

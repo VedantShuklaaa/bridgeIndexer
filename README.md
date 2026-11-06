@@ -240,7 +240,7 @@ flowchart LR
         RT --> LA[Limiter A]
     end
     subgraph stream["stream.<domain>  (ROLE=stream, Helius key B)"]
-        ING[Ingester + reconcile] --> RS[(Redis Stream)]
+        ING[Ingester + poll] --> RS[(Redis Stream)]
         RS --> WK[Workers]
         WK --> LB[Limiter B]
         WK --> BC[Broadcast]
@@ -281,6 +281,7 @@ bridgeIndexer/
 ├── docs/
 │   ├── 3e-worker-patience.md            # live token wait notes (3e)
 │   ├── 4bd-reconnect-verification.md    # 4b + 4d EC2 reconnect/watchdog verification
+│   ├── 4f-reconcile-poll.md             # periodic poll: window, checkpoint, metrics (4f)
 │   ├── 3g-list-endpoint.md              # list contract, synthetic plans, known limits (3g)
 │   └── scaling-log.md                   # measured before/after entries
 ├── scripts/
@@ -345,6 +346,7 @@ bridgeIndexer/
 │   │   ├── detect.rs                   # chain-first detection and WormholeScan enrichment (pure)
 │   │   ├── read_through.rs             # caches, single-flight, stale-while-revalidate
 │   │   ├── reconcile.rs                # pure window, diff, recall, miss clustering and lag (4a)
+│   │   ├── reconcile_poll.rs           # periodic poll + shared signature scan (4f)
 │   │   ├── replay.rs                   # pure compare/summary for the replay tool
 │   │   └── transfers.rs                # list query validation, cursor, one keyset page (3g)
 │   ├── db/
@@ -675,6 +677,22 @@ and compares their status with WormholeScan, reusing the replay comparison.
 `--json` prints the same report machine-readable. Exits 1 when recall is below
 `--min-recall` (default 99.9) and the cap was not hit.
 
+### Periodic reconciliation poll
+
+The `reconcile` bin is a manual measurement; the poll is the always-on safety net.
+When ingestion is enabled, the supervised `reconcile-poll` task runs every
+`INGEST_POLL_SECS` (default 300) per registered program. Each cycle scans
+`getSignaturesForAddress` over `[last_poll_end - INGEST_POLL_OVERLAP_SECS,
+now - INGEST_POLL_OFFSET_SECS]`, subtracts what `bridge_transfers` already holds, and
+republishes the rest as normal stream candidates, so the consumers classify and
+persist them. The Redis dedupe and idempotent upserts make a replay safe. The
+per-program checkpoint is stored in `indexer_state` and only moves forward; the
+window on a first run starts `INGEST_POLL_OVERLAP_SECS` before now. A cycle publishes
+at most `INGEST_POLL_MAX_PUBLISH` signatures and logs when the cap is hit; a capped
+cycle does not advance the checkpoint, so the remainder is covered again. It uses the
+reconcile Helius lane (`HELIUS_RECONCILE_URL`, `RECONCILE_RPS`). See
+[`docs/4f-reconcile-poll.md`](docs/4f-reconcile-poll.md).
+
 ### Metrics
 
 Every role serves Prometheus metrics on `0.0.0.0:$METRICS_PORT` (default `9100`)
@@ -686,7 +704,7 @@ closed, so scrape it only from the private network.
 | --- | --- | --- |
 | `cache_lookups_total` | counter | `result`: `memory`, `pg_fresh`, `pg_stale`, `cold` |
 | `cache_refresh_skipped_total` | counter | `reason`: `no_token`, `in_flight` |
-| `limiter_wait_seconds` | histogram | `provider`: `helius`, `wormhole`; `lane`: `api`, `ingest`, `shared` |
+| `limiter_wait_seconds` | histogram | `provider`: `helius`, `wormhole`; `lane`: `api`, `ingest`, `reconcile`, `shared` |
 | `upstream_calls_total` | counter | `provider` and `lane` as above; `outcome`: `ok`, `err`, `timeout` |
 | `http_request_duration_seconds` | histogram | `route`: matched route pattern (or `unmatched`); `status_class`: `2xx`, `4xx`, `5xx`, `other` |
 | `stream_lag` | gauge | none |
@@ -694,9 +712,13 @@ closed, so scrape it only from the private network.
 | `dead_letter_depth` | gauge | none |
 | `ingest_age_seconds` | gauge | none |
 | `ingest_reconnects_total` | counter | `reason`: `watchdog`, `subscribe_failed`, `closed`, `error` |
+| `poll_cycles_total` | counter | `program`: registered program ID; `result`: `ok`, `error` |
+| `poll_missed_total` | counter | `program`: registered program ID |
+| `poll_last_success_timestamp_seconds` | gauge | `program`: registered program ID |
 
 Every label is a static string: no transaction hashes, addresses or user ids are
-used as label values. `cache_lookups_total` counts cache lookups, so a v2 request
+used as label values. The `program` label is one of the registered program IDs, a
+fixed set from the protocol registry. `cache_lookups_total` counts cache lookups, so a v2 request
 that misses its own cache also performs the underlying v1 lookups.
 `limiter_wait_seconds` includes shed waits (a token timeout is recorded), and
 `upstream_calls_total` counts each upstream attempt, retries included. A
@@ -733,9 +755,10 @@ scrape_configs:
   `HELIUS_LIVE_URL` is the deprecated name of `HELIUS_STREAM_URL`: it is still read when
   `HELIUS_STREAM_URL` is unset and logs a warning at startup.
 * `HELIUS_RECONCILE_URL` (optional, falls back to `HELIUS_URL`) and `RECONCILE_RPS`
-  (default 3) are the `reconcile` tool's own Helius lane. Its limiter is built
-  separately from the API's and the live pipeline's, so a reconciliation run cannot
-  starve ingestion.
+  (default 3) are the reconcile Helius lane. The `reconcile` bin and the periodic
+  reconciliation poll both use this endpoint and quota, each with its own limiter
+  built separately from the API's and the live pipeline's, so neither can starve
+  ingestion.
 * Ingestion is always on (A8), all settings optional: `INGEST_ENABLED` (default on, `0` is a
   kill switch), `LIVE_BACKFILL` (default **on**, was off), `INGEST_BACKFILL_MAX` (5000),
   `INGEST_BACKFILL_PACE_MS` (750), `INGEST_REWIND_SLOTS` (20) and `INGEST_DEDUPE_TTL_SECS`
@@ -752,6 +775,20 @@ scrape_configs:
   lets the backfill outrun the limiter (the old 150 ms did). A full 5000-signature run
   therefore takes about 62 minutes instead of about 12, which is also why the dedupe TTL is
   now two hours: a full backfill outlives the old one-hour window.
+* Periodic reconciliation poll (4f), all optional and only active when `INGEST_ENABLED`
+  is on: `INGEST_POLL_SECS` (300, minimum 30), `INGEST_POLL_OVERLAP_SECS` (600),
+  `INGEST_POLL_OFFSET_SECS` (180) and `INGEST_POLL_MAX_PUBLISH` (500). Every cycle, for
+  each registered program, it scans `getSignaturesForAddress` over
+  `[last_poll_end - overlap, now - offset]`, subtracts signatures already in
+  `bridge_transfers`, and republishes the rest through the normal stream; the consumers
+  classify and persist them. The per-program checkpoint lives in `indexer_state`
+  (no migration) and only moves forward. The offset keeps the window behind the
+  ingester, the overlap re-covers what the previous window ended before seeing, and the
+  cap bounds the Helius spend after a gap (a capped cycle does not advance the
+  checkpoint, so the remainder is re-covered next cycle). Poll cycles use the reconcile lane; their
+  metrics are `poll_cycles_total`, `poll_missed_total` and
+  `poll_last_success_timestamp_seconds`. Details:
+  [`docs/4f-reconcile-poll.md`](docs/4f-reconcile-poll.md).
 * Live worker patience and retry budget (all optional): `HELIUS_LIVE_TOKEN_WAIT_MS` (20000)
   is how long a worker waits for the first Helius token of a message;
   `WORKER_MAX_DELIVERIES` (10) is how many times a transiently failing message may be
@@ -1020,7 +1057,7 @@ Work items:
 * \[ ] 4c. Backfill as a separate task, concurrent with live reads
 * \[x] 4d. Ping/pong keepalive and a no-message watchdog that forces a reconnect. Done: a ping every `INGEST_PING_SECS` (default 30), the watchdog resets on every frame and reconnects after `INGEST_WATCHDOG_SECS` (default 90) of silence, and `ingest_reconnects_total{reason}` counts each ended connection
 * \[x] 4e. Surface subscribe errors, supervise the ingester, `GREATEST` on the checkpoint. Supervision was already in place from A8; subscribe replies are awaited and surfaced, and the checkpoint upsert is monotonic
-* \[ ] 4f. Periodic reconciliation poll as a completeness guarantee: WebSocket is the low-latency path, polling is the safety net
+* \[x] 4f. Periodic reconciliation poll as a completeness guarantee: WebSocket is the low-latency path, polling is the safety net. Done: the supervised `reconcile-poll` task runs every `INGEST_POLL_SECS` (default 300, minimum 30) per registered program over `[last_poll_end - INGEST_POLL_OVERLAP_SECS, now - INGEST_POLL_OFFSET_SECS]`, subtracts signatures already in `bridge_transfers`, and republishes the rest through the normal stream so the consumers classify and persist them. The per-program checkpoint is monotonic in `indexer_state`, each cycle is capped at `INGEST_POLL_MAX_PUBLISH` (500), and the poll has its own reconcile Helius lane. Notes: [`docs/4f-reconcile-poll.md`](docs/4f-reconcile-poll.md)
 * \[x] 4g. Evaluate Helius' other streaming options against current docs before building anything custom. Done: Enhanced WebSockets need Developer+, LaserStream gRPC mainnet needs Business+, webhooks are limited to 1 on Free and need a public endpoint. Decision: keep `logsSubscribe` and build 4f as the safety net. Notes: [`docs/4g-helius-streaming-options.md`](docs/4g-helius-streaming-options.md)
 
 Exit: recall ≥ 99.9% for every indexed program over 24 h, classification precision and p99 ingestion lag recorded.

@@ -31,6 +31,59 @@ impl Window {
     }
 }
 
+/// Plans one cycle of the periodic reconciliation poll (4f).
+///
+/// The cycle ends `offset_secs` before `now`, so the WebSocket ingester had a
+/// chance to see everything in it. It starts `overlap_secs` before `last_poll_end`,
+/// the previous successful cycle's end, so the part the previous window could not
+/// see yet is scanned again. On the first run there is no checkpoint, so the
+/// anchor is `now` and the window starts `overlap_secs` before it.
+///
+/// An overlap shorter than the offset, or a checkpoint ahead of the wall clock,
+/// would produce a start after the end; the window is clamped to empty instead.
+pub fn poll_window(
+    now: i64,
+    last_poll_end: Option<i64>,
+    overlap_secs: i64,
+    offset_secs: i64,
+) -> Window {
+    let end = now.saturating_sub(offset_secs);
+    let anchor = last_poll_end.unwrap_or(now);
+    let start = anchor.saturating_sub(overlap_secs).min(end);
+    Window { start, end }
+}
+
+/// The poll checkpoint only moves forward: a cycle that began before the stored end
+/// (or a wall clock that stepped back) must not rewind it and replay the same window.
+pub fn next_poll_end(previous: Option<i64>, ended_at: i64) -> i64 {
+    previous.map_or(ended_at, |previous| previous.max(ended_at))
+}
+
+/// The checkpoint to persist after a cycle.
+///
+/// A capped cycle has not published everything it found, and its oldest remainder is
+/// at the start of the window. Advancing the end would move the next window past that
+/// remainder, so the checkpoint stays where it was; on a first run it is pinned to the
+/// window's start, which makes the next window cover the whole one again. A normal
+/// cycle advances to the window's end, never backwards.
+pub fn checkpoint_after_cycle(previous: Option<i64>, window: Window, cap_hit: bool) -> Option<i64> {
+    if cap_hit {
+        previous.or(Some(window.start))
+    } else {
+        Some(next_poll_end(previous, window.end))
+    }
+}
+
+/// Signatures in the scanned window that have no persisted row. These are the
+/// candidates the poll republishes; the existing Redis dedupe and idempotent
+/// upserts make a repeat harmless.
+pub fn missing_signatures(
+    signatures: &[Signature],
+    persisted: &[PersistedTransaction],
+) -> Vec<Signature> {
+    diff(signatures, persisted).missing
+}
+
 /// One successful `getSignaturesForAddress` entry inside the window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Signature {
@@ -401,6 +454,131 @@ mod tests {
         let window = Window::plan(10_000, 3600, 600);
         assert_eq!(window.end, 9400);
         assert_eq!(window.start, 5800);
+    }
+
+    #[test]
+    fn the_first_poll_starts_one_overlap_before_now() {
+        let window = poll_window(10_000, None, 600, 180);
+
+        assert_eq!(window.end, 9_820);
+        assert_eq!(window.start, 9_400);
+    }
+
+    #[test]
+    fn a_later_poll_overlaps_the_previous_end() {
+        // The previous cycle ended at 9_820; this one runs 300 s later.
+        let window = poll_window(10_300, Some(9_820), 600, 180);
+
+        assert_eq!(window.end, 10_120);
+        assert_eq!(window.start, 9_220);
+    }
+
+    #[test]
+    fn the_poll_end_offset_keeps_the_scan_behind_the_ingester() {
+        let window = poll_window(10_000, None, 600, 180);
+        assert_eq!(window.end, 9_820);
+
+        // A larger offset reaches further back and leaves more time for the stream.
+        let window = poll_window(10_000, None, 600, 400);
+        assert_eq!(window.end, 9_600);
+    }
+
+    #[test]
+    fn an_overlap_shorter_than_the_offset_is_an_empty_window() {
+        let window = poll_window(10_000, None, 60, 180);
+
+        assert_eq!(window.start, window.end);
+        assert_eq!(window.end, 9_820);
+    }
+
+    #[test]
+    fn a_checkpoint_ahead_of_the_clock_does_not_scan_the_future() {
+        let window = poll_window(10_000, Some(11_000), 600, 180);
+
+        assert_eq!(window.start, window.end);
+    }
+
+    #[test]
+    fn the_poll_checkpoint_never_moves_backwards() {
+        assert_eq!(next_poll_end(None, 100), 100);
+        assert_eq!(next_poll_end(Some(90), 100), 100);
+        assert_eq!(next_poll_end(Some(110), 100), 110);
+    }
+
+    #[test]
+    fn a_capped_cycle_keeps_the_checkpoint_so_the_remainder_is_recovered() {
+        let window = Window {
+            start: 9_400,
+            end: 9_820,
+        };
+
+        // A normal cycle advances to the end.
+        assert_eq!(
+            checkpoint_after_cycle(Some(9_000), window, false),
+            Some(9_820)
+        );
+        // A capped cycle leaves the previous end alone, so the next window still
+        // starts before the remainder.
+        assert_eq!(
+            checkpoint_after_cycle(Some(9_000), window, true),
+            Some(9_000)
+        );
+        // There is no previous end on a first run, so pin the window's start.
+        assert_eq!(
+            checkpoint_after_cycle(None, window, true),
+            Some(window.start)
+        );
+    }
+
+    #[test]
+    fn a_poll_selects_only_signatures_without_a_persisted_row() {
+        let window = Window {
+            start: 9_400,
+            end: 9_820,
+        };
+        let mut scan = SignatureScan::default();
+        scan.push_page(
+            &[
+                entry("persisted", 30, 9_800, false),
+                entry("missing", 29, 9_700, false),
+                entry("failed", 28, 9_600, true),
+            ],
+            window,
+        );
+        let persisted = vec![row("persisted", 30, 9_800, 9_805)];
+
+        let missing = missing_signatures(&scan.signatures, &persisted);
+
+        let hashes: Vec<&str> = missing.iter().map(|s| s.signature.as_str()).collect();
+        assert_eq!(hashes, vec!["missing"]);
+    }
+
+    #[test]
+    fn an_overlapping_window_does_not_reselect_what_the_last_cycle_persisted() {
+        // The second cycle starts 600 s before the first cycle's end, so both
+        // signatures are scanned again; the persisted ones must not be republished.
+        let first = Window {
+            start: 9_400,
+            end: 9_820,
+        };
+        let second = poll_window(10_300, Some(first.end), 600, 180);
+        assert_eq!(
+            second,
+            Window {
+                start: 9_220,
+                end: 10_120
+            }
+        );
+
+        let persisted = vec![row("a", 30, 9_800, 9_805), row("b", 31, 9_900, 9_905)];
+
+        let mut scan = SignatureScan::default();
+        scan.push_page(
+            &[entry("b", 31, 9_900, false), entry("a", 30, 9_800, false)],
+            second,
+        );
+
+        assert!(missing_signatures(&scan.signatures, &persisted).is_empty());
     }
 
     #[test]

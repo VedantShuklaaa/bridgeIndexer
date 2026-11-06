@@ -20,6 +20,9 @@ pub const STREAM_PENDING: &str = "stream_pending";
 pub const DEAD_LETTER_DEPTH: &str = "dead_letter_depth";
 pub const INGEST_AGE_SECONDS: &str = "ingest_age_seconds";
 pub const INGEST_RECONNECTS_TOTAL: &str = "ingest_reconnects_total";
+pub const POLL_CYCLES_TOTAL: &str = "poll_cycles_total";
+pub const POLL_MISSED_TOTAL: &str = "poll_missed_total";
+pub const POLL_LAST_SUCCESS_TIMESTAMP_SECONDS: &str = "poll_last_success_timestamp_seconds";
 
 /// Installs the Prometheus recorder and starts its HTTP listener on
 /// `0.0.0.0:$METRICS_PORT` (default 9100). Every role calls this once at startup.
@@ -82,6 +85,18 @@ fn describe() {
     metrics::describe_counter!(
         INGEST_RECONNECTS_TOTAL,
         "Solana WebSocket reconnects by reason (watchdog, subscribe_failed, closed, error)"
+    );
+    metrics::describe_counter!(
+        POLL_CYCLES_TOTAL,
+        "Reconciliation-poll cycles by program and result (ok, error)"
+    );
+    metrics::describe_counter!(
+        POLL_MISSED_TOTAL,
+        "Signatures the reconciliation poll had to publish because no row and no recent publish existed, by program"
+    );
+    metrics::describe_gauge!(
+        POLL_LAST_SUCCESS_TIMESTAMP_SECONDS,
+        "Unix time of the last successful reconciliation-poll cycle, by program"
     );
 }
 
